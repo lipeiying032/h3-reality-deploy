@@ -8,6 +8,11 @@
 
 # ---- 内部研究目录（不公开） ----
 sources-xray/
+sources-apernet-quicgo/
+sources-mundo-quicgo/
+sources-mundo-reality/
+sources-sagernet-quicgo/
+sources-singbox/
 packaging/
 probe-mod/
 xray-linux-amd64
