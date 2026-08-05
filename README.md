@@ -75,7 +75,8 @@ GOOS=windows GOARCH=amd64 go build -mod=vendor -o xray-h3-win-amd64.exe ./main
 ## 快速开始（全新 VPS）
 
 ```bash
-git clone https://github.com/lipeiying032/h3-reality-deploy.git
+# 全新 VPS 一键部署（若已 clone 过会自动 git pull 更新到最新）
+git clone https://github.com/lipeiying032/h3-reality-deploy.git 2>/dev/null || (cd h3-reality-deploy && git pull)
 cd h3-reality-deploy
 sudo bash deploy-h3-sni.sh
 ```
