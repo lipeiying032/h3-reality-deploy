@@ -29,7 +29,7 @@
 │ serverName=SNI  fp=chrome  alpn=["h3"]    │
 │ ClientHello: random=认证载荷（不可区分）    │
 └────────────────────┬──────────────────────┘
-                     │ QUIC/UDP :8446
+                     │ QUIC/UDP :443
                      ▼
 ┌──────────── 服务端（fork xray）────────────┐
 │ ① QUIC 预检：解密 Initial → 提取 ClientHello│
@@ -68,7 +68,7 @@ go build -mod=vendor ./...
 GOOS=windows GOARCH=amd64 go build -mod=vendor -o xray-h3-win-amd64.exe ./main
 ```
 
-> 注意：H3（8446）节点必须用此 fork 内核，官方内核不支持 REALITY+H3。
+> 注意：H3 节点必须用此 fork 内核，官方内核不支持 REALITY+H3。
 
 ---
 
@@ -82,16 +82,17 @@ sudo bash deploy-h3-sni.sh
 
 脚本自动完成：
 
-1. 交互输入 SNI（默认 `ea.com`，支持 `q/quit` 退出）；
+1. 交互输入 SNI（直接回车则从维护库 [h3-reality-sni](https://github.com/lipeiying032/h3-reality-sni) 随机挑选并自动验证，支持 `q/quit` 退出）；
 2. 域名格式校验 + DNS 解析 + **H3 支持探测**——不支持则红色拒绝并建议换 SNI（最多 5 次）；
 3. 探测工具自给自足：同目录二进制 → 源码 + Go 自动编译 → GitHub Release 下载；
-4. xray 内核自动检测（`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH`）；
-5. 没有 `server.json` → 自动生成最小可运行配置（8443 H2 + 8446 H3，UUID/密钥自动生成）；
+4. xray 内核自动获取：检测本地 → Release 预编译下载（`xray-h3-server-linux-amd64`）→ `core/` 源码编译兜底；
+5. 没有 `server.json` → 自动生成最小可运行配置（默认端口 443：H2 TCP + H3 UDP，UUID/密钥自动生成）；
 6. 没有 systemd 服务 → 自动创建 `xray-h3.service` 并 `enable`；
 7. `run -test` 校验 → 重启 → 端口监听 + relay 闭环验证；
-8. 输出完整 **VLESS 分享链接**（`vless://...` 含 `sni/pbk/sid/fp=chrome/type=xhttp`），可直接导入客户端。
+8. 输出完整 **VLESS 分享链接**（`vless://...` 含 `sni/pbk/sid/fp=chrome/type=xhttp`），可直接导入客户端；
+9. 部署成功后自动安装 `h3reality` 便携管理命令（`/usr/local/bin`），日常可用 `h3reality status|list|switch|add|remove|link|restart|log` 管理节点。
 
-> 已有旧配置时：只更新 8446 inbound 的 `dest`/`serverNames`/`fallbackDestRoutes[SNI]`，
+> 已有旧配置时：按特征定位 H3 inbound，只更新其 `dest`/`serverNames`/`fallbackDestRoutes[SNI]`，
 > 其余 inbound 与 17 条路由条目不动，自动备份后可回滚。
 
 ### 手动部署（不想用脚本）
@@ -109,7 +110,9 @@ h3-reality-deploy/
 ├── H3-REALITY-README.md   # 完整实现原理文档（12 节：认证/指纹/relay/部署/FAQ）
 ├── REQUIREMENTS.md        # 开源所需的 GitHub 权限与 Token 导出指南
 ├── core/                  # fork 内核完整源码（v26.7.28 + 全部魔改，含 vendor/，MIT）
-├── deploy-h3-sni.sh       # 服务端一键部署脚本（自包含引导版）
+├── deploy-h3-sni.sh       # 服务端一键部署脚本（交互引导，逻辑在 h3-lib.sh）
+├── h3-lib.sh              # 公共函数库（deploy 与 h3reality 共享）
+├── h3reality              # 便携管理命令（status/list/switch/add/remove/link 等）
 ├── probe-h3-sni.go        # H3 探测工具源码（Go 1.22+，quic-go http3）
 ├── probe-h3-sni           # 预编译静态二进制（linux/amd64，无 Go 环境直接可用）
 ├── LICENSE                # MIT
