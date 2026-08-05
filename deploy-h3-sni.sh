@@ -42,12 +42,23 @@
 #   - 中文输出，红=错误/拒绝，绿=成功，黄=警告
 # =============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
+
+# 任何未预期的失败都输出可见错误（行号 + 退出码），绝不静默退出
+_deploy_err_trap() {
+  local line="${1:-?}" rc=$?
+  printf '\033[0;31m错误: 脚本异常退出（第 %s 行，退出码 %s）\033[0m\n' "$line" "$rc" >&2
+  exit "$rc"
+}
+trap '_deploy_err_trap "$LINENO"' ERR
 
 # ---------------- 引入公共函数库（与 h3reality 共用同一份逻辑） ----------------
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=h3-lib.sh
-source "$LIB_DIR/h3-lib.sh"
+if ! source "$LIB_DIR/h3-lib.sh"; then
+  echo "错误: 无法加载公共函数库 $LIB_DIR/h3-lib.sh（缺失或语法错误），脚本终止。" >&2
+  exit 1
+fi
 
 require_root
 command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
@@ -571,8 +582,9 @@ install_h3reality() {
 # ==================== 主流程 ====================
 
 # 1. 内核检测与模式确认
-detect_xray
-if [ -z "$XRAY_BIN" ]; then
+if ! detect_xray; then
+  no_kernel_guide
+elif [ -z "$XRAY_BIN" ]; then
   no_kernel_guide
 else
   confirm_kernel_mode

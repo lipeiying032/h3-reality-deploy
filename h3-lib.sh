@@ -108,14 +108,14 @@ valid_domain() {
 resolve_ip() {
   local host="$1" ip=""
   if command -v getent >/dev/null 2>&1; then
-    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
-    [ -z "$ip" ] && ip=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    [ -z "$ip" ] && ip=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)
   fi
   if [ -z "$ip" ] && command -v dig >/dev/null 2>&1; then
-    ip=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
+    ip=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)
   fi
   if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
-    ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF; exit}')
+    ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF; exit}' || true)
   fi
   [ -n "$ip" ] && { echo "$ip"; return 0; }
   return 1
@@ -150,10 +150,10 @@ pick_random_port() {
 get_server_ip() {
   local ip=""
   if command -v hostname >/dev/null 2>&1; then
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   fi
   if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{print $7; exit}')
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{print $7; exit}' || true)
   fi
   if [ -z "$ip" ]; then
     printf "无法自动检测公网 IP，请手动输入: "
@@ -190,7 +190,7 @@ fetch_sni_list() {
     json="$data"
     printf '%s' "$json" > "$SNI_LIST_CACHE" 2>/dev/null
   elif [ -f "$SNI_LIST_CACHE" ]; then
-    json=$(cat "$SNI_LIST_CACHE" 2>/dev/null)
+    json=$(cat "$SNI_LIST_CACHE" 2>/dev/null || true)
     yellow "SNI 库拉取失败，使用本地缓存..."
   fi
   if [ -n "$json" ]; then
@@ -508,7 +508,7 @@ detect_xray() {
     fi
   fi
   if [ -n "$XRAY_BIN" ]; then
-    v=$("$XRAY_BIN" version 2>/dev/null | head -n1)
+    v=$("$XRAY_BIN" version 2>/dev/null | head -n1 || true)
     if [ -n "$v" ]; then
       green "检测到 xray 内核: $XRAY_BIN"
       yellow "  版本: $v"
@@ -863,7 +863,7 @@ PYEOF
   [ -n "$priv" ] && PRIVATE_KEY="$priv"
   [ -n "$sid" ] && SHORT_ID="$sid"
   if [ -n "$PRIVATE_KEY" ]; then
-    pk=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/^Password/{print $NF}')
+    pk=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/^Password/{print $NF}' || true)
     [ -n "$pk" ] && PUBLIC_KEY="$pk"
   fi
   return 0
@@ -875,7 +875,7 @@ gen_keys() {
   out=$("$XRAY_BIN" x25519 2>/dev/null || true)
   PRIVATE_KEY=$(echo "$out" | awk '/^PrivateKey:/{print $2}')
   PUBLIC_KEY=$(echo "$out" | awk '/^Password/{print $NF}')
-  UUID=$("$XRAY_BIN" uuid 2>/dev/null | head -n1)
+  UUID=$("$XRAY_BIN" uuid 2>/dev/null | head -n1 || true)
   if [ -z "$UUID" ] && command -v python3 >/dev/null 2>&1; then
     UUID=$(python3 -c 'import uuid;print(uuid.uuid4())')
   fi
