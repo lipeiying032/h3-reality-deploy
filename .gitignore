@@ -1,0 +1,27 @@
+# ---- 部署/运行产物 ----
+/tmp/
+*.log
+*.pcap
+*.bin
+*.zip
+*.exe
+
+# ---- 内部研究目录（不公开） ----
+sources-*/
+packaging/
+probe-mod/
+xray-linux-amd64
+
+# ---- 内部工作文档与提示词（不公开） ----
+*-prompt.md
+prompt.md
+REPORT*.md
+context.md
+h3-server.json
+
+# ---- 编辑器/系统杂项 ----
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
