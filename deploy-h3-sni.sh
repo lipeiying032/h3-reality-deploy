@@ -20,7 +20,7 @@
 #      dest/serverNames/fallbackDestRoutes[SNI]（其余条目不动）
 #   7. systemd 服务自动创建（xray-h3.service 不存在时），已存在只 restart
 #   8. 端口冲突检测（8446 UDP / 8443 TCP，被非 xray 进程占用时黄色警告 + 确认）
-#   9. 部署后输出完整 VLESS 分享链接（vless://...，含 sni/pbk/sid/fp/type）
+#   9. 部署后输出完整 VLESS 分享链接（vless://...，含 sni/host/pbk/sid/fp/type）
 #
 # 说明：
 #   - 已有配置时只改 8446 inbound，绝不触碰 8443 / 8445
@@ -76,6 +76,20 @@ www.nintendo.com www.xbox.com"
 
 # ---------------- 工具函数 ----------------
 die() { red "错误: $*"; exit 1; }
+
+# URL 编码：仅编码非 unreserved 字符（RFC 3986），用于 vless:// 链接的参数值
+urlencode() {
+  local s="$1" c="" out=""
+  while [ -n "$s" ]; do
+    c="${s%"${s#?}"}"
+    case "$c" in
+      [a-zA-Z0-9._~-]) out+="$c" ;;
+      *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+    esac
+    s="${s#?}"
+  done
+  printf '%s' "$out"
+}
 
 # 非 root → sudo 重执行
 if [ "$(id -u)" -ne 0 ]; then
@@ -504,7 +518,7 @@ gen_keys() {
   local out
   out=$("$XRAY_BIN" x25519 2>/dev/null)
   PRIVATE_KEY=$(echo "$out" | awk '/^PrivateKey:/{print $2}')
-  PUBLIC_KEY=$(echo "$out" | awk '/^Password/{print $3}')
+  PUBLIC_KEY=$(echo "$out" | awk '/^Password/{print $NF}')
   UUID=$("$XRAY_BIN" uuid 2>/dev/null | head -n1)
   if [ -z "$UUID" ] && command -v python3 >/dev/null 2>&1; then
     UUID=$(python3 -c 'import uuid;print(uuid.uuid4())')
@@ -795,7 +809,7 @@ PYEOF
   [ -n "$priv" ] && PRIVATE_KEY="$priv"
   [ -n "$sid" ] && SHORT_ID="$sid"
   if [ -n "$PRIVATE_KEY" ]; then
-    pk=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/^Password/{print $3}')
+    pk=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/^Password/{print $NF}')
     [ -n "$pk" ] && PUBLIC_KEY="$pk"
   fi
 }
@@ -1026,8 +1040,8 @@ if [ "$DEGRADED" -eq 1 ]; then
   fi
 else
   if [ -n "$UUID" ] && [ -n "$PUBLIC_KEY" ] && [ -n "$SHORT_ID" ]; then
-    echo "vless://${UUID}@${SERVER_IP}:${H3_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&enableH3=1&path=%2Fv1%2Fcollect&sni=${sni}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&alpn=h3#H3-REALITY-${H3_PORT}"
-    echo "vless://${UUID}@${SERVER_IP}:${H2_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&path=%2Fv1%2Fcollect&sni=${sni}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#H3-REALITY-H2-${H2_PORT}"
+    echo "vless://${UUID}@${SERVER_IP}:${H3_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&enableH3=1&path=%2Fv1%2Fcollect&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$PUBLIC_KEY")&sid=$(urlencode "$SHORT_ID")&host=$(urlencode "$sni")&alpn=h3#H3-REALITY-${H3_PORT}"
+    echo "vless://${UUID}@${SERVER_IP}:${H2_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&path=%2Fv1%2Fcollect&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$PUBLIC_KEY")&sid=$(urlencode "$SHORT_ID")&host=$(urlencode "$sni")#H3-REALITY-H2-${H2_PORT}"
   else
     yellow "警告: 无法生成分享链接（缺少 UUID/publicKey/shortId），请从 $CONFIG_PATH 中手动提取"
   fi

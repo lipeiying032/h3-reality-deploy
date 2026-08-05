@@ -25,3 +25,12 @@ h3-server.json
 *.swo
 .idea/
 .vscode/
+
+# ---- H3 客户端 TUI（内核/大二进制/用户数据不入库） ----
+client-tui/kernel/
+client-tui/client-tui-linux-amd64
+client-tui/client-tui-win-amd64.exe
+client-tui/configs.json
+client-tui/current.json
+client-tui/configs.lock
+client-tui/logs/

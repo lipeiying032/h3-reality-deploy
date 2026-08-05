@@ -295,8 +295,8 @@ sudo bash deploy-h3-sni.sh
 
 | 节点 | 地址 | H2 | H3 |
 |---|---|---|---|
-| 主 VPS | 192.129.210.194 | 8443 | 8446 |
-| 小 VPS | 198.46.146.78 | 8445 | 8446 |
+| 主 VPS | `YOUR_MAIN_VPS_IP` | 8443 | 8446 |
+| 小 VPS | `YOUR_SMALL_VPS_IP` | 8445 | 8446 |
 
 两台 VPS 的 8446 inbound 结构相同（当前 SNI = ea.com，2026-08-05 更新，路由表 17 条）。
 
@@ -423,7 +423,7 @@ WantedBy=multi-user.target
   "settings": {
     "vnext": [
       {
-        "address": "192.129.210.194",       // 主 VPS；小 VPS 用 198.46.146.78
+        "address": "YOUR_MAIN_VPS_IP",      // 主 VPS；小 VPS 用 YOUR_SMALL_VPS_IP
         "port": 8446,
         "users": [
           {
@@ -496,7 +496,7 @@ WantedBy=multi-user.target
 - **BBR 降级**：quic-go 的 BBR 需 `congestion=bbr` + `bbrProfile=aggressive` + 大窗口
   （`init/maxStreamReceiveWindow` 等）才能跑满；默认 BBR standard 明显慢；`bbr_sender.go`
   必须实现 `OnPacketsLost`/`OnAppLimited`（v6 的核心提速点），否则拥塞控制空转。
-- **shortId hex pad**：xray 配置里 shortId 是 hex 解码（如 `"de085aa9"` = 4 字节），而认证记录
+- **shortId hex pad**：xray 配置里 shortId 是 hex 解码（如 `"0a1b2c3d"` = 4 字节），而认证记录
   构造器要求 8 字节——必须补零扩展到 8 字节，否则客户端发不出认证（服务端一路 401/RELAY）。
 - **RFC 8879 压缩证书**：uTLS 指纹保留 `compress_cert(brotli)`，与 Chrome 一致；服务端若配置
   压缩证书会参与握手，不要把该扩展从指纹里删掉。
