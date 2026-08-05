@@ -282,14 +282,14 @@ sudo bash deploy-h3-sni.sh
 
 - 探针自给自足：同目录二进制 → 同目录源码 + Go 自动编译 → GitHub Release 下载预编译二进制；
 - xray 内核自动检测（`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH`），
-  找不到时黄色警告并给出引导（联系作者获取 fork 内核 / 官方内核 H2 降级模式）；
+  找不到时黄色警告并给出引导（从仓库 `core/` 源码构建 fork 内核 / 官方内核 H2 降级模式）；
 - 没有 `server.json` 自动生成最小可运行配置（8443 H2 + 8446 H3），UUID/x25519 keypair/
   shortId 用内核二进制自动生成；已有配置只改 8446 的 dest/serverNames/fallbackDestRoutes[SNI]；
 - 没有 `xray-h3.service` 自动创建并 `enable`；
 - 部署后输出完整 VLESS 分享链接（`vless://...`，含 sni/pbk/sid/fp/type），可直接导入客户端。
 
-> 注意：本项目不打包 xray-h3 fork 内核（避免暴露防探测细节）。H3（8446）节点必须使用
-> fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅 8443，自签证书 + 明确警告）。
+> 注意：fork 内核源码已开源在仓库 [`core/`](core/)（v26.7.28 + 全部魔改，MIT）。H3（8446）
+> 节点必须使用 fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅 8443，自签证书 + 明确警告）。
 
 ### 8.1 双 VPS 拓扑
 
@@ -596,8 +596,9 @@ sudo bash deploy-h3-sni.sh
   （`.../releases/latest/download/probe-h3-sni-linux-amd64`）；下载失败给黄色警告并说明
   手动获取方式（脚本内嵌源码，需 Go 1.22+ 编译）；
 - 内核检测：`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH` 中的 `xray`，
-  找到后 `version` 校验；找不到 → 黄色警告（本项目不打包内核）+ 两种引导：联系作者获取
-  fork 内核，或已装官方 xray 则走 **H2 降级模式**（只部署 8443 + 自签证书，明确提示跳过 H3）；
+  找到后 `version` 校验；找不到 → 黄色警告（提示从仓库 `core/` 源码构建内核）+ 两种引导：
+  按 README「core/ 内核源码」自行构建 fork 内核，或已装官方 xray 则走 **H2 降级模式**
+  （只部署 8443 + 自签证书，明确提示跳过 H3）；
 - 无 `server.json` → 自动生成最小可运行配置：8443 H2（vless+xhttp+reality，dest 真证书需
   fork 内核）+ 8446 H3（alpn=h3 + `fallbackDest` + 17 条 `fallbackDestRoutes`），
   UUID/privateKey/publicKey/shortId 由内核二进制自动生成；

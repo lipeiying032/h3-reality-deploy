@@ -3,9 +3,9 @@
 让 **VLESS + XHTTP + REALITY** 节点在 **QUIC/H3 传输层**与"真实浏览器访问真实网站"不可区分。
 本仓库开源三样东西：**完整实现原理文档**、**服务端一键部署脚本**、**H3 支持探测工具**。
 
-> 关于内核：`xray-h3` fork 内核（v26.7.28 + client_random 认证 + uTLS Chrome 指纹 +
-> SNI 感知 UDP relay）**不开源**——避免暴露防探测细节。部署脚本会自动检测/引导内核，
-> 未安装时给出获取途径（联系作者或官方内核 H2 降级模式）。
+> 关于内核：完整 fork 内核源码已开源在本仓库 [`core/`](core/)（基于 XTLS/Xray-core
+> v26.7.28，MIT 协议，含 REALITY-over-QUIC 全部魔改与完整 vendor/ 依赖，可直接离线构建）。
+> 部署脚本会自动检测/引导内核；**H3 节点必须使用此 fork 内核**（官方内核不支持 REALITY+H3）。
 
 ---
 
@@ -45,6 +45,33 @@
 
 ---
 
+## core/ 内核源码
+
+完整 fork 内核源码已开源在 [`core/`](core/)：基于 XTLS/Xray-core **v26.7.28**（MIT），
+包含 `client_random` 认证、uTLS Chrome 指纹、SNI 感知 UDP relay 等全部魔改，
+`vendor/` 依赖完整（apernet/quic-go fork + utls + xtls/reality），可离线构建。
+
+主要魔改点：
+
+- **REALITY-over-QUIC**：`client_random` 认证（AES-GCM 32B 填 CH random，与真随机不可区分）；
+- **uTLS Chrome 指纹 CH 构造**（`quicifySpec` 常量表 + ALPS h3）；
+- **QUIC 预检 + 5-tuple UDP NAT relay**（SNI 感知 `fallbackDestRoutes`）；
+- **BBR 修复**（`OnPacketsLost`/`OnAppLimited`）+ H3 写聚合（41MB/s）。
+
+构建方法：
+
+```bash
+cd core
+go build -mod=vendor ./...
+# 服务端产物: core/xray
+# 交叉编译 Windows 客户端:
+GOOS=windows GOARCH=amd64 go build -mod=vendor -o xray-h3-win-amd64.exe ./main
+```
+
+> 注意：H3（8446）节点必须用此 fork 内核，官方内核不支持 REALITY+H3。
+
+---
+
 ## 快速开始（全新 VPS）
 
 ```bash
@@ -81,6 +108,7 @@ h3-reality-deploy/
 ├── README.md              # 项目主页（本文件）
 ├── H3-REALITY-README.md   # 完整实现原理文档（12 节：认证/指纹/relay/部署/FAQ）
 ├── REQUIREMENTS.md        # 开源所需的 GitHub 权限与 Token 导出指南
+├── core/                  # fork 内核完整源码（v26.7.28 + 全部魔改，含 vendor/，MIT）
 ├── deploy-h3-sni.sh       # 服务端一键部署脚本（自包含引导版）
 ├── probe-h3-sni.go        # H3 探测工具源码（Go 1.22+，quic-go http3）
 ├── probe-h3-sni           # 预编译静态二进制（linux/amd64，无 Go 环境直接可用）
@@ -101,6 +129,7 @@ h3-reality-deploy/
 
 ## 使用说明与免责声明
 
-- 本仓库提供的是**原理文档 + 部署工具**；内核需自行构建或联系作者获取；
+- 本仓库开源**原理文档 + 部署工具 + fork 内核完整源码**（`core/`，MIT）；
+  内核可按上文「core/ 内核源码」直接构建，无需联系作者获取；
 - 请遵守所在地区法律法规，仅用于合法用途；
 - MIT License，作者 lipeiying032，2026。

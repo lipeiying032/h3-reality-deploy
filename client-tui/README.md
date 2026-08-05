@@ -57,14 +57,16 @@ chcp 65001
 
 ## 从源码构建
 
-构建需要仓库内的内核二进制（`kernel/` 目录，不入 git，需从
-`packaging/` 拷贝）：
+构建需要仓库内 `core/` 源码编译出的内核二进制（内核源码已开源，见仓库
+[README.md](../README.md)「core/ 内核源码」）：
 
 ```bash
-# 准备内核（仓库内已存在则跳过）
+# 先用 core/ 源码编译内核（Linux + Windows amd64）
 mkdir -p kernel
-cp ../packaging/xray-h3-v9 kernel/
-cp ../packaging/xray-h3-v9-win-amd64.exe kernel/
+cd ../core
+go build -mod=vendor -o ../client-tui/kernel/xray-h3-v9 ./main
+GOOS=windows GOARCH=amd64 go build -mod=vendor -o ../client-tui/kernel/xray-h3-v9-win-amd64.exe ./main
+cd ../client-tui
 
 # Linux
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o client-tui-linux-amd64 .
@@ -73,8 +75,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o cli
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o client-tui-win-amd64.exe .
 ```
 
-内核是黑盒，只做进程管理（释放 → 生成配置 → `run -c config.json` → 停止时终止），
-不修改、不重新编译。
+内核源码已开源在 `../core/`；TUI 只做进程管理（释放 → 生成配置 →
+`run -c config.json` → 停止时终止），不修改、不重新编译。
 
 ## 测试
 

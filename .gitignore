@@ -7,7 +7,7 @@
 *.exe
 
 # ---- 内部研究目录（不公开） ----
-sources-*/
+sources-xray/
 packaging/
 probe-mod/
 xray-linux-amd64
