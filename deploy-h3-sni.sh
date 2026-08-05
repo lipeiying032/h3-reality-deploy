@@ -6,10 +6,13 @@
 #   1. 交互输入 SNI（直接回车：从 SNI 维护库随机挑选，q/quit 退出）
 #   2. 校验域名格式 + DNS 解析 + H3 探测（validate_sni_h3，与 h3reality 共用）
 #   3. 探针自给自足（二进制 → 源码编译 → Release 下载，ensure_probe）
-#   4. xray-h3 fork 内核自动获取（Release 下载 → core/ 源码编译兜底，detect_xray）
-#   5. server.json 自动生成（不存在时）或按特征修改 H3 inbound（已存在时）
+#   4. xray-h3 fork 内核自动获取（Release 下载 → core/ 源码编译兜底，detect_xray；
+#      官方 xray 仅视为干扰项，忽略并自动获取 fork 内核，不询问、不降级）
+#   5. server.json（XRAY_CONFIG，默认 /opt/xray/server.json）自动生成（不存在时）
+#      或按特征修改 H3 inbound（已存在时）
 #   6. systemd 服务自动创建（xray-h3.service 不存在时），已存在只 restart
-#   7. 端口冲突处理（仅新配置生成模式）：自定义/随机端口（H2_PORT/H3_PORT 可覆盖）
+#   7. 端口冲突处理（始终检测，已有配置时端口以配置为准）：自定义/随机端口
+#      （H2_PORT/H3_PORT 可覆盖）
 #   8. 部署后输出完整 VLESS 分享链接（gen_vless_link，与 h3reality link 共用）
 #   9. 部署成功后自动安装便携管理命令 h3reality（幂等，install_h3reality）
 #
@@ -35,8 +38,10 @@
 # 说明：
 #   - 已有配置时按特征定位 H3 inbound（network=xhttp 且 alpn 含 h3，
 #     或存在 fallbackDest/fallbackDestRoutes）修改，绝不触碰其他 inbound
-#   - 端口冲突询问仅在新配置生成模式（server.json 不存在）触发；
-#     已存在配置时 inbound 端口是既成事实，以现有配置为准
+#   - 官方 xray（/usr/local/bin/xray 或 PATH 中的 xray）与本项目无关，只提示并忽略；
+#     本项目 fork 内核固定安装到 /opt/xray/xray-linux-amd64
+#   - 端口冲突检测始终运行（不被"存在配置文件"短路）：已有配置时端口以配置为准，
+#     但官方 xray 等进程占用目标端口（443 TCP/UDP）时仍黄色警告并询问
 #   - 非 root 自动用 sudo 重执行（已 root 则跳过）
 #   - JSON 编辑优先 python3，其次 jq
 #   - 中文输出，红=错误/拒绝，绿=成功，黄=警告
@@ -65,7 +70,7 @@ command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
 command -v python3 >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 \
   || die "需要 python3 或 jq 来编辑 JSON"
 
-# ===== 阶段 1: 端口冲突检测（仅新配置生成模式） =====
+# ===== 阶段 1: 端口冲突检测（始终运行，已有配置时端口以配置为准） =====
 
 # 交互输入自定义端口：数字 + 1024-65535 + 未占用；非法输入红字重试；
 # 成功输出端口并返回 0，直接回车取消返回 1（由调用方转随机端口）
@@ -91,7 +96,19 @@ input_custom_port() {
   done
 }
 
-# 检测 ${H3_PORT} UDP / ${H2_PORT} TCP 被非 xray 进程占用时黄色警告 →
+# 过滤 ss 行：剔除本项目内核进程占用的行，其余（官方 xray 或其他进程）视为冲突
+foreign_occupants() {
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if is_own_kernel_process "$line"; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done
+}
+
+# 检测 ${H3_PORT} UDP / ${H2_PORT} TCP 被非本项目内核进程占用时黄色警告 →
 # 询问自定义端口 [y/N] → 自定义或自动随机；端口最终确定后打印绿色摘要
 check_port_conflicts() {
   local ans new_port occupied
@@ -99,48 +116,55 @@ check_port_conflicts() {
     yellow "警告: 未找到 ss，跳过端口冲突检测"
     return 0
   fi
-  # 已有配置模式：inbound 端口是既成事实，不触发端口询问
+  # 已有本项目配置时端口以配置为准（可能不是 443）；无配置时用目标端口。
+  # 端口冲突检测始终运行，不因"存在配置文件"短路
   if [ -f "$CONFIG_PATH" ]; then
-    yellow "已存在 $CONFIG_PATH，端口以现有配置为准，跳过端口冲突询问"
-    return 0
+    if [ "$DEGRADED" -eq 1 ]; then
+      if new_port=$(get_h2_port); then H2_PORT="$new_port"; fi
+    else
+      if new_port=$(get_h3_port); then H3_PORT="$new_port"; fi
+      if new_port=$(get_h2_port); then H2_PORT="$new_port"; fi
+    fi
   fi
 
-  # H3（UDP）冲突处理
-  occupied=$(ss -ulnp 2>/dev/null | grep ":${H3_PORT} " || true)
-  if [ -n "$occupied" ] && ! echo "$occupied" | grep -q "xray"; then
-    yellow "警告: UDP ${H3_PORT} 被非 xray 进程占用："
-    echo "$occupied" | sed 's/^/  UDP /' || true
-    printf "UDP ${H3_PORT} 被占用，是否自定义端口？[y/N] "
-    read -r ans || { echo; die "读取输入失败"; }
-    case "$ans" in
-      y|Y)
-        if new_port=$(input_custom_port udp "H3(UDP)"); then
-          H3_PORT="$new_port"
-          yellow "H3 端口已设置为 $H3_PORT（客户端分享链接将带此端口）"
-        else
+  # H3（UDP）冲突处理（降级模式不部署 H3，跳过）
+  if [ "$DEGRADED" -eq 0 ]; then
+    occupied=$(ss -ulnp 2>/dev/null | grep ":${H3_PORT} " | foreign_occupants || true)
+    if [ -n "$occupied" ]; then
+      yellow "警告: UDP ${H3_PORT} 被其他进程占用（可能为官方 xray）："
+      echo "$occupied" | sed 's/^/  UDP /' || true
+      printf "UDP ${H3_PORT} 被占用，是否自定义端口？[y/N] "
+      read -r ans || { echo; die "读取输入失败"; }
+      case "$ans" in
+        y|Y)
+          if new_port=$(input_custom_port udp "H3(UDP)"); then
+            H3_PORT="$new_port"
+            yellow "H3 端口已设置为 $H3_PORT（客户端分享链接将带此端口）"
+          else
+            if new_port=$(pick_random_port udp); then
+              H3_PORT="$new_port"
+              yellow "未输入自定义端口，自动使用随机端口 ${H3_PORT}（UDP）"
+            else
+              die "无法找到空闲 UDP 端口"
+            fi
+          fi
+          ;;
+        *)
           if new_port=$(pick_random_port udp); then
             H3_PORT="$new_port"
-            yellow "未输入自定义端口，自动使用随机端口 ${H3_PORT}（UDP）"
+            yellow "已使用随机端口 ${H3_PORT}（UDP）"
           else
             die "无法找到空闲 UDP 端口"
           fi
-        fi
-        ;;
-      *)
-        if new_port=$(pick_random_port udp); then
-          H3_PORT="$new_port"
-          yellow "已使用随机端口 ${H3_PORT}（UDP）"
-        else
-          die "无法找到空闲 UDP 端口"
-        fi
-        ;;
-    esac
+          ;;
+      esac
+    fi
   fi
 
   # H2（TCP）冲突处理
-  occupied=$(ss -tlnp 2>/dev/null | grep ":${H2_PORT} " || true)
-  if [ -n "$occupied" ] && ! echo "$occupied" | grep -q "xray"; then
-    yellow "警告: TCP ${H2_PORT} 被非 xray 进程占用："
+  occupied=$(ss -tlnp 2>/dev/null | grep ":${H2_PORT} " | foreign_occupants || true)
+  if [ -n "$occupied" ]; then
+    yellow "警告: TCP ${H2_PORT} 被其他进程占用（可能为官方 xray）："
     echo "$occupied" | sed 's/^/  TCP /' || true
     printf "TCP ${H2_PORT} 被占用，是否自定义端口？[y/N] "
     read -r ans || { echo; die "读取输入失败"; }

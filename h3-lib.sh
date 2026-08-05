@@ -44,7 +44,8 @@ die() { red "错误: $*"; exit 1; }
 
 # ---------------- B. 配置常量 ----------------
 # 内核/配置路径支持环境变量覆盖（测试沙箱与特殊场景），默认与历史行为一致：
-#   XRAY_CONFIG=/path/to/server.json  覆盖配置路径
+#   XRAY_CONFIG=/path/to/server.json  覆盖配置路径（默认 /opt/xray/server.json，
+#                                      本项目只认该路径，绝不扫描官方 xray 配置）
 #   XRAY_BIN=/path/to/xray            跳过内核检测，直接使用
 #   UNIT_FILE=/path/to/xray-h3.service 覆盖 systemd 单元文件路径
 SERVICE="${SERVICE:-xray-h3}"
@@ -70,7 +71,7 @@ PROBE_MOD_DIR="$LIB_DIR/probe-mod"
 
 # 全局状态变量（两个入口共享）
 XRAY_BIN="${XRAY_BIN:-}"
-CONFIG_PATH="${XRAY_CONFIG:-}"
+CONFIG_PATH="${XRAY_CONFIG:-/opt/xray/server.json}"
 DEGRADED=0        # 1=官方内核 H2 降级模式
 CONFIG_GENERATED=0 # 1=本次新生成的配置（回滚时整体移除）
 sni=""
@@ -129,6 +130,18 @@ port_in_use() {
     tcp) out=$(ss -tlnp 2>/dev/null | grep ":${port} " || true) ;;
   esac
   [ -n "$out" ]
+}
+
+# 判断 ss 输出行中占用端口的进程是否为本项目内核进程（$XRAY_BIN）：
+# 只有本项目自己的内核占端口不算冲突（xray-h3 服务正在运行）；
+# 官方 xray（/usr/local/bin/xray 等）或其他进程一律视为冲突
+is_own_kernel_process() {
+  local line="$1" pid exe
+  [ -n "$XRAY_BIN" ] || return 1
+  pid=$(printf '%s\n' "$line" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n1)
+  [ -n "$pid" ] || return 1
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null | sed 's/ (deleted)$//')
+  [ -n "$exe" ] && [ "$exe" = "$XRAY_BIN" ]
 }
 
 # 随机选一个未被占用的端口（udp/tcp，1024-65535），最多尝试 20 次；
@@ -491,22 +504,14 @@ build_xray_from_source() {
   return 1
 }
 
-# 检测顺序：/opt/xray/xray-linux-amd64 → /usr/local/bin/xray → PATH 中 xray；
-# 已通过环境变量 XRAY_BIN 指定则直接使用；找不到 → 自动获取
-# （Release 预编译下载 → 仓库 core/ 源码编译兜底）；全部失败返回 1
+# 检测本项目 fork 内核（固定路径 /opt/xray/xray-linux-amd64）：
+#   - 环境变量 XRAY_BIN 显式指定时直接使用（测试/特殊场景）
+#   - 机器上已存在的官方 xray（/usr/local/bin/xray 或 PATH 中的 xray）只是
+#     "干扰项"：黄色提示后忽略，不询问、不降级，仍自动获取 fork 内核
+#   - 自动获取链路：Release 预编译下载 → 仓库 core/ 源码编译兜底；
+#     只有自动获取也全部失败才返回 1（由调用方进入降级模式菜单）
 detect_xray() {
-  local cand v
-  if [ -z "$XRAY_BIN" ]; then
-    for cand in /opt/xray/xray-linux-amd64 /usr/local/bin/xray; do
-      if [ -x "$cand" ]; then
-        XRAY_BIN="$cand"
-        break
-      fi
-    done
-    if [ -z "$XRAY_BIN" ] && command -v xray >/dev/null 2>&1; then
-      XRAY_BIN="$(command -v xray)"
-    fi
-  fi
+  local v official=""
   if [ -n "$XRAY_BIN" ]; then
     v=$("$XRAY_BIN" version 2>/dev/null | head -n1 || true)
     if [ -n "$v" ]; then
@@ -517,42 +522,58 @@ detect_xray() {
     yellow "警告: $XRAY_BIN 存在但无法执行（架构不匹配或文件损坏），按未检测到处理"
     XRAY_BIN=""
   fi
-  # 未检测到：自动获取（Release 预编译下载 → 源码编译兜底）
-  yellow "未检测到 xray-h3 fork 内核，尝试自动获取..."
+
+  # 本项目 fork 内核固定安装路径
+  if [ -x /opt/xray/xray-linux-amd64 ]; then
+    XRAY_BIN=/opt/xray/xray-linux-amd64
+    v=$("$XRAY_BIN" version 2>/dev/null | head -n1 || true)
+    if [ -n "$v" ]; then
+      green "检测到本项目 fork 内核: $XRAY_BIN"
+      yellow "  版本: $v"
+      return 0
+    fi
+    yellow "警告: /opt/xray/xray-linux-amd64 存在但无法执行（架构不匹配或文件损坏），将重新获取"
+    XRAY_BIN=""
+  fi
+
+  # 官方 xray 只是干扰项：提示但忽略，继续自动获取 fork 内核
+  if [ -x /usr/local/bin/xray ]; then
+    official=/usr/local/bin/xray
+  elif command -v xray >/dev/null 2>&1; then
+    official="$(command -v xray)"
+  fi
+  if [ -n "$official" ]; then
+    yellow "检测到官方 xray（$official），将忽略并自动获取 fork 内核"
+    v=$("$official" version 2>/dev/null | head -n1 || true)
+    [ -n "$v" ] && yellow "  版本: $v"
+  fi
+
+  # 自动获取（Release 预编译下载 → 源码编译兜底）
+  yellow "未检测到本项目 fork 内核（/opt/xray/xray-linux-amd64），尝试自动获取..."
   if download_xray; then
-    green "内核下载成功: $XRAY_BIN (Release 预编译)"
+    green "fork 内核下载成功: $XRAY_BIN（Release 预编译）"
     return 0
   fi
   if command -v go >/dev/null 2>&1; then
     yellow "Release 下载失败，检测到 Go 环境，尝试从仓库 core/ 源码编译..."
     if build_xray_from_source; then
-      green "内核编译成功: $XRAY_BIN (源码编译)"
+      green "fork 内核编译成功: $XRAY_BIN（源码编译）"
       return 0
     fi
     yellow "源码编译失败，已清理临时目录"
   else
     yellow "Release 下载失败，且本机没有 Go 环境，无法源码编译"
   fi
-  yellow "警告: 内核自动获取失败（Release 下载与源码编译均未成功），请检查网络后重试或手动准备"
+  yellow "警告: fork 内核自动获取失败（Release 下载与源码编译均未成功），请检查网络后重试或手动准备"
   return 1
 }
 
 # ---------------- G. 配置操作 ----------------
 
-# 配置路径检测：默认保留 /opt/xray/server.json 为首选；
-# 找不到已有配置时用它作为待生成路径；XRAY_CONFIG 已指定则直接采用
+# 本项目配置路径固定为 XRAY_CONFIG（默认 /opt/xray/server.json）；
+# 绝不把 /usr/local/etc/xray/config.json 等官方 xray 配置当作本项目已有配置
 detect_config_path() {
-  if [ -n "$CONFIG_PATH" ]; then
-    return 0
-  fi
-  CONFIG_PATH=""
-  if [ -f /opt/xray/server.json ]; then
-    CONFIG_PATH=/opt/xray/server.json
-  elif [ -f /usr/local/etc/xray/config.json ]; then
-    CONFIG_PATH=/usr/local/etc/xray/config.json
-  else
-    CONFIG_PATH=/opt/xray/server.json
-  fi
+  CONFIG_PATH="${XRAY_CONFIG:-/opt/xray/server.json}"
 }
 
 # 校验配置中存在结构正常的 H3 inbound（network=xhttp 且 alpn 含 h3，
@@ -986,6 +1007,43 @@ PYEOF
         ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
         (.streamSettings.realitySettings | has("fallbackDest")) or
         (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .port][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
+  [ -n "$port" ] || return 1
+  echo "$port"
+  return 0
+}
+
+# 输出 H2 inbound 的监听端口（fork 配置：xhttp 且非 H3 的 inbound；
+# 降级配置：唯一的 xhttp inbound）；失败返回 1
+get_h2_port() {
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$CONFIG_PATH" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+def is_h3_inbound(x):
+    ss = x.get("streamSettings") or {}
+    if ss.get("network") != "xhttp":
+        return False
+    rs = ss.get("realitySettings") or {}
+    return "h3" in (rs.get("alpn") or []) or "fallbackDest" in rs or bool(rs.get("fallbackDestRoutes"))
+for ib in cfg.get("inbounds", []):
+    ss = ib.get("streamSettings") or {}
+    if ss.get("network") == "xhttp" and not is_h3_inbound(ib):
+        print(ib.get("port", 443))
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+    then
+      return 0
+    fi
+    return 1
+  fi
+  local port
+  port=$(jq -r '[.inbounds[] |
+        select(.streamSettings.network == "xhttp") |
+        select(((.streamSettings.realitySettings.alpn // []) | index("h3")) == null
+           and (.streamSettings.realitySettings | has("fallbackDest") | not)
+           and (.streamSettings.realitySettings.fallbackDestRoutes == null)) |
+        .port][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
   [ -n "$port" ] || return 1
   echo "$port"
   return 0
