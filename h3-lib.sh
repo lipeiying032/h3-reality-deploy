@@ -21,7 +21,8 @@
 #   E. 探针获取       ensure_probe/build_probe_from_source/download_probe_release
 #   F. 内核获取       detect_xray/download_xray/build_xray_from_source
 #   G. 配置操作       detect_config_path/find_h3_inbound/backup_config/
-#                     update_sni_routes/add_sni_route/remove_sni_route/
+#                     update_sni_routes（切换 SNI：dest+serverNames[0]，并清理旧配置
+#                     残留的 fallbackDest/fallbackDestRoutes，迁移到新内核配置）/
 #                     run_test/restart_service/start_service/stop_service/
 #                     service_is_active/rollback/extract_client_params/gen_keys
 #   H. VLESS 链接     gen_vless_link/get_current_sni/get_h3_port
@@ -858,7 +859,7 @@ json_explode_if_compressed() {
 
 # 逐 inbound 输出一行（以 | 分隔）：port|xhttp|h3mark|id|privateKey|shortId|serverName|dest
 #   xhttp=1  streamSettings.network == "xhttp"
-#   h3mark=1 realitySettings 含 alpn "h3" / fallbackDest / fallbackDestRoutes
+#   h3mark=1 realitySettings 含 alpn "h3"
 # 无 inbounds 或解析失败时输出为空
 scan_inbounds() {
   local src="$CONFIG_PATH" tmp=""
@@ -895,7 +896,7 @@ scan_inbounds() {
         sub(/,?[[:space:]]*$/, "", p)
       }
       if ($0 ~ /"network"[[:space:]]*:[[:space:]]*"xhttp"/) xhttp = 1
-      if (h3mark == 0 && ($0 ~ /"fallbackDest"/ || $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/)) h3mark = 1
+      if (h3mark == 0 && $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/) h3mark = 1
       if (id == "" && $0 ~ /^[[:space:]]*"id"[[:space:]]*:[[:space:]]*/) id = val($0)
       if (priv == "" && $0 ~ /^[[:space:]]*"privateKey"[[:space:]]*:[[:space:]]*/) priv = val($0)
       if ($0 ~ /^[[:space:]]*"shortIds"[[:space:]]*:[[:space:]]*\[/) in_sid = 1
@@ -929,7 +930,7 @@ scan_h3_range() {
       n_open = gsub(/\{/, "{")
       n_close = gsub(/\}/, "}")
       if ($0 ~ /"network"[[:space:]]*:[[:space:]]*"xhttp"/) xhttp = 1
-      if (h3mark == 0 && ($0 ~ /"fallbackDest"/ || $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/)) h3mark = 1
+      if (h3mark == 0 && $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/) h3mark = 1
       depth += n_open - n_close
       if (depth <= 0) {
         if (xhttp == 1 && h3mark == 1) { print start "|" NR; exit }
@@ -974,133 +975,47 @@ sed_set_server_names() {
   ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 }
 
-# 在 H3 inbound 的 fallbackDestRoutes 块末尾插入 <sni>: <sni>:443
-# （自动给原最后一条补逗号，缩进沿用块收尾行）
-sed_insert_route() {
+# 无 jq 时切换 SNI：改 H3 inbound 的 dest 与 serverNames[0]，并清理旧配置残留的
+# fallbackDest/fallbackDestRoutes（内核已移除这两个字段，此处迁移到新内核配置）
+sed_update_sni() {
   local sni="$1" range start end
   range=$(scan_h3_range) || true
   [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
   start=${range%%|*}; end=${range##*|}
-  awk -v sni="$sni" -v s="$start" -v e="$end" '
-    NR < s || NR > e {
-      if (buf != "") { print buf; buf = "" }
-      print
-      next
-    }
-    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
-      if (buf != "") print buf
-      buf = ""
-      in_routes = 1
-      print
-      next
-    }
-    in_routes && /^[[:space:]]*\}/ {
-      ind = $0; sub(/[^[:space:]].*$/, "", ind)
-      if (buf != "") {
-        if (buf ~ /,[[:space:]]*$/) { print buf }
-        else { sub(/[[:space:]]*$/, ",", buf); print buf }
-      }
-      printf "%s\"%s\": \"%s:443\"\n", ind, sni, sni
-      print
-      in_routes = 0
-      buf = ""
-      next
-    }
-    { if (buf != "") print buf; buf = $0 }
-    END { if (buf != "") print buf }
-  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-}
-
-# 无 jq 时切换 SNI：仅改 H3 inbound 的 dest、serverNames[0]，
-# 并 upsert fallbackDestRoutes[<sni>]（存在改值，否则块尾插入补逗号）
-sed_update_sni_routes() {
-  local sni="$1" range start end
-  range=$(scan_h3_range) || true
-  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
-  start=${range%%|*}; end=${range##*|}
-  # 仅替换 H3 inbound 范围内的 dest
   sed "${start},${end}s/\"dest\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"dest\": \"${sni}:443\"/" "$CONFIG_PATH" \
     > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
   sed_set_server_names "$sni"
-  # upsert fallbackDestRoutes[<sni>]（仅在 H3 inbound 范围内判定与替换）
-  if sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:[[:space:]]*"'; then
-    sed "${start},${end}s/^\([[:space:]]*\)\"${sni}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"\([[:space:]]*,\)\{0,1\}[[:space:]]*$/\1\"${sni}\": \"${sni}:443\"\2/" "$CONFIG_PATH" \
-    > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-  else
-    sed_insert_route "$sni"
-  fi
-  return 0
-}
-
-# 无 jq 时添加路由条目（仅 H3 inbound；已存在则幂等成功）
-sed_add_sni_route() {
-  local sni="$1" range start end
-  range=$(scan_h3_range) || true
-  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
-  start=${range%%|*}; end=${range##*|}
-  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '"fallbackDestRoutes"[[:space:]]*:[[:space:]]*{' \
-    || { red "ERROR: 未找到 H3 inbound"; return 1; }
-  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:[[:space:]]*"' && return 0
-  sed_insert_route "$sni"
-}
-
-# 无 jq 时删除路由条目（仅 H3 inbound；含存在性与至少保留 1 条的校验）
-sed_remove_sni_route() {
-  local sni="$1" count range start end
-  range=$(scan_h3_range) || true
-  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
-  start=${range%%|*}; end=${range##*|}
-  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '"fallbackDestRoutes"[[:space:]]*:[[:space:]]*{' \
-    || { red "ERROR: 未找到 H3 inbound"; return 1; }
-  if ! sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:'; then
-    red "ERROR: 路由不存在: $sni"
-    return 1
-  fi
-  count=$(sed -n "${start},${end}p" "$CONFIG_PATH" | awk '
-    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ { in_routes = 1; next }
-    in_routes && /^[[:space:]]*\}/ { exit }
-    in_routes && /^[[:space:]]*"/ { n++ }
-    END { print n + 0 }
-  ')
-  if [ "$count" -le 1 ]; then
-    red "ERROR: 至少需要保留 1 条路由，拒绝删除最后一个条目: $sni"
-    return 1
-  fi
-  awk -v sni="$sni" -v s="$start" -v e="$end" '
+  # 删除 fallbackDest 标量行与 fallbackDestRoutes 块（无该键时原样输出），
+  # 并给被删键的前一行补掉尾逗号
+  awk -v s="$start" -v e="$end" '
     NR < s || NR > e {
       if (buf != "") { print buf; buf = "" }
       print
       next
     }
-    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
-      if (buf != "") print buf
-      buf = ""
-      in_routes = 1
-      print
+    /"fallbackDest"[[:space:]]*:[[:space:]]*"|"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
+      if (buf != "") {
+        if (buf ~ /,[[:space:]]*$/) sub(/,[[:space:]]*$/, "", buf)
+        print buf
+        buf = ""
+      }
+      if ($0 ~ /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/) in_routes = 1
       next
     }
-    in_routes && /^[[:space:]]*\}/ {
-      if (removed && buf ~ /,[[:space:]]*$/) sub(/,[[:space:]]*$/, "", buf)
-      if (buf != "") print buf
-      print
-      in_routes = 0; buf = ""; removed = 0
-      next
-    }
-    in_routes && index($0, "\"" sni "\":") { removed = 1; next }
+    in_routes && /^[[:space:]]*\}/ { in_routes = 0; next }
+    in_routes { next }
     { if (buf != "") print buf; buf = $0 }
     END { if (buf != "") print buf }
   ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+  return 0
 }
 
-
-# 校验配置中存在结构正常的 H3 inbound（network=xhttp 且 alpn 含 h3，
-# 或存在 fallbackDest/fallbackDestRoutes）；0=存在，1=不存在
+# 校验配置中存在结构正常的 H3 inbound（network=xhttp 且 alpn 含 h3）；
+# 0=存在，1=不存在
 find_h3_inbound() {
   if command -v jq >/dev/null 2>&1; then
-    if jq -e '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null)))] | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
+    if jq -e '[.inbounds[] | select(.streamSettings.network == "xhttp" and
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))] | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
       return 0
     fi
     return 1
@@ -1121,78 +1036,29 @@ backup_config() {
   green "已备份: $BACKUP"
 }
 
-# 切换/更新当前 SNI：改 H3 inbound 的 dest、serverNames[0] 与
-# fallbackDestRoutes[<sni>]（其余 inbound 与路由条目不动）；成功返回 0
+# 切换/更新当前 SNI：改 H3 inbound 的 dest 与 serverNames[0]；旧配置残留的
+# fallbackDest/fallbackDestRoutes（字段已从内核移除）一并检测、提示并清理，
+# 迁移到新内核配置（经典 REALITY 语义：认证失败/探测流量一律原样转发 dest，
+# 不按 SNI 分流）；成功返回 0
 update_sni_routes() {
   local sni="$1" edit_ok=0
-  yellow "更新 H3 inbound: dest=$sni:443 serverNames[0]=$sni fallbackDestRoutes[$sni]=$sni:443"
+  if grep -q '"fallbackDest"\|"fallbackDestRoutes"' "$CONFIG_PATH" 2>/dev/null; then
+    yellow "检测到旧配置含 fallbackDest/fallbackDestRoutes（内核已移除这两个字段），切换 SNI 时一并清理并迁移到新内核配置"
+  fi
+  yellow "更新 H3 inbound: dest=$sni:443 serverNames[0]=$sni"
   if command -v jq >/dev/null 2>&1; then
     if jq --arg sni "$sni" '
       .inbounds = [ .inbounds[] | if (.streamSettings.network == "xhttp" and
-          (((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-           (.streamSettings.realitySettings | has("fallbackDest")) or
-           (.streamSettings.realitySettings.fallbackDestRoutes != null))) then
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null)) then
         .streamSettings.realitySettings.dest = ($sni + ":443")
         | .streamSettings.realitySettings.serverNames[0] = $sni
-        | .streamSettings.realitySettings.fallbackDestRoutes[$sni] = ($sni + ":443")
+        | del(.streamSettings.realitySettings.fallbackDest)
+        | del(.streamSettings.realitySettings.fallbackDestRoutes)
       else . end ]' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     then
       edit_ok=1
     fi
-  elif sed_update_sni_routes "$sni"; then
-    edit_ok=1
-  fi
-  [ "$edit_ok" -eq 1 ]
-}
-
-# 添加 SNI 到 fallbackDestRoutes（不动当前 dest/serverNames）；成功返回 0
-add_sni_route() {
-  local sni="$1" edit_ok=0
-  yellow "添加 fallbackDestRoutes[$sni]=$sni:443（不改动当前 dest/serverNames）"
-  if command -v jq >/dev/null 2>&1; then
-    if jq --arg sni "$sni" '
-      .inbounds = [ .inbounds[] | if (.streamSettings.network == "xhttp" and
-          (((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-           (.streamSettings.realitySettings | has("fallbackDest")) or
-           (.streamSettings.realitySettings.fallbackDestRoutes != null))) then
-        .streamSettings.realitySettings.fallbackDestRoutes[$sni] = ($sni + ":443")
-      else . end ]' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-    then
-      edit_ok=1
-    fi
-  elif sed_add_sni_route "$sni"; then
-    edit_ok=1
-  fi
-  [ "$edit_ok" -eq 1 ]
-}
-
-# 从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删清空路由表）；
-# 目标不存在（4）或仅剩 1 条（5）时输出红色原因并返回 1
-remove_sni_route() {
-  local sni="$1" edit_ok=0
-  yellow "删除 fallbackDestRoutes[$sni]（至少保留 1 条路由）"
-  if command -v jq >/dev/null 2>&1; then
-    if jq -e --arg sni "$sni" '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | has($sni)' "$CONFIG_PATH" >/dev/null 2>&1 && \
-       jq -e --arg sni "$sni" '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | length > 1' "$CONFIG_PATH" >/dev/null 2>&1
-    then
-      if jq --arg sni "$sni" '
-        .inbounds = [ .inbounds[] | if (.streamSettings.network == "xhttp" and
-            (((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-             (.streamSettings.realitySettings | has("fallbackDest")) or
-             (.streamSettings.realitySettings.fallbackDestRoutes != null))) then
-          del(.streamSettings.realitySettings.fallbackDestRoutes[$sni])
-        else . end ]' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-      then
-        edit_ok=1
-      fi
-    fi
-  elif sed_remove_sni_route "$sni"; then
+  elif sed_update_sni "$sni"; then
     edit_ok=1
   fi
   [ "$edit_ok" -eq 1 ]
@@ -1247,9 +1113,7 @@ extract_client_params() {
              (.streamSettings.realitySettings.shortIds[0] // "")]] | .[0] | .[]' "$CONFIG_PATH" 2>/dev/null || true)
     else
       out=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-            ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-            (.streamSettings.realitySettings | has("fallbackDest")) or
-            (.streamSettings.realitySettings.fallbackDestRoutes != null))) |
+            (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))) |
             [.settings.clients[0].id // "", .streamSettings.realitySettings.privateKey // "",
              (.streamSettings.realitySettings.shortIds[0] // "")]] | .[0] | .[]' "$CONFIG_PATH" 2>/dev/null || true)
     fi
@@ -1332,9 +1196,7 @@ get_current_sni() {
   if command -v jq >/dev/null 2>&1; then
     local sni
     sni=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.serverNames[0]][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))) | .streamSettings.realitySettings.serverNames[0]][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
     [ -n "$sni" ] || return 1
     echo "$sni"
     return 0
@@ -1358,9 +1220,7 @@ get_h3_port() {
   if command -v jq >/dev/null 2>&1; then
     local port
     port=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .port][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))) | .port][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
     [ -n "$port" ] || return 1
     echo "$port"
     return 0
@@ -1382,9 +1242,7 @@ get_h2_port() {
     local port
     port=$(jq -r '[.inbounds[] |
           select(.streamSettings.network == "xhttp") |
-          select(((.streamSettings.realitySettings.alpn // []) | index("h3")) == null
-             and (.streamSettings.realitySettings | has("fallbackDest") | not)
-             and (.streamSettings.realitySettings.fallbackDestRoutes == null)) |
+          select(((.streamSettings.realitySettings.alpn // []) | index("h3")) == null) |
           .port][0] // empty' "$CONFIG_PATH" 2>/dev/null) || return 1
     [ -n "$port" ] || return 1
     echo "$port"
@@ -1406,9 +1264,7 @@ get_h3_dest() {
   if command -v jq >/dev/null 2>&1; then
     local dest
     dest=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.dest][0] // empty' "$CONFIG_PATH" 2>/dev/null) || true
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))) | .streamSettings.realitySettings.dest][0] // empty' "$CONFIG_PATH" 2>/dev/null) || true
     [ -n "$dest" ] || return 1
     echo "$dest"
     return 0
@@ -1427,9 +1283,7 @@ get_h3_dest() {
 get_h3_server_names() {
   if command -v jq >/dev/null 2>&1; then
     jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.serverNames][0] // [] | join(" ")' "$CONFIG_PATH" 2>/dev/null || true
+          (((.streamSettings.realitySettings.alpn // []) | index("h3")) != null))) | .streamSettings.realitySettings.serverNames][0] // [] | join(" ")' "$CONFIG_PATH" 2>/dev/null || true
     return 0
   fi
   # sed/awk 兜底：解析 H3 inbound 范围内 serverNames 数组的全部元素
@@ -1451,56 +1305,4 @@ get_h3_server_names() {
   ')
   echo "$names"
   return 0
-}
-
-# 输出 H3 inbound 的 fallbackDestRoutes 条目数
-get_h3_route_count() {
-  if command -v jq >/dev/null 2>&1; then
-    local n
-    n=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | length' "$CONFIG_PATH" 2>/dev/null) || true
-    echo "${n:-0}"
-    return 0
-  fi
-  # sed/awk 兜底：统计 H3 inbound 范围内路由条目数
-  local range start end n
-  range=$(scan_h3_range) || true
-  [ -n "$range" ] || return 1
-  start=${range%%|*}; end=${range##*|}
-  n=$(sed -n "${start},${end}p" "$CONFIG_PATH" | awk '
-    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ { in_routes = 1; next }
-    in_routes && /^[[:space:]]*\}/ { exit }
-    in_routes && /^[[:space:]]*"/ { n++ }
-    END { print n + 0 }
-  ')
-  echo "${n:-0}"
-  return 0
-}
-
-# 输出 H3 inbound 的 fallbackDestRoutes 全部条目（每行 key<TAB>value，按 key 排序）
-get_h3_routes() {
-  if command -v jq >/dev/null 2>&1; then
-    jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | to_entries[] | (.key + "\t" + .value)' "$CONFIG_PATH" 2>/dev/null || true
-    return 0
-  fi
-  # sed/awk 兜底：解析 H3 inbound 范围内路由条目并按 key 排序（与旧 python 行为一致）
-  local range start end
-  range=$(scan_h3_range) || true
-  [ -n "$range" ] || return 1
-  start=${range%%|*}; end=${range##*|}
-  sed -n "${start},${end}p" "$CONFIG_PATH" | awk '
-    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ { in_routes = 1; next }
-    in_routes && /^[[:space:]]*\}/ { exit }
-    in_routes && /^[[:space:]]*"/ {
-      line = $0
-      k = line; sub(/^[[:space:]]*"/, "", k); sub(/"[[:space:]]*:.*$/, "", k)
-      v = line; sub(/^[^:]*:[[:space:]]*"/, "", v); sub(/"[[:space:]]*,?[[:space:]]*$/, "", v)
-      print k "\t" v
-    }
-  ' | LC_ALL=C sort
 }
