@@ -1,0 +1,137 @@
+# build-kernel.yml
+# 自动构建服务端内核并更新 Release 资产
+#
+# 触发条件:
+#   - push 到 main 分支且变更路径包含 core/**（内核源码/依赖变更）
+#   - workflow_dispatch 手动触发（兜底）
+#   - 注意: 仅修改 .github/ 本身不会触发本 workflow
+#
+# 产物:
+#   - 编译 linux/amd64 静态二进制（CGO_ENABLED=0）
+#   - 更新 latest release 上的同名资产 xray-h3-server-linux-amd64
+#     （deploy-h3-sni.sh 通过 KERNEL_URL 从
+#       https://github.com/lipeiying032/h3-reality-deploy/releases/latest/download/xray-h3-server-linux-amd64
+#       下载内核，资产名保持不变，部署脚本 URL 无需任何改动）
+#
+# 更新策略（GitHub 不允许同名资产直接覆盖，故采用两步上传最小化空窗）:
+#   1) 先把新二进制上传为临时名 xray-h3-server-linux-amd64-new
+#   2) 删除旧资产 xray-h3-server-linux-amd64（不存在则跳过）
+#   3) PATCH 把新资产重命名为正式名 xray-h3-server-linux-amd64
+#   说明: 旧资产删除到重命名完成之间存在一个秒级空窗，期间部署脚本下载可能
+#   短暂失败，属可接受范围（几十秒内恢复）。若任一 API 调用失败，step 以
+#   非零退出，资产停留在可用的旧版本/新版本，不会产生半更新状态。
+#
+# 权限: 使用默认 secrets.GITHUB_TOKEN（contents: write 覆盖 release 管理），
+#       无需用户 PAT。
+
+name: build-kernel
+
+on:
+  push:
+    paths:
+      - 'core/**'
+    branches:
+      - main
+  workflow_dispatch:
+
+# 同一时间只允许一个构建/更新流程，避免并发运行时资产删除/重命名相互竞争。
+concurrency:
+  group: build-kernel-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build kernel and update release asset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: "Checkout (sparse: only core/)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # core/ 是完整 fork 内核源码（含 core/vendor），go build -mod=vendor 只依赖 core/
+          # sparse-checkout 仅拉取 core/，避免下载 client-tui/、packaging、README 等无关内容，加快 checkout
+          sparse-checkout: core
+          sparse-checkout-cone-mode: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # core/go.mod 要求 go 1.26；'1.26' 由 setup-go 解析为最新 1.26.x 补丁版。
+          # 若 setup-go 暂不支持 1.26，可改用 'stable'（更高的 Go 也能编译 go 1.26 module）。
+          go-version: '1.26'
+
+      - name: Build static linux/amd64 server binary
+        working-directory: core
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -o xray-h3-server-linux-amd64 ./main
+
+      - name: Verify binary
+        working-directory: core
+        run: |
+          file xray-h3-server-linux-amd64
+          ./xray-h3-server-linux-amd64 version
+          test -s xray-h3-server-linux-amd64
+          ls -lh xray-h3-server-linux-amd64
+
+      - name: Get latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/releases/latest --jq '{id, tag_name}' > /tmp/release.json
+          cat /tmp/release.json
+          echo "release_id=$(jq -r .id /tmp/release.json)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(jq -r .tag_name /tmp/release.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload new asset under temp name
+        id: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/octet-stream" \
+            "repos/${{ github.repository }}/releases/${{ steps.release.outputs.release_id }}/assets?name=xray-h3-server-linux-amd64-new" \
+            --input core/xray-h3-server-linux-amd64 --jq '{id, name, size}' > /tmp/new-asset.json
+          cat /tmp/new-asset.json
+          echo "new_asset_id=$(jq -r .id /tmp/new-asset.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Delete old asset (if any)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          old_id="$(gh api repos/${{ github.repository }}/releases/${{ steps.release.outputs.release_id }}/assets \
+            --jq '.[] | select(.name == "xray-h3-server-linux-amd64") | .id' | head -n 1)"
+          if [ -n "$old_id" ]; then
+            gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$old_id"
+            echo "Deleted old asset id=$old_id"
+          else
+            echo "No existing xray-h3-server-linux-amd64 asset to delete"
+          fi
+
+      - name: Rename new asset to final name
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${{ github.repository }}/releases/assets/${{ steps.upload.outputs.new_asset_id }}" \
+            -f name=xray-h3-server-linux-amd64
+
+      - name: Verify published asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="$(gh api repos/${{ github.repository }}/releases/${{ steps.release.outputs.release_id }}/assets \
+            --jq '.[] | select(.name == "xray-h3-server-linux-amd64")')"
+          test -n "$asset"
+          echo "$asset" | jq '{name, size, browser_download_url, updated_at}'
+          size="$(echo "$asset" | jq -r .size)"
+          test "$size" -gt 30000000
+          echo "Asset size OK: $size bytes"

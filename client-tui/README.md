@@ -13,7 +13,7 @@ H3-REALITY 项目的最终用户客户端：**一个可执行文件** = 终端�
 
 1. 双击 / 运行 `client-tui-win-amd64.exe`（Windows）或 `./client-tui-linux-amd64`（Linux）。
 2. 主菜单选 `[1] 添加配置`，粘贴服务端的 VLESS 分享链接（形如
-   `vless://<UUID>@<host>:8446?encryption=none&security=reality&type=xhttp&mode=stream-one&enableH3=1&path=...&sni=...&pbk=...&sid=...#备注`），回车。
+   `vless://<UUID>@<host>:443?encryption=none&security=reality&type=xhttp&mode=stream-one&enableH3=1&path=...&sni=...&pbk=...&sid=...#备注`），回车。
    程序自动解析全部参数并校验（UUID / 端口 / REALITY / xhttp / sni / pbk），
    解析失败会红字提示且不保存。
 3. `[2] 配置列表` 可查看所有已存配置并切换当前使用哪个；`[5] 删除`、`[6] 重命名`。

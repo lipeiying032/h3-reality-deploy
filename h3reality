@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# =============================================================================
+# h3reality — H3 REALITY SNI 便携管理命令（部署成功后自动安装到 /usr/local/bin）
+#
+# 功能：日常增删/切换 SNI、查看状态/路由、输出分享链接、服务管理，
+#       无需再手动 ssh 改 server.json 或重跑整个部署脚本。
+#
+# 子命令（用户可记忆的短命令）：
+#   h3reality status            当前状态：SNI/dest/serverNames、端口、服务 active、监听端口、配置路径
+#   h3reality list              列出 fallbackDestRoutes 全部 SNI 路由条目
+#   h3reality switch <sni>      切换当前 SNI（改 dest + serverNames[0] + 路由，校验 H3 支持）
+#   h3reality add <sni>         添加 SNI 到 fallbackDestRoutes（校验 H3 支持 + DNS）
+#   h3reality remove <sni>      从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删）
+#   h3reality link              输出当前 VLESS 分享链接（全参数）
+#   h3reality restart|start|stop|log   服务管理（xray-h3 systemd）
+#   h3reality help              用法说明
+#   无参数 / 未知命令 → 打印 help + status
+#
+# 架构总览（每步 → 对应函数，[lib] 表示在 h3-lib.sh 中）：
+#
+#   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
+#   │ ① 命令分发    │──►│ ② SNI 校验    │──►│ ③ 配置修改    │──►│ ④ 校验+重启   │──►│ ⑤ 结果展示   │
+#   └────────────┘   └────────────┘   └────────────┘   └────────────┘   └────────────┘
+#    case 分发         validate_sni_h3  backup_config    run_test         show_status
+#    [main]           [lib]            update/add/       restart_service  list_routes
+#    ensure_probe                      remove_sni_route  [lib]            gen_vless_link
+#    [lib]                             [lib]             rollback [lib]   [lib]
+#
+# 说明：
+#   - 所有 SNI 校验（valid_domain/resolve_ip/H3 probe）与部署脚本共用同一函数
+#   - 修改 server.json 前自动备份（server.json.bak-h3reality-<ts>）
+#   - 改完 run -test 校验，失败自动回滚；成功 systemctl restart xray-h3
+#   - 非 root 自动 sudo 重执行（与部署脚本一致）
+#   - 中文输出，红=错误/拒绝，绿=成功，黄=警告
+# =============================================================================
+
+set -euo pipefail
+
+# ---------------- 引入公共函数库（与 deploy-h3-sni.sh 共用同一份逻辑） ----------------
+H3REALITY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! source "$H3REALITY_DIR/h3-lib.sh"; then
+  echo "错误: 未找到 h3-lib.sh（应与 h3reality 同目录）" >&2
+  exit 1
+fi
+
+require_root
+command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
+
+# ---------------- 用法说明 ----------------
+usage() {
+  cat <<'EOF'
+用法: h3reality <子命令> [参数]
+
+子命令:
+  status                 查看当前状态（SNI/dest/serverNames、端口、服务、监听、配置路径）
+  list                   列出 fallbackDestRoutes 全部 SNI 路由条目
+  switch <sni>           切换当前 SNI（改 dest + serverNames[0]，校验 H3 支持）
+  add <sni>              添加 SNI 到 fallbackDestRoutes（校验 H3 支持 + DNS）
+  remove <sni>           从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删）
+  link                   输出当前 VLESS 分享链接（全参数）
+  restart | start | stop 服务管理（xray-h3 systemd）
+  log                    查看 xray-h3 最近日志（journalctl 最近 100 行）
+  help                   显示本帮助
+EOF
+}
+
+# ---------------- 配置存在性与 H3 inbound 前置检查 ----------------
+require_config() {
+  detect_config_path
+  if [ ! -f "$CONFIG_PATH" ]; then
+    red "配置不存在: $CONFIG_PATH（请先运行 deploy-h3-sni.sh 完成首次部署）"
+    return 1
+  fi
+  find_h3_inbound || { red "未找到 H3 inbound（可能为官方内核 H2 降级配置）: $CONFIG_PATH"; return 1; }
+  return 0
+}
+
+# ---------------- 修改后统一流程：run -test 校验 → 失败回滚 → 重启 ----------------
+apply_and_reload() {
+  if ! run_test; then
+    rollback
+    die "配置校验失败，已回滚到修改前"
+  fi
+  green "配置校验通过"
+  if ! restart_service; then
+    rollback
+    die "服务重启失败，已回滚"
+  fi
+  green "服务已重启（$SERVICE）"
+}
+
+# ---------------- 状态展示 ----------------
+show_status() {
+  local port="" dest="" sn_list="" route_count="" cur_sni="" listen_info=""
+  if ! require_config; then
+    # 配置存在但无 H3 inbound 时，仍展示基础信息（降级配置场景）
+    if [ -f "$CONFIG_PATH" ]; then
+      banner yellow "h3reality status（降级/异常配置）"
+      echo "  配置路径:   $CONFIG_PATH"
+      if service_is_active; then
+        green "  服务状态:   active（$SERVICE）"
+      else
+        red "  服务状态:   inactive（$SERVICE）"
+      fi
+    fi
+    return 0
+  fi
+  cur_sni=$(get_current_sni) || cur_sni="?"
+  port=$(get_h3_port) || port="?"
+  sn_list=$(get_h3_server_names) || sn_list=""
+  dest=$(get_h3_dest) || dest=""
+  route_count=$(get_h3_route_count) || route_count="0"
+
+  banner green "h3reality status"
+  echo "  配置路径:   $CONFIG_PATH"
+  echo "  当前 SNI:   $cur_sni"
+  echo "  dest:       $dest"
+  echo "  serverNames: [ ${sn_list} ]"
+  echo "  H3 端口:    $port (UDP)"
+  echo "  路由条目数: ${route_count:-0}"
+  if service_is_active; then
+    green "  服务状态:   active（$SERVICE）"
+  else
+    red "  服务状态:   inactive（$SERVICE）"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    listen_info=$(ss -ulnp 2>/dev/null | grep ":${port} " || true)
+  else
+    listen_info=$(netstat -ulnp 2>/dev/null | grep ":${port} " || true)
+  fi
+  if [ -n "$listen_info" ]; then
+    green "  监听端口:   :${port} (UDP)"
+    echo "$listen_info" | sed 's/^/              /'
+  else
+    yellow "  监听端口:   :${port} 未监听（服务可能未运行）"
+  fi
+}
+
+# ---------------- 列出 fallbackDestRoutes ----------------
+list_routes() {
+  local out="" i=0 cur_sni=""
+  require_config || return 1
+  cur_sni=$(get_current_sni) || cur_sni="?"
+  out=$(get_h3_routes) || true
+  banner green "fallbackDestRoutes"
+  if [ -z "$out" ]; then
+    yellow "  共 0 条路由（fallbackDestRoutes 为空）"
+    return 0
+  fi
+  echo "  共 $(echo "$out" | wc -l | tr -d ' ') 条路由:"
+  while IFS=$'\t' read -r k v; do
+    i=$((i + 1))
+    if [ "$k" = "$cur_sni" ]; then
+      yellow "  [$i] $k -> $v（当前 dest SNI）"
+    else
+      echo "  [$i] $k -> $v"
+    fi
+  done <<< "$out"
+}
+
+# ---------------- switch / add / remove ----------------
+cmd_switch() {
+  local new_sni="$1"
+  require_config || die "无法执行 switch"
+  ensure_probe
+  validate_sni_h3 "$new_sni" || die "SNI 校验未通过，未做任何修改"
+  backup_config "h3reality"
+  if ! update_sni_routes "$new_sni"; then
+    rollback
+    die "修改配置失败，已回滚"
+  fi
+  apply_and_reload
+  green "已切换当前 SNI -> $new_sni"
+  echo
+  show_status
+}
+
+cmd_add() {
+  local new_sni="$1"
+  require_config || die "无法执行 add"
+  ensure_probe
+  validate_sni_h3 "$new_sni" || die "SNI 校验未通过，未做任何修改"
+  backup_config "h3reality"
+  if ! add_sni_route "$new_sni"; then
+    rollback
+    die "添加路由失败，已回滚"
+  fi
+  apply_and_reload
+  green "已添加路由: $new_sni -> $new_sni:443"
+  echo
+  list_routes
+}
+
+cmd_remove() {
+  local old_sni="$1" cur_sni=""
+  require_config || die "无法执行 remove"
+  cur_sni=$(get_current_sni) || cur_sni="?"
+  if [ "$cur_sni" = "$old_sni" ]; then
+    yellow "注意: $old_sni 是当前 dest SNI，移除其路由后主 SNI 仍走 dest；如需切换请先: h3reality switch <新sni>"
+  fi
+  backup_config "h3reality"
+  if ! remove_sni_route "$old_sni"; then
+    rollback
+    die "移除失败，已回滚"
+  fi
+  apply_and_reload
+  green "已移除路由: $old_sni"
+  echo
+  list_routes
+}
+
+# ---------------- link：输出当前 VLESS 分享链接（全参数） ----------------
+cmd_link() {
+  local cur_sni="" h3_port="" server_ip=""
+  require_config || die "无法生成分享链接"
+  detect_xray || die "未检测到 xray 内核，无法派生 publicKey"
+  cur_sni=$(get_current_sni) || die "无法读取当前 SNI"
+  h3_port=$(get_h3_port) || die "无法读取 H3 端口"
+  extract_client_params "" || true
+  if [ -z "$UUID" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$SHORT_ID" ]; then
+    die "无法生成分享链接（缺少 UUID/publicKey/shortId），请检查 $CONFIG_PATH"
+  fi
+  server_ip=$(get_server_ip)
+  banner green "当前 VLESS 分享链接（H3 全参数）"
+  gen_vless_link fork "$server_ip" "$h3_port" "$UUID" "$PUBLIC_KEY" "$SHORT_ID" "$cur_sni"
+  echo
+  yellow "  节点: $cur_sni:${h3_port}（UDP）  配置: $CONFIG_PATH"
+}
+
+# ---------------- 服务管理（restart/start/stop） ----------------
+cmd_service() {
+  local action="$1"
+  case "$action" in
+    restart)
+      if restart_service; then
+        green "服务已重启: $SERVICE"
+      else
+        red "服务重启失败（$SERVICE）"
+        return 1
+      fi
+      ;;
+    start)
+      if start_service; then
+        green "服务已启动: $SERVICE"
+      else
+        red "服务启动失败（$SERVICE）"
+        return 1
+      fi
+      ;;
+    stop)
+      if stop_service; then
+        green "服务已停止: $SERVICE"
+      else
+        red "服务停止失败（$SERVICE）"
+        return 1
+      fi
+      ;;
+  esac
+  if service_is_active; then
+    green "当前状态: active（$SERVICE）"
+  else
+    red "当前状态: inactive（$SERVICE）"
+  fi
+}
+
+# ---------------- log：查看 xray-h3 最近日志 ----------------
+cmd_log() {
+  if ! command -v journalctl >/dev/null 2>&1; then
+    yellow "未找到 journalctl，无法查看日志（系统日志可能由其他工具管理）"
+    return 0
+  fi
+  banner yellow "xray-h3 最近日志（最近 100 行）"
+  journalctl -u "$SERVICE" -n 100 --no-pager || true
+}
+
+# ---------------- 命令分发 ----------------
+cmd="${1:-}"
+case "$cmd" in
+  "")
+    usage
+    echo
+    show_status
+    ;;
+  status)
+    show_status
+    ;;
+  list)
+    list_routes
+    ;;
+  switch)
+    if [ $# -lt 2 ]; then
+      red "用法: h3reality switch <sni>"
+      exit 1
+    fi
+    cmd_switch "$2"
+    ;;
+  add)
+    if [ $# -lt 2 ]; then
+      red "用法: h3reality add <sni>"
+      exit 1
+    fi
+    cmd_add "$2"
+    ;;
+  remove)
+    if [ $# -lt 2 ]; then
+      red "用法: h3reality remove <sni>"
+      exit 1
+    fi
+    cmd_remove "$2"
+    ;;
+  link)
+    cmd_link
+    ;;
+  restart|start|stop)
+    cmd_service "$cmd"
+    ;;
+  log)
+    cmd_log
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    yellow "未知命令: $cmd"
+    echo
+    usage
+    echo
+    show_status
+    ;;
+esac

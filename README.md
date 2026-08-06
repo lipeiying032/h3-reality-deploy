@@ -15,7 +15,7 @@
 - **探测伪装**：无认证的 QUIC 探测流被 SNI 感知的字节级 UDP relay 原样转发到真实站点，
   探测者看到的握手/证书/响应与直连真实站点完全一致；
 - **Chrome 指纹**：客户端握手指纹对齐 Chrome（uTLS quicifySpec，5 组 groups、ALPS→h3、TP 干净）；
-- **一键部署**：全新 VPS 上 `git clone` 后单条命令完成 SNI 探测、配置生成、systemd 服务、部署验证；
+- **一键部署**：全新 VPS 上 curl 下载仓库后单条命令完成 SNI 探测、配置生成、systemd 服务、部署验证；
 - **探针自给自足**：无 Go 环境也能跑——同目录二进制 → 源码自动编译 → GitHub Release 下载三级兜底；
 - **自动引导**：内核检测、server.json 生成、systemd 服务创建、端口冲突检测、VLESS 分享链接输出全自动。
 
@@ -29,7 +29,7 @@
 │ serverName=SNI  fp=chrome  alpn=["h3"]    │
 │ ClientHello: random=认证载荷（不可区分）    │
 └────────────────────┬──────────────────────┘
-                     │ QUIC/UDP :8446
+                     │ QUIC/UDP :443
                      ▼
 ┌──────────── 服务端（fork xray）────────────┐
 │ ① QUIC 预检：解密 Initial → 提取 ClientHello│
@@ -68,30 +68,46 @@ go build -mod=vendor ./...
 GOOS=windows GOARCH=amd64 go build -mod=vendor -o xray-h3-win-amd64.exe ./main
 ```
 
-> 注意：H3（8446）节点必须用此 fork 内核，官方内核不支持 REALITY+H3。
+> 注意：H3 节点必须用此 fork 内核，官方内核不支持 REALITY+H3。
 
 ---
 
 ## 快速开始（全新 VPS）
 
 ```bash
-git clone https://github.com/lipeiying032/h3-reality-deploy.git
+# 全新 VPS 一键部署（目录已存在会重新下载并覆盖，等价于更新到最新版）
+rm -rf h3-reality-deploy
+mkdir -p h3-reality-deploy
+curl -fsSL -o h3-reality-deploy.tar.gz https://codeload.github.com/lipeiying032/h3-reality-deploy/tar.gz/refs/heads/main || {
+  rm -f h3-reality-deploy.tar.gz
+  echo "错误：仓库下载失败，请检查："
+  echo "  1. GitHub 网络是否可达（可验证：curl -fsSI https://github.com）"
+  echo "  2. 是否被防火墙或代理拦截"
+  exit 1
+}
+tar -xzf h3-reality-deploy.tar.gz --strip-components=1 -C h3-reality-deploy || {
+  rm -f h3-reality-deploy.tar.gz
+  echo "错误：解压失败，请检查磁盘空间或网络下载是否完整"
+  exit 1
+}
+rm -f h3-reality-deploy.tar.gz
 cd h3-reality-deploy
 sudo bash deploy-h3-sni.sh
 ```
 
 脚本自动完成：
 
-1. 交互输入 SNI（默认 `ea.com`，支持 `q/quit` 退出）；
+1. 交互输入 SNI（直接回车则从维护库 [h3-reality-sni](https://github.com/lipeiying032/h3-reality-sni) 随机挑选并自动验证，支持 `q/quit` 退出）；
 2. 域名格式校验 + DNS 解析 + **H3 支持探测**——不支持则红色拒绝并建议换 SNI（最多 5 次）；
 3. 探测工具自给自足：同目录二进制 → 源码 + Go 自动编译 → GitHub Release 下载；
-4. xray 内核自动检测（`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH`）；
-5. 没有 `server.json` → 自动生成最小可运行配置（8443 H2 + 8446 H3，UUID/密钥自动生成）；
+4. xray 内核自动获取：检测本地 → Release 预编译下载（`xray-h3-server-linux-amd64`）→ `core/` 源码编译兜底；
+5. 没有 `server.json` → 自动生成最小可运行配置（默认端口 443：H2 TCP + H3 UDP，UUID/密钥自动生成）；
 6. 没有 systemd 服务 → 自动创建 `xray-h3.service` 并 `enable`；
 7. `run -test` 校验 → 重启 → 端口监听 + relay 闭环验证；
-8. 输出完整 **VLESS 分享链接**（`vless://...` 含 `sni/pbk/sid/fp=chrome/type=xhttp`），可直接导入客户端。
+8. 输出完整 **VLESS 分享链接**（`vless://...` 含 `sni/pbk/sid/fp=chrome/type=xhttp`），可直接导入客户端；
+9. 部署成功后自动安装 `h3reality` 便携管理命令（`/usr/local/bin`），日常可用 `h3reality status|list|switch|add|remove|link|restart|log` 管理节点。
 
-> 已有旧配置时：只更新 8446 inbound 的 `dest`/`serverNames`/`fallbackDestRoutes[SNI]`，
+> 已有旧配置时：按特征定位 H3 inbound，只更新其 `dest`/`serverNames`/`fallbackDestRoutes[SNI]`，
 > 其余 inbound 与 17 条路由条目不动，自动备份后可回滚。
 
 ### 手动部署（不想用脚本）
@@ -109,7 +125,9 @@ h3-reality-deploy/
 ├── H3-REALITY-README.md   # 完整实现原理文档（12 节：认证/指纹/relay/部署/FAQ）
 ├── REQUIREMENTS.md        # 开源所需的 GitHub 权限与 Token 导出指南
 ├── core/                  # fork 内核完整源码（v26.7.28 + 全部魔改，含 vendor/，MIT）
-├── deploy-h3-sni.sh       # 服务端一键部署脚本（自包含引导版）
+├── deploy-h3-sni.sh       # 服务端一键部署脚本（交互引导，逻辑在 h3-lib.sh）
+├── h3-lib.sh              # 公共函数库（deploy 与 h3reality 共享）
+├── h3reality              # 便携管理命令（status/list/switch/add/remove/link 等）
 ├── probe-h3-sni.go        # H3 探测工具源码（Go 1.22+，quic-go http3）
 ├── probe-h3-sni           # 预编译静态二进制（linux/amd64，无 Go 环境直接可用）
 ├── LICENSE                # MIT

@@ -1,345 +1,295 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-h3-sni.sh — H3 REALITY SNI 一键部署脚本（服务端，自包含引导版）
+# deploy-h3-sni.sh — H3 REALITY SNI 一键部署脚本（服务端）
 #
 # 功能：
-#   1. 交互输入 SNI（默认 ea.com，q/quit 退出）
-#   2. 校验域名格式 + DNS 解析
-#   3. 探针测试该 SNI 的 HTTP/3 支持：任何 HTTP 响应 = 支持；
-#      超时 / CRYPTO_ERROR = 不支持 → 红色拒绝并建议换 SNI（最多 5 次）
-#   4. 探针自给自足（使用者无需预装 Go）：
-#      ① 同目录 probe-h3-sni 二进制
-#      ② 同目录 probe-h3-sni.go + 系统有 go → 自动 go build
-#      ③ 都没有 → 从 GitHub Release 下载预编译二进制
-#      ④ 下载失败 → 黄色警告 + 手动获取方式（脚本已内嵌源码，需 Go 1.22+ 编译）
-#   5. xray-h3 fork 内核自动检测：
-#      /opt/xray/xray-linux-amd64 → /usr/local/bin/xray → PATH 中的 xray；
-#      找不到 → 黄色警告 + 两种引导（①联系作者 ②官方内核 H2 降级模式）
-#   6. server.json 自动生成（不存在时）：8443 H2 + 8446 H3 双 inbound，
-#      UUID/privateKey/publicKey/shortId 自动生成；已存在 → 只改 8446 的
-#      dest/serverNames/fallbackDestRoutes[SNI]（其余条目不动）
-#   7. systemd 服务自动创建（xray-h3.service 不存在时），已存在只 restart
-#   8. 端口冲突检测（8446 UDP / 8443 TCP，被非 xray 进程占用时黄色警告 + 确认）
-#   9. 部署后输出完整 VLESS 分享链接（vless://...，含 sni/host/pbk/sid/fp/type）
+#   1. 交互输入 SNI（直接回车：从 SNI 维护库随机挑选，q/quit 退出）
+#   2. 校验域名格式 + DNS 解析 + H3 探测（validate_sni_h3，与 h3reality 共用）
+#   3. 探针自给自足（二进制 → 源码编译 → Release 下载，ensure_probe）
+#   4. xray-h3 fork 内核自动获取（Release 下载 → core/ 源码编译兜底，detect_xray；
+#      官方 xray 仅视为干扰项，忽略并自动获取 fork 内核，不询问、不降级）
+#   5. server.json（XRAY_CONFIG，默认 /opt/xray/server.json）自动生成（不存在时）
+#      或按特征修改 H3 inbound（已存在时）
+#   6. systemd 服务自动创建（xray-h3.service 不存在时），已存在只 restart
+#   7. 端口冲突处理（始终检测，已有配置时端口以配置为准）：自定义/随机端口
+#      （H2_PORT/H3_PORT 可覆盖）
+#   8. 部署后输出完整 VLESS 分享链接（gen_vless_link，与 h3reality link 共用）
+#   9. 部署成功后自动安装便携管理命令 h3reality（幂等，install_h3reality）
+#
+# 公共逻辑全部在 h3-lib.sh（本脚本与 h3reality 共同 source），本文件只保留
+# 交互引导与步骤编排；SNI 校验、配置修改、链接生成等核心行为两入口完全一致。
+#
+# 架构总览（每步 → 对应函数，[lib] 表示在 h3-lib.sh 中）：
+#
+#   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+#   │ ① 交互输入 SNI │──►│ ② SNI 验证    │──►│ ③ 内核获取    │──►│ ④ 配置生成/修改 │
+#   └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
+#    input_sni_fork     validate_sni_h3  detect_xray       generate_*_config
+#    fetch/random_sni   [lib]            confirm_mode      update_sni_routes [lib]
+#    [lib]              probe_h3 [lib]   download/build    backup_config [lib]
+#                                        [lib]
+#   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+#   │ ⑤ 服务部署    │──►│ ⑥ 部署验证    │──►│ ⑦ 链接输出    │
+#   └─────────────┘   └─────────────┘   └─────────────┘
+#    ensure_service     ss + relay       gen_vless_link [lib]
+#    restart_service    probe_h3 [lib]   install_h3reality
+#    [lib]
 #
 # 说明：
-#   - 已有配置时只改 8446 inbound，绝不触碰 8443 / 8445
-#   - 内核路径/配置路径自动检测（默认保留 /opt/xray 为首选），均通过变量传递
+#   - 已有配置时按特征定位 H3 inbound（network=xhttp 且 alpn 含 h3，
+#     或存在 fallbackDest/fallbackDestRoutes）修改，绝不触碰其他 inbound
+#   - 官方 xray（/usr/local/bin/xray 或 PATH 中的 xray）与本项目无关，只提示并忽略；
+#     本项目 fork 内核固定安装到 /opt/xray/xray-linux-amd64
+#   - 端口冲突检测始终运行（不被"存在配置文件"短路）：已有配置时端口以配置为准，
+#     但官方 xray 等进程占用目标端口（443 TCP/UDP）时仍黄色警告并询问
 #   - 非 root 自动用 sudo 重执行（已 root 则跳过）
-#   - JSON 编辑优先 python3，其次 jq
+#   - JSON 编辑优先 jq，无 jq 用 sed/awk 兜底（不依赖 python3）
 #   - 中文输出，红=错误/拒绝，绿=成功，黄=警告
 # =============================================================================
 
-set -u
-set -o pipefail
+set -Eeuo pipefail
 
-# ---------------- 颜色 ----------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-red()    { printf "${RED}%s${NC}\n" "$*"; }
-green()  { printf "${GREEN}%s${NC}\n" "$*"; }
-yellow() { printf "${YELLOW}%s${NC}\n" "$*"; }
-
-# ---------------- 路径与常量 ----------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROBE="$SCRIPT_DIR/probe-h3-sni"
-PROBE_SRC="$SCRIPT_DIR/probe-h3-sni.go"
-PROBE_MOD_DIR="$SCRIPT_DIR/probe-mod"
-PROBE_RELEASE_URL="https://github.com/lipeiying032/h3-reality-deploy/releases/latest/download/probe-h3-sni-linux-amd64"
-XRAY_BIN=""
-CONFIG_PATH=""
-SERVICE=xray-h3
-UNIT_FILE=/etc/systemd/system/xray-h3.service
-H2_PORT=8443
-H3_PORT=8446
-PROBE_TIMEOUT=12s
-MAX_ATTEMPTS=5
-DEGRADED=0
-CONFIG_GENERATED=0
-sni=""
-probe_out=""
-TS=""
-BACKUP=""
-UUID=""
-PRIVATE_KEY=""
-PUBLIC_KEY=""
-SHORT_ID=""
-
-# 已知支持 H3 的建议 SNI 列表（2026-08 实测）
-SUGGEST_SNIS="ea.com google.com www.google.com youtube.com www.youtube.com
-facebook.com www.facebook.com cloudflare-quic.com cdn.cloudflare.steamstatic.com
-steampipe.akamaized.net eaassets-a.akamaihd.net ubisoft.com www.epicgames.com
-www.nintendo.com www.xbox.com"
-
-# ---------------- 工具函数 ----------------
-die() { red "错误: $*"; exit 1; }
-
-# URL 编码：仅编码非 unreserved 字符（RFC 3986），用于 vless:// 链接的参数值
-urlencode() {
-  local s="$1" c="" out=""
-  while [ -n "$s" ]; do
-    c="${s%"${s#?}"}"
-    case "$c" in
-      [a-zA-Z0-9._~-]) out+="$c" ;;
-      *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
-    esac
-    s="${s#?}"
-  done
-  printf '%s' "$out"
+# 任何未预期的失败都输出可见错误（行号 + 退出码），绝不静默退出
+_deploy_err_trap() {
+  local line="${1:-?}" rc=$?
+  printf '\033[0;31m错误: 脚本异常退出（第 %s 行，退出码 %s）\033[0m\n' "$line" "$rc" >&2
+  exit "$rc"
 }
+trap '_deploy_err_trap "$LINENO"' ERR
 
-# 非 root → sudo 重执行
-if [ "$(id -u)" -ne 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
-    yellow "当前用户非 root，使用 sudo 重新执行..."
-    exec sudo bash "$0" "$@"
-  else
-    die "需要 root 权限（且未找到 sudo），请用 root 运行本脚本"
-  fi
+# ---------------- 引入公共函数库（与 h3reality 共用同一份逻辑） ----------------
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=h3-lib.sh
+if ! source "$LIB_DIR/h3-lib.sh"; then
+  echo "错误: 无法加载公共函数库 $LIB_DIR/h3-lib.sh（缺失或语法错误），脚本终止。" >&2
+  exit 1
 fi
 
-# DNS 解析：getent → dig → host，返回第一个 IPv4 或失败
-resolve_ip() {
-  local host="$1" ip=""
-  if command -v getent >/dev/null 2>&1; then
-    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
-    [ -z "$ip" ] && ip=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
-  fi
-  if [ -z "$ip" ] && command -v dig >/dev/null 2>&1; then
-    ip=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
-  fi
-  if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
-    ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF; exit}')
-  fi
-  [ -n "$ip" ] && { echo "$ip"; return 0; }
-  return 1
+require_root
+command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
+
+# ===== 阶段 1: 端口冲突检测（始终运行，已有配置时端口以配置为准） =====
+
+# 交互输入自定义端口：数字 + 1024-65535 + 未占用；非法输入红字重试；
+# 成功输出端口并返回 0，直接回车取消返回 1（由调用方转随机端口）
+input_custom_port() {
+  local proto="$1" label="$2" input
+  while :; do
+    printf "请输入新的 %s 端口（1024-65535，需未被占用；直接回车改为随机）: " "$label" >&2
+    read -r input || { echo; die "读取输入失败"; }
+    if [ -z "$input" ]; then
+      return 1
+    fi
+    case "$input" in
+      ''|*[!0-9]*) red "端口必须是数字，请重新输入" >&2; continue ;;
+    esac
+    if [ "$input" -lt 1024 ] || [ "$input" -gt 65535 ]; then
+      red "端口必须在 1024-65535 之间，请重新输入" >&2; continue
+    fi
+    if port_in_use "$proto" "$input"; then
+      red "端口 $input 已被占用，请重新输入" >&2; continue
+    fi
+    echo "$input"
+    return 0
+  done
 }
 
-# 域名格式校验（简单正则：至少两段，字母/数字/连字符）
-valid_domain() {
-  echo "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+# 过滤 ss 行：剔除本项目内核进程占用的行，其余（官方 xray 或其他进程）视为冲突
+foreign_occupants() {
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if is_own_kernel_process "$line"; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done
 }
 
-# 内嵌探针源码（与仓库根目录 probe-h3-sni.go 保持同步）
-EMBEDDED_PROBE_SRC='// probe-h3-sni 是一个极简 HTTP/3 (QUIC) 支持探测工具，用于在部署 H3 REALITY
-// 节点前确认某个 SNI 是否真的有 H3 端点，以及部署后用 -addr 指向本机 8446
-// 验证 relay 闭环（预检把未认证的 QUIC 流原样转发到真实 dest，由 dest 完成握手）。
-//
-// 用法:
-//
-//	probe-h3-sni -sni <域名>                  # 直连 https://<域名>/ 探测该 SNI 的 H3 支持
-//	probe-h3-sni -sni <域名> -addr <ip:port>  # 连 https://<addr>/，但 TLS SNI 仍用 -sni
-//	probe-h3-sni -sni <域名> -timeout 15s     # 自定义握手超时（默认 12s）
-//
-// 判定规则:
-//
-//	任何 HTTP 响应（200/301/307/400/403 等）=> 完整握手，STATUS: <code>，退出码 0
-//	握手/请求错误（超时、CRYPTO_ERROR 0x128/0x150 等）=> ERR: <错误>，退出码 1
-//	参数错误 => 退出码 2
-package main
-
-import (
-	"context"
-	"crypto/tls"
-	"flag"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"strings"
-	"time"
-
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-)
-
-func main() {
-	sni := flag.String("sni", "", "要探测/发送的 SNI 域名（必填）")
-	timeout := flag.Duration("timeout", 12*time.Second, "握手与请求总超时")
-	addr := flag.String("addr", "", "可选：要连接的 host:port（例如 127.0.0.1:8446 用于 relay 闭环验证）；为空则直连 https://<sni>/")
-	flag.Parse()
-
-	if *sni == "" {
-		fmt.Fprintln(os.Stderr, "参数错误: -sni 必填")
-		fmt.Fprintln(os.Stderr, "用法: probe-h3-sni -sni <域名> [-timeout 12s] [-addr host:port]")
-		os.Exit(2)
-	}
-	if *timeout <= 0 {
-		fmt.Fprintln(os.Stderr, "参数错误: -timeout 必须为正数")
-		os.Exit(2)
-	}
-
-	// 目标 URL：默认 https://<sni>/；-addr 模式连 https://<addr>/（TLS SNI 仍是 -sni）。
-	host := *sni
-	if *addr != "" {
-		host = normalizeHostPort(*addr)
-	}
-	u := &url.URL{Scheme: "https", Host: host, Path: "/"}
-
-	tlsCfg := &tls.Config{
-		ServerName:         *sni,
-		InsecureSkipVerify: true, // 只关心握手是否完成，不校验证书链
-		NextProtos:         []string{"h3"},
-	}
-	quicCfg := &quic.Config{
-		HandshakeIdleTimeout: *timeout,
-		MaxIdleTimeout:       30 * time.Second,
-	}
-
-	transport := &http3.Transport{
-		QUICConfig:      quicCfg,
-		TLSClientConfig: tlsCfg,
-	}
-	defer transport.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		fmt.Printf("ERR: %v\n", err)
-		os.Exit(1)
-	}
-	// :authority 固定为目标 host（-addr 模式为 addr，否则为 SNI）。
-	req.Host = u.Host
-
-	resp, err := transport.RoundTrip(req)
-	if err != nil {
-		fmt.Printf("ERR: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	fmt.Printf("STATUS: %d\n", resp.StatusCode)
-	os.Exit(0)
-}
-
-// normalizeHostPort 保证 host:port 完整：无端口补 443，IPv6 加方括号。
-func normalizeHostPort(hostport string) string {
-	hostport = strings.TrimSpace(hostport)
-	if _, _, err := net.SplitHostPort(hostport); err == nil {
-		return hostport
-	}
-	// 纯 IP（含 IPv6）或裸域名：按 host 处理
-	if ip := net.ParseIP(hostport); ip != nil {
-		if strings.Contains(hostport, ":") {
-			return "[" + hostport + "]:443"
-		}
-		return hostport + ":443"
-	}
-	return hostport + ":443"
-}
-'
-
-# 用源码编译探针（优先仓库自带 probe-mod，其次内嵌源码临时编译）
-# 需要 go 环境 + 可访问 proxy.golang.org 拉取 quic-go 依赖
-build_probe_from_source() {
-  local tmpdir rc
-  if [ -f "$PROBE_MOD_DIR/go.mod" ] && [ -f "$PROBE_MOD_DIR/main.go" ]; then
-    (
-      cd "$PROBE_MOD_DIR" || exit 1
-      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o "$PROBE" . || exit 1
-    )
-    [ -x "$PROBE" ] && { green "探针编译成功（probe-mod）: $PROBE"; return 0; }
-  fi
-  tmpdir=$(mktemp -d)
-  if [ -f "$PROBE_SRC" ]; then
-    cp "$PROBE_SRC" "$tmpdir/main.go"
-  else
-    printf '%s\n' "$EMBEDDED_PROBE_SRC" > "$tmpdir/main.go"
-  fi
-  (
-    cd "$tmpdir" || exit 1
-    go mod init probe-h3-sni >/dev/null 2>&1 || exit 1
-    go mod tidy >/dev/null 2>&1 || exit 1
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o "$PROBE" . || exit 1
-  )
-  rc=$?
-  rm -rf "$tmpdir"
-  return $rc
-}
-
-# 从 GitHub Release 下载预编译探针（curl 优先，其次 wget）
-download_probe_release() {
-  yellow "尝试从 GitHub Release 下载预编译探针..."
-  yellow "  $PROBE_RELEASE_URL"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout 15 --max-time 120 -o "$PROBE" "$PROBE_RELEASE_URL" || return 1
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=15 -T 120 -O "$PROBE" "$PROBE_RELEASE_URL" || return 1
-  else
-    return 1
-  fi
-  chmod +x "$PROBE"
-  [ -x "$PROBE" ] || return 1
-  return 0
-}
-
-# 确保探针可用：
-#   ① 同目录二进制 → ② 同目录源码 + go 编译 → ③ Release 下载 → ④ 内嵌源码提示
-ensure_probe() {
-  if [ -x "$PROBE" ]; then
-    green "使用探针: $PROBE"
+# 检测 ${H3_PORT} UDP / ${H2_PORT} TCP 被非本项目内核进程占用时黄色警告 →
+# 询问自定义端口 [y/N] → 自定义或自动随机；端口最终确定后打印绿色摘要
+check_port_conflicts() {
+  local ans new_port occupied
+  if ! command -v ss >/dev/null 2>&1; then
+    yellow "警告: 未找到 ss，跳过端口冲突检测"
     return 0
   fi
-  if [ -f "$PROBE_SRC" ] && command -v go >/dev/null 2>&1; then
-    yellow "未找到探针二进制，检测到 Go 环境，尝试编译 probe-h3-sni.go..."
-    if build_probe_from_source; then
-      green "探针编译成功: $PROBE"
+  # 已有本项目配置时端口以配置为准（可能不是 443）；无配置时用目标端口。
+  # 端口冲突检测始终运行，不因"存在配置文件"短路
+  if [ -f "$CONFIG_PATH" ]; then
+    if [ "$DEGRADED" -eq 1 ]; then
+      if new_port=$(get_h2_port); then H2_PORT="$new_port"; fi
+    else
+      if new_port=$(get_h3_port); then H3_PORT="$new_port"; fi
+      if new_port=$(get_h2_port); then H2_PORT="$new_port"; fi
+    fi
+  fi
+
+  # H3（UDP）冲突处理（降级模式不部署 H3，跳过）
+  if [ "$DEGRADED" -eq 0 ]; then
+    occupied=$(ss -ulnp 2>/dev/null | grep ":${H3_PORT} " | foreign_occupants || true)
+    if [ -n "$occupied" ]; then
+      yellow "警告: UDP ${H3_PORT} 被其他进程占用（可能为官方 xray）："
+      echo "$occupied" | sed 's/^/  UDP /' || true
+      printf "UDP ${H3_PORT} 被占用，是否自定义端口？[y/N] "
+      read -r ans || { echo; die "读取输入失败"; }
+      case "$ans" in
+        y|Y)
+          if new_port=$(input_custom_port udp "H3(UDP)"); then
+            H3_PORT="$new_port"
+            yellow "H3 端口已设置为 $H3_PORT（客户端分享链接将带此端口）"
+          else
+            if new_port=$(pick_random_port udp); then
+              H3_PORT="$new_port"
+              yellow "未输入自定义端口，自动使用随机端口 ${H3_PORT}（UDP）"
+            else
+              die "无法找到空闲 UDP 端口"
+            fi
+          fi
+          ;;
+        *)
+          if new_port=$(pick_random_port udp); then
+            H3_PORT="$new_port"
+            yellow "已使用随机端口 ${H3_PORT}（UDP）"
+          else
+            die "无法找到空闲 UDP 端口"
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  # H2（TCP）冲突处理
+  occupied=$(ss -tlnp 2>/dev/null | grep ":${H2_PORT} " | foreign_occupants || true)
+  if [ -n "$occupied" ]; then
+    yellow "警告: TCP ${H2_PORT} 被其他进程占用（可能为官方 xray）："
+    echo "$occupied" | sed 's/^/  TCP /' || true
+    printf "TCP ${H2_PORT} 被占用，是否自定义端口？[y/N] "
+    read -r ans || { echo; die "读取输入失败"; }
+    case "$ans" in
+      y|Y)
+        if new_port=$(input_custom_port tcp "H2(TCP)"); then
+          H2_PORT="$new_port"
+          yellow "H2 端口已设置为 $H2_PORT（客户端分享链接将带此端口）"
+        else
+          if new_port=$(pick_random_port tcp); then
+            H2_PORT="$new_port"
+            yellow "未输入自定义端口，自动使用随机端口 ${H2_PORT}（TCP）"
+          else
+            die "无法找到空闲 TCP 端口"
+          fi
+        fi
+        ;;
+      *)
+        if new_port=$(pick_random_port tcp); then
+          H2_PORT="$new_port"
+          yellow "已使用随机端口 ${H2_PORT}（TCP）"
+        else
+          die "无法找到空闲 TCP 端口"
+        fi
+        ;;
+    esac
+  fi
+
+  green "最终端口: H2=${H2_PORT} (TCP) / H3=${H3_PORT} (UDP)"
+}
+
+# ===== 阶段 2: 交互输入 SNI（fork 完整模式：格式 + DNS + H3 探测 + 拒绝循环） =====
+input_sni_fork() {
+  local attempt=0 input auto=0
+  sni=""
+  while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    if [ "$auto" -eq 0 ]; then
+      if [ "${#SNI_LIST[@]}" -gt 0 ]; then
+        printf "请输入 SNI（直接回车：从维护库随机挑选 SNI，q/quit 退出）[%d/%d]: " "$attempt" "$MAX_ATTEMPTS"
+      else
+        printf "请输入 SNI（q/quit 退出）[%d/%d]: " "$attempt" "$MAX_ATTEMPTS"
+      fi
+      read -r input || { echo; die "读取输入失败"; }
+      if [ -z "$input" ]; then
+        if [ "${#SNI_LIST[@]}" -eq 0 ]; then
+          red "SNI 不能为空（SNI 库不可用），请手动输入"
+          continue
+        fi
+        auto=1
+        input=$(random_sni)
+        yellow "已从 SNI 维护库随机挑选: $input"
+      else
+        auto=0
+      fi
+      input=$(echo "$input" | tr 'A-Z' 'a-z' | xargs)
+    else
+      # 随机模式：H3 探测失败自动换下一个
+      input=$(random_sni)
+      yellow "已自动换下一个随机 SNI: $input"
+    fi
+    case "$input" in
+      q|quit) echo "已退出，未做任何修改。"; exit 1 ;;
+      "") red "SNI 不能为空，请手动输入"; auto=0; continue ;;
+    esac
+    sni="$input"
+
+    # 与 h3reality 完全相同的三段校验：格式 → DNS → H3 探测
+    if validate_sni_h3 "$sni"; then
       return 0
     fi
-    yellow "源码编译失败（可能无法访问 proxy.golang.org），尝试下载预编译二进制..."
-  elif [ -f "$PROBE_SRC" ]; then
-    yellow "未找到探针二进制，且本机没有 Go 环境，尝试下载预编译二进制..."
-  else
-    yellow "未找到探针二进制与源码，尝试下载预编译二进制..."
-  fi
-  if download_probe_release; then
-    green "探针下载成功: $PROBE"
-    return 0
-  fi
-  # 最后手段：黄色警告 + 手动获取方式
-  yellow "警告: 探针获取失败，请手动获取后重试："
-  yellow "  方式1: 在 GitHub Releases 页面下载 probe-h3-sni-linux-amd64，放到本脚本同目录"
-  yellow "  方式2: 脚本已内嵌探针源码（EMBEDDED_PROBE_SRC），需 Go 1.22+ 编译："
-  yellow "         提取内嵌源码为 main.go，执行 go mod init probe-h3-sni && go mod tidy &&"
-  yellow "         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o probe-h3-sni ."
-  yellow "  方式3: curl -fL -o probe-h3-sni $PROBE_RELEASE_URL && chmod +x probe-h3-sni"
-  die "探针不可用，无法进行 H3 探测。"
-}
-
-# ---------------- xray 内核检测 ----------------
-# 检测顺序：/opt/xray/xray-linux-amd64 → /usr/local/bin/xray → PATH 中 xray
-detect_xray() {
-  local cand v
-  XRAY_BIN=""
-  for cand in /opt/xray/xray-linux-amd64 /usr/local/bin/xray; do
-    if [ -x "$cand" ]; then
-      XRAY_BIN="$cand"
-      break
+    red "该 SNI 未通过校验，已拒绝部署: $sni"
+    yellow "可参考 https://github.com/lipeiying032/h3-reality-sni 的维护库，或直接回车让脚本随机挑选"
+    sni=""
+    if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+      if [ "$auto" -eq 1 ]; then
+        red "随机挑选的 $MAX_ATTEMPTS 个 SNI 均不支持 H3，请手动输入可用 SNI。"
+        auto=0
+        attempt=0
+        continue
+      fi
+      red "连续 $MAX_ATTEMPTS 次未通过，退出。"
+      exit 1
     fi
   done
-  if [ -z "$XRAY_BIN" ] && command -v xray >/dev/null 2>&1; then
-    XRAY_BIN="$(command -v xray)"
-  fi
-  if [ -n "$XRAY_BIN" ]; then
-    v=$("$XRAY_BIN" version 2>/dev/null | head -n1)
-    if [ -n "$v" ]; then
-      green "检测到 xray 内核: $XRAY_BIN"
-      yellow "  版本: $v"
-      return 0
-    fi
-    yellow "警告: $XRAY_BIN 存在但无法执行（架构不匹配或文件损坏），按未检测到处理"
-    XRAY_BIN=""
-  fi
-  return 1
 }
+
+# 降级模式 SNI 输入（只校验格式 + DNS，跳过 H3 探测）
+input_sni_degraded() {
+  local attempt=0 input
+  sni=""
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    if [ "${#SNI_LIST[@]}" -gt 0 ]; then
+      printf "请输入 H2 节点的 serverName（直接回车：从维护库随机挑选 SNI，q/quit 退出）[%d/3]: " "$attempt"
+    else
+      printf "请输入 H2 节点的 serverName（q/quit 退出）[%d/3]: " "$attempt"
+    fi
+    read -r input || { echo; die "读取输入失败"; }
+    if [ -z "$input" ]; then
+      if [ "${#SNI_LIST[@]}" -eq 0 ]; then
+        red "serverName 不能为空（SNI 库不可用），请手动输入"
+        continue
+      fi
+      input=$(random_sni)
+      yellow "已从 SNI 维护库随机挑选: $input"
+    fi
+    input=$(echo "$input" | tr 'A-Z' 'a-z' | xargs)
+    case "$input" in
+      q|quit) echo "已退出，未做任何修改。"; exit 1 ;;
+      "") red "serverName 不能为空，请手动输入"; continue ;;
+    esac
+    sni="$input"
+    if ! valid_domain "$sni"; then
+      red "SNI 格式不合法（示例: example.com / www.example.com）"
+      continue
+    fi
+    if ! resolve_ip "$sni" >/dev/null; then
+      red "DNS 解析失败: $sni（请检查域名是否真实存在）"
+      continue
+    fi
+    green "serverName 使用: $sni（降级模式跳过 H3 探测）"
+    return 0
+  done
+}
+
+# ===== 阶段 3: 内核模式确认（fork 完整 / 官方内核 H2 降级） =====
 
 # 确认内核是 fork（支持 H3）还是官方（降级 H2）
 confirm_kernel_mode() {
@@ -358,7 +308,7 @@ confirm_kernel_mode() {
       ;;
     *)
       DEGRADED=1
-      yellow "已选择官方内核降级模式：只部署 H2（8443）节点，跳过 H3 部分"
+      yellow "已选择官方内核降级模式：只部署 H2（${H2_PORT}）节点，跳过 H3 部分"
       ;;
   esac
 }
@@ -367,8 +317,8 @@ confirm_kernel_mode() {
 no_kernel_guide() {
   local ans cand
   echo
-  yellow "=========== 检测不到 xray-h3 fork 内核 ==========="
-  yellow "本项目不打包内核（避免暴露防探测细节），需要你自行准备："
+  yellow "=========== 内核自动获取失败 ==========="
+  yellow "Release 下载与源码编译均未成功（可能网络受限或缺少 Go），需要你手动准备："
   yellow "  ① 联系作者获取 xray-h3 fork 内核（或自行构建），放到 /opt/xray/xray-linux-amd64"
   yellow "  ② 若你已安装官方 xray 内核，可先用降级模式部署 H2 节点（只输出 H2 配置+客户端链接）"
   echo
@@ -387,284 +337,196 @@ no_kernel_guide() {
       fi
       if [ -z "$XRAY_BIN" ]; then
         red "仍未找到官方 xray 内核。请先安装官方 xray 或获取 fork 内核后再运行本脚本。"
-        red "H3（8446）节点必须使用 xray-h3 fork 内核，官方内核不支持 H3/QUIC REALITY。"
+        red "H3（${H3_PORT}）节点必须使用 xray-h3 fork 内核，官方内核不支持 H3/QUIC REALITY。"
         exit 1
       fi
       DEGRADED=1
-      green "使用官方内核降级模式: $XRAY_BIN（仅 H2 8443，跳过 H3 部分）"
+      green "使用官方内核降级模式: $XRAY_BIN（仅 H2 ${H2_PORT}，跳过 H3 部分）"
       ;;
     *)
-      red "未部署任何内核。H3（8446）节点必须使用 xray-h3 fork 内核，请联系作者获取。"
+      red "未部署任何内核。H3（${H3_PORT}）节点必须使用 xray-h3 fork 内核，请联系作者获取。"
       exit 1
       ;;
   esac
 }
 
-# ---------------- 配置路径检测 ----------------
-# 默认保留 /opt/xray/server.json 为首选；找不到已有配置时用它作为待生成路径
-detect_config_path() {
-  CONFIG_PATH=""
-  if [ -f /opt/xray/server.json ]; then
-    CONFIG_PATH=/opt/xray/server.json
-  elif [ -f /usr/local/etc/xray/config.json ]; then
-    CONFIG_PATH=/usr/local/etc/xray/config.json
-  else
-    CONFIG_PATH=/opt/xray/server.json
-  fi
-}
+# ===== 阶段 4: 配置生成（fork 完整模式 / 降级模式） =====
 
-# ---------------- 端口冲突检测 ----------------
-# 检查 8446 UDP 与 8443 TCP；被非 xray 进程占用 → 黄色警告 + 询问（默认继续）
-check_port_conflicts() {
-  local warn=0 line ans
-  if ! command -v ss >/dev/null 2>&1; then
-    yellow "警告: 未找到 ss，跳过端口冲突检测"
-    return 0
-  fi
-  line=$(ss -ulnp 2>/dev/null | grep ":${H3_PORT} " || true)
-  if [ -n "$line" ]; then
-    echo "$line" | grep -q "xray" || warn=1
-  fi
-  line=$(ss -tlnp 2>/dev/null | grep ":${H2_PORT} " || true)
-  if [ -n "$line" ]; then
-    echo "$line" | grep -q "xray" || warn=1
-  fi
-  if [ "$warn" -eq 1 ]; then
-    yellow "警告: 检测到以下端口被非 xray 进程占用："
-    ss -ulnp 2>/dev/null | grep ":${H3_PORT} " | sed 's/^/  UDP /' || true
-    ss -tlnp 2>/dev/null | grep ":${H2_PORT} " | sed 's/^/  TCP /' || true
-    yellow "脚本继续后 xray 将绑定 8446/8443（覆盖端口说明：若占用进程不释放，绑定会失败）"
-    printf "是否继续？[Y/n] "
-    read -r ans || { echo; die "读取输入失败"; }
-    case "$ans" in
-      n|N) die "用户取消，未做任何修改" ;;
-    esac
-  fi
-}
-
-# ---------------- 交互输入 SNI（fork 完整模式：格式 + DNS + H3 探测 + 拒绝循环） ----------------
-input_sni_fork() {
-  local attempt=0 input
-  sni=""
-  while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
-    attempt=$((attempt + 1))
-    printf "请输入 SNI（直接回车默认 ea.com，q/quit 退出）[%d/%d]: " "$attempt" "$MAX_ATTEMPTS"
-    read -r input || { echo; die "读取输入失败"; }
-    input=$(echo "${input:-ea.com}" | tr 'A-Z' 'a-z' | xargs)
-    case "$input" in
-      q|quit) echo "已退出，未做任何修改。"; exit 1 ;;
-    esac
-    sni="$input"
-
-    # 1. 域名格式
-    if ! valid_domain "$sni"; then
-      red "SNI 格式不合法（示例: ea.com / www.google.com）"
-      continue
-    fi
-    # 2. DNS 解析
-    if ! resolve_ip "$sni" >/dev/null; then
-      red "DNS 解析失败: $sni（请检查域名是否真实存在）"
-      continue
-    fi
-    # 3. H3 支持测试（直连 https://<SNI>/）
-    yellow "正在测试 $sni 的 HTTP/3 支持（最长 ${PROBE_TIMEOUT}）..."
-    probe_out=$("$PROBE" -sni "$sni" -timeout "$PROBE_TIMEOUT" 2>&1)
-    probe_rc=$?
-    if [ "$probe_rc" -eq 0 ]; then
-      green "SNI 支持 H3: $sni"
-      green "探测结果（握手状态码）: $probe_out"
-      return 0
-    fi
-    red "该 SNI 不支持 H3，已拒绝部署: $sni"
-    red "探测结果: $probe_out"
-    yellow "建议换用以下实测支持 H3 的 SNI："
-    printf "${YELLOW}  %s${NC}\n" $SUGGEST_SNIS
-    sni=""
-    if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-      red "连续 $MAX_ATTEMPTS 次未通过，退出。"
-      exit 1
-    fi
-  done
-}
-
-# 降级模式 SNI 输入（只校验格式 + DNS，跳过 H3 探测）
-input_sni_degraded() {
-  local attempt=0 input
-  sni=""
-  while [ "$attempt" -lt 3 ]; do
-    attempt=$((attempt + 1))
-    printf "请输入 H2 节点的 serverName（直接回车默认 ea.com，q/quit 退出）[%d/3]: " "$attempt"
-    read -r input || { echo; die "读取输入失败"; }
-    input=$(echo "${input:-ea.com}" | tr 'A-Z' 'a-z' | xargs)
-    case "$input" in
-      q|quit) echo "已退出，未做任何修改。"; exit 1 ;;
-    esac
-    sni="$input"
-    if ! valid_domain "$sni"; then
-      red "SNI 格式不合法（示例: ea.com / www.google.com）"
-      continue
-    fi
-    if ! resolve_ip "$sni" >/dev/null; then
-      red "DNS 解析失败: $sni（请检查域名是否真实存在）"
-      continue
-    fi
-    green "serverName 使用: $sni（降级模式跳过 H3 探测）"
-    return 0
-  done
-}
-
-# ---------------- 密钥生成（用检测到的内核二进制） ----------------
-gen_keys() {
-  local out
-  out=$("$XRAY_BIN" x25519 2>/dev/null)
-  PRIVATE_KEY=$(echo "$out" | awk '/^PrivateKey:/{print $2}')
-  PUBLIC_KEY=$(echo "$out" | awk '/^Password/{print $NF}')
-  UUID=$("$XRAY_BIN" uuid 2>/dev/null | head -n1)
-  if [ -z "$UUID" ] && command -v python3 >/dev/null 2>&1; then
-    UUID=$(python3 -c 'import uuid;print(uuid.uuid4())')
-  fi
-  if command -v openssl >/dev/null 2>&1; then
-    SHORT_ID=$(openssl rand -hex 4 2>/dev/null)
-  fi
-  [ -z "$SHORT_ID" ] && SHORT_ID=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  [ -z "$PRIVATE_KEY" ] && die "无法从内核生成 x25519 密钥（$XRAY_BIN x25519 失败）"
-  [ -z "$UUID" ] && die "无法生成 UUID"
-  [ -z "$SHORT_ID" ] && die "无法生成 shortId"
-  green "已生成 UUID / x25519 keypair / shortId"
-}
-
-# ---------------- 配置生成（fork 模式：8443 H2 + 8446 H3 最小可运行模板） ----------------
+# fork 模式：${H2_PORT} H2 + ${H3_PORT} H3 最小可运行模板（新配置生成）
 generate_fork_config() {
-  local conf_dir
+  local conf_dir routes_json r first=1
   conf_dir=$(dirname "$CONFIG_PATH")
   mkdir -p "$conf_dir" || die "无法创建配置目录 $conf_dir"
-  python3 - "$CONFIG_PATH" "$UUID" "$PRIVATE_KEY" "$SHORT_ID" "$sni" <<'PYEOF' || die "配置模板生成失败"
-import json, sys
-conf, uuid, priv, sid, sni = sys.argv[1:6]
-routes = {
-    "www.apple.com": "www.apple.com:443",
-    "apple.com": "apple.com:443",
-    "google.com": "google.com:443",
-    "www.google.com": "www.google.com:443",
-    "youtube.com": "youtube.com:443",
-    "www.youtube.com": "www.youtube.com:443",
-    "facebook.com": "facebook.com:443",
-    "www.facebook.com": "www.facebook.com:443",
-    "cloudflare-quic.com": "cloudflare-quic.com:443",
-    "cdn.cloudflare.steamstatic.com": "cdn.cloudflare.steamstatic.com:443",
-    "steampipe.akamaized.net": "steampipe.akamaized.net:443",
-    "ea.com": "ea.com:443",
-    "eaassets-a.akamaihd.net": "eaassets-a.akamaihd.net:443",
-    "ubisoft.com": "ubisoft.com:443",
-    "www.epicgames.com": "www.epicgames.com:443",
-    "www.nintendo.com": "www.nintendo.com:443",
-    "www.xbox.com": "www.xbox.com:443",
-}
-routes.pop(sni, None)   # 避免与占位 SNI 重复
-routes[sni] = sni + ":443"
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": 8443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "reality",
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                },
-                "realitySettings": {
-                    "show": False,
-                    "dest": sni + ":443",
-                    "serverNames": [sni],
-                    "privateKey": priv,
-                    "shortIds": [sid],
-                    "fingerprint": "chrome",
-                },
-            },
+
+  # fallbackDestRoutes 固定条目；若当前 SNI 命中固定条目则跳过（旧 python 逻辑等价：
+  # routes.pop(sni) 去重后最后追加当前 SNI），保证 JSON 无重复键
+  local route_snis=(
+    www.apple.com apple.com google.com www.google.com
+    youtube.com www.youtube.com facebook.com www.facebook.com
+    cloudflare-quic.com cdn.cloudflare.steamstatic.com steampipe.akamaized.net
+    ea.com eaassets-a.akamaihd.net ubisoft.com www.epicgames.com
+    www.nintendo.com www.xbox.com
+  )
+  for r in "${route_snis[@]}"; do
+    [ "$r" = "$sni" ] && continue
+    if [ "$first" -eq 1 ]; then
+      printf -v routes_json '            "%s": "%s:443"' "$r" "$r"
+      first=0
+    else
+      printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$r" "$r"
+    fi
+  done
+  if [ "$first" -eq 1 ]; then
+    printf -v routes_json '            "%s": "%s:443"' "$sni" "$sni"
+  else
+    printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$sni" "$sni"
+  fi
+
+  cat > "$CONFIG_PATH" <<EOF || die "配置模板生成失败"
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $H2_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/v1/collect",
+          "noGRPCHeader": true
         },
-        {
-            "listen": "0.0.0.0",
-            "port": 8446,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
+        "realitySettings": {
+          "show": false,
+          "dest": "$sni:443",
+          "serverNames": [
+            "$sni"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ],
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": $H3_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "sockopt": {
+          "customSockopt": [
+            {
+              "system": "linux",
+              "network": "udp",
+              "level": "1",
+              "opt": "8",
+              "value": "8388608",
+              "type": "int"
             },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "reality",
-                "sockopt": {
-                    "customSockopt": [
-                        {"system": "linux", "network": "udp", "level": "1", "opt": "8", "value": "8388608", "type": "int"},
-                        {"system": "linux", "network": "udp", "level": "1", "opt": "7", "value": "8388608", "type": "int"},
-                    ]
-                },
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "enableH3": True,
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                    "headers": {
-                        "accept-encoding": "gzip, deflate, br, zstd",
-                        "content-type": "application/octet-stream",
-                        "dnt": "",
-                    },
-                    "xPaddingBytes": "32-96",
-                    "xPaddingObfsMode": True,
-                    "xPaddingPlacement": "query",
-                    "xPaddingKey": "cb",
-                    "xPaddingMethod": "tokenish",
-                },
-                "realitySettings": {
-                    "show": False,
-                    "dest": sni + ":443",
-                    "serverNames": [sni],
-                    "privateKey": priv,
-                    "shortIds": [sid],
-                    "fingerprint": "chrome",
-                    "alpn": ["h3"],
-                    "fallbackDest": "cloudflare-quic.com:443",
-                    "fallbackDestRoutes": routes,
-                },
-                "finalmask": {
-                    "quicParams": {
-                        "congestion": "bbr",
-                        "bbrProfile": "aggressive",
-                        "initStreamReceiveWindow": 4194304,
-                        "maxStreamReceiveWindow": 16777216,
-                        "initConnectionReceiveWindow": 8388608,
-                        "maxConnectionReceiveWindow": 67108864,
-                        "maxIdleTimeout": 60,
-                        "keepAlivePeriod": 30,
-                        "maxIncomingStreams": 1000,
-                    }
-                },
-            },
+            {
+              "system": "linux",
+              "network": "udp",
+              "level": "1",
+              "opt": "7",
+              "value": "8388608",
+              "type": "int"
+            }
+          ]
         },
-    ],
-    "outbounds": [
-        {"protocol": "freedom", "tag": "direct"},
-        {"protocol": "blackhole", "tag": "blocked"},
-    ],
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "enableH3": true,
+          "path": "/v1/collect",
+          "noGRPCHeader": true,
+          "headers": {
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "content-type": "application/octet-stream",
+            "dnt": ""
+          },
+          "xPaddingBytes": "32-96",
+          "xPaddingObfsMode": true,
+          "xPaddingPlacement": "query",
+          "xPaddingKey": "cb",
+          "xPaddingMethod": "tokenish"
+        },
+        "realitySettings": {
+          "show": false,
+          "dest": "$sni:443",
+          "serverNames": [
+            "$sni"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ],
+          "fingerprint": "chrome",
+          "alpn": [
+            "h3"
+          ],
+          "fallbackDest": "cloudflare-quic.com:443",
+          "fallbackDestRoutes": {
+$routes_json
+          }
+        },
+        "finalmask": {
+          "quicParams": {
+            "congestion": "bbr",
+            "bbrProfile": "aggressive",
+            "initStreamReceiveWindow": 4194304,
+            "maxStreamReceiveWindow": 16777216,
+            "initConnectionReceiveWindow": 8388608,
+            "maxConnectionReceiveWindow": 67108864,
+            "maxIdleTimeout": 60,
+            "keepAlivePeriod": 30,
+            "maxIncomingStreams": 1000
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
 }
-with open(conf, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-print("OK: 已生成最小可运行配置（8443 H2 + 8446 H3）")
-PYEOF
+EOF
+  green "OK: 已生成最小可运行配置（H2 port $H2_PORT + H3 port $H3_PORT）"
   green "配置已生成: $CONFIG_PATH"
 }
 
-# ---------------- 配置生成（降级模式：仅 8443 H2 + 自签证书） ----------------
+# 降级模式：仅 ${H2_PORT} H2 + 自签证书（官方内核不支持 fork 的 dest 真证书伪装）
 generate_degraded_config() {
   local conf_dir cert key
   conf_dir=$(dirname "$CONFIG_PATH")
@@ -684,137 +546,63 @@ generate_degraded_config() {
       die "降级模式需要 openssl 生成自签证书（或先自行提供证书），请安装 openssl 后重试"
     fi
   fi
-  python3 - "$CONFIG_PATH" "$UUID" "$cert" "$key" <<'PYEOF' || die "降级配置生成失败"
-import json, sys
-conf, uuid, cert, key = sys.argv[1:5]
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": 8443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "tls",
-                "tlsSettings": {
-                    "certificates": [
-                        {"certificateFile": cert, "keyFile": key}
-                    ]
-                },
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                },
-            },
+  cat > "$CONFIG_PATH" <<EOF || die "降级配置生成失败"
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $H2_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "$cert",
+              "keyFile": "$key"
+            }
+          ]
+        },
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/v1/collect",
+          "noGRPCHeader": true
         }
-    ],
-    "outbounds": [
-        {"protocol": "freedom", "tag": "direct"},
-        {"protocol": "blackhole", "tag": "blocked"},
-    ],
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
 }
-with open(conf, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-print("OK: 已生成 H2 降级配置（仅 8443）")
-PYEOF
+EOF
+  green "OK: 已生成 H2 降级配置（仅 port $H2_PORT）"
   green "配置已生成: $CONFIG_PATH"
   yellow "警告: 降级模式使用自签证书（非 REALITY 伪装），仅作为临时 H2 节点；"
   yellow "      正式 H3 部署仍需要 xray-h3 fork 内核。"
 }
 
-# ---------------- 已有配置：只改 8446 inbound 的 dest/serverNames/fallbackDestRoutes[SNI] ----------------
-edit_existing_config() {
-  TS=$(date +%Y%m%d-%H%M%S)
-  BACKUP="$CONFIG_PATH.bak-sni-$sni-$TS"
-  cp -a "$CONFIG_PATH" "$BACKUP" || die "备份失败"
-  green "已备份: $BACKUP"
-
-  yellow "修改 $CONFIG_PATH 的 8446 inbound: dest=$sni:443 serverNames=[$sni] fallbackDestRoutes[$sni]=$sni:443"
-
-  local edit_ok=0
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$CONFIG_PATH" "$sni" <<'PYEOF'
-import json, os, sys
-conf, sni = sys.argv[1], sys.argv[2]
-with open(conf, encoding="utf-8") as f:
-    cfg = json.load(f)
-ib = None
-for x in cfg.get("inbounds", []):
-    if x.get("port") == 8446:
-        ib = x
-        break
-if ib is None:
-    print("ERROR: 未找到 port=8446 的 inbound", file=sys.stderr)
-    sys.exit(3)
-ss = ib.setdefault("streamSettings", {})
-rs = ss.setdefault("realitySettings", {})
-rs["dest"] = sni + ":443"
-rs["serverNames"] = [sni]
-routes = rs.setdefault("fallbackDestRoutes", {})
-routes[sni] = sni + ":443"
-tmp = conf + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-os.replace(tmp, conf)
-print("OK: 已更新 8446 inbound（其余 inbound 与路由条目未动）")
-PYEOF
-    [ $? -eq 0 ] && edit_ok=1
-  elif command -v jq >/dev/null 2>&1; then
-    jq --arg sni "$sni" '
-      .inbounds = [ .inbounds[] | if .port == 8446 then
-        .streamSettings.realitySettings.dest = ($sni + ":443")
-        | .streamSettings.realitySettings.serverNames = [$sni]
-        | .streamSettings.realitySettings.fallbackDestRoutes[$sni] = ($sni + ":443")
-      else . end ]' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH" && edit_ok=1
-  fi
-  if [ "$edit_ok" -ne 1 ]; then
-    rollback
-    die "修改配置失败，已回滚"
-  fi
-}
-
-# ---------------- 从已有配置提取客户端参数（UUID/privateKey/shortId → publicKey） ----------------
-extract_client_params() {
-  local port="$1" out uuid priv sid pk
-  out=$(python3 - "$CONFIG_PATH" "$port" <<'PYEOF' || true
-import json, sys
-conf, port = sys.argv[1], int(sys.argv[2])
-cfg = json.load(open(conf, encoding="utf-8"))
-for ib in cfg.get("inbounds", []):
-    if ib.get("port") == port:
-        rs = ib.get("streamSettings", {}).get("realitySettings", {})
-        clients = ib.get("settings", {}).get("clients", [])
-        uuid = clients[0]["id"] if clients else ""
-        priv = rs.get("privateKey", "")
-        sid = (rs.get("shortIds") or [""])[0]
-        print(uuid)
-        print(priv)
-        print(sid)
-        sys.exit(0)
-sys.exit(1)
-PYEOF
-)
-  uuid=$(echo "$out" | sed -n '1p')
-  priv=$(echo "$out" | sed -n '2p')
-  sid=$(echo "$out" | sed -n '3p')
-  [ -n "$uuid" ] && UUID="$uuid"
-  [ -n "$priv" ] && PRIVATE_KEY="$priv"
-  [ -n "$sid" ] && SHORT_ID="$sid"
-  if [ -n "$PRIVATE_KEY" ]; then
-    pk=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/^Password/{print $NF}')
-    [ -n "$pk" ] && PUBLIC_KEY="$pk"
-  fi
-}
-
-# ---------------- systemd 服务（不存在则创建，ExecStart 不一致则更新） ----------------
+# ===== 阶段 5: systemd 服务（不存在则创建，ExecStart 不一致则更新） =====
 ensure_service() {
   local need_create=0 need_update=0
   if [ ! -f "$UNIT_FILE" ]; then
@@ -853,46 +641,26 @@ EOF
   fi
 }
 
-# 回滚：新生成的配置 → 移除；编辑的配置 → 恢复备份
-rollback() {
-  if [ "$CONFIG_GENERATED" -eq 1 ]; then
-    yellow "回滚中：移除新生成的配置与服务单元"
-    rm -f "$CONFIG_PATH" "$UNIT_FILE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+# ===== 阶段 6: 安装便携管理命令（首次部署成功后自动执行，幂等） =====
+install_h3reality() {
+  local dest_dir="${H3REALITY_DIR:-/usr/local/bin}"
+  if [ ! -f "$LIB_DIR/h3reality" ] || [ ! -f "$LIB_DIR/h3-lib.sh" ]; then
+    yellow "警告: 未找到 h3reality 或 h3-lib.sh（应与本脚本同目录），跳过管理命令安装"
     return 0
   fi
-  if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
-    yellow "回滚中：恢复 $BACKUP -> $CONFIG_PATH"
-    cp -a "$BACKUP" "$CONFIG_PATH" || red "回滚失败：无法恢复备份"
-    "$XRAY_BIN" run -test -c "$CONFIG_PATH" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE" >/dev/null 2>&1 || true
-  fi
+  mkdir -p "$dest_dir"
+  cp -a "$LIB_DIR/h3reality" "$dest_dir/h3reality" && chmod +x "$dest_dir/h3reality"
+  cp -a "$LIB_DIR/h3-lib.sh" "$dest_dir/h3-lib.sh"
+  green "已安装便携管理命令（幂等）: $dest_dir/h3reality"
+  yellow "之后可随时执行: h3reality help（status/list/switch/add/remove/link 等）"
 }
 
-# 公网 IP 检测（hostname -I → ip route → 手动输入）
-get_server_ip() {
-  local ip=""
-  if command -v hostname >/dev/null 2>&1; then
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  fi
-  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{print $7; exit}')
-  fi
-  if [ -z "$ip" ]; then
-    printf "无法自动检测公网 IP，请手动输入: "
-    read -r ip || { echo; die "读取输入失败"; }
-  fi
-  echo "$ip"
-}
-
-# ---------------- 主流程 ----------------
-command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
-command -v python3 >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 \
-  || die "需要 python3 或 jq 来编辑 JSON"
+# ==================== 主流程 ====================
 
 # 1. 内核检测与模式确认
-detect_xray
-if [ -z "$XRAY_BIN" ]; then
+if ! detect_xray; then
+  no_kernel_guide
+elif [ -z "$XRAY_BIN" ]; then
   no_kernel_guide
 else
   confirm_kernel_mode
@@ -902,7 +670,8 @@ fi
 detect_config_path
 check_port_conflicts
 
-# 3. SNI 输入
+# 3. SNI 维护库 + SNI 输入
+fetch_sni_list || true
 if [ "$DEGRADED" -eq 1 ]; then
   gen_keys
   input_sni_degraded
@@ -911,27 +680,18 @@ else
   input_sni_fork
 fi
 
-# 4. 配置准备（已有配置 → 只改 8446；没有 → 自动生成）
+# 4. 配置准备（已有配置 → 按特征定位 H3 inbound 修改；没有 → 自动生成）
 if [ -f "$CONFIG_PATH" ]; then
   if [ "$DEGRADED" -eq 1 ]; then
     yellow "已存在 $CONFIG_PATH，降级模式跳过配置生成，直接使用现有配置"
   else
-    # 确认现有 8446 inbound 结构正常
-    python3 - "$CONFIG_PATH" <<'PYEOF' || die "8446 inbound 结构异常，拒绝继续"
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-for ib in cfg.get("inbounds", []):
-    if ib.get("port") == 8446:
-        rs = ib.get("streamSettings", {}).get("realitySettings")
-        if not rs:
-            print("ERROR: 8446 inbound 未配置 realitySettings", file=sys.stderr)
-            sys.exit(1)
-        print("OK: 8446 inbound 存在，realitySettings 正常")
-        sys.exit(0)
-print("ERROR: 未找到 port=8446 的 inbound", file=sys.stderr)
-sys.exit(1)
-PYEOF
-    edit_existing_config
+    # 确认现有 H3 inbound 结构正常
+    find_h3_inbound || die "H3 inbound 结构异常，拒绝继续"
+    backup_config "sni-$sni"
+    if ! update_sni_routes "$sni"; then
+      rollback
+      die "修改配置失败，已回滚"
+    fi
   fi
 else
   if [ "$DEGRADED" -eq 1 ]; then
@@ -943,29 +703,21 @@ else
   CONFIG_GENERATED=1
 fi
 
-# 5. 配置校验（run -test）
-yellow "校验配置: $XRAY_BIN run -test -c $CONFIG_PATH"
-if ! "$XRAY_BIN" run -test -c "$CONFIG_PATH" >/dev/null 2>&1; then
+# 5. 配置校验 + systemd 服务 + 重启
+if ! run_test; then
   rollback
   die "配置校验失败，已回滚"
 fi
 green "配置校验通过"
 
-# 6. systemd 服务 + 重启
 ensure_service
-yellow "重启服务: systemctl restart $SERVICE"
-if ! systemctl restart "$SERVICE" >/dev/null 2>&1; then
+if ! restart_service; then
   rollback
   die "服务重启失败，已回滚"
 fi
-sleep 2
-if [ "$(systemctl is-active "$SERVICE" 2>/dev/null)" != "active" ]; then
-  rollback
-  die "服务未处于 active 状态，已回滚"
-fi
 green "服务已重启并运行"
 
-# 7. 验证（fork：8446 UDP 监听 + relay 闭环；降级：8443 TCP 监听）
+# 6. 部署验证（fork：${H3_PORT} UDP 监听 + relay 闭环；降级：${H2_PORT} TCP 监听）
 if [ "$DEGRADED" -eq 0 ]; then
   if command -v ss >/dev/null 2>&1; then
     LISTEN_INFO=$(ss -ulnp 2>/dev/null | grep ":${H3_PORT} " || true)
@@ -973,19 +725,17 @@ if [ "$DEGRADED" -eq 0 ]; then
     LISTEN_INFO=$(netstat -ulnp 2>/dev/null | grep ":${H3_PORT} " || true)
   fi
   if [ -n "$LISTEN_INFO" ]; then
-    green "8446 UDP 监听确认:"
+    green "${H3_PORT} UDP 监听确认:"
     echo "$LISTEN_INFO" | sed 's/^/  /'
   else
     yellow "警告: 未在 ss -ulnp 输出中找到 :${H3_PORT}，请手动确认监听状态"
   fi
 
   yellow "relay 闭环验证: probe-h3-sni -sni $sni -addr 127.0.0.1:${H3_PORT}"
-  relay_out=$("$PROBE" -sni "$sni" -addr "127.0.0.1:${H3_PORT}" -timeout 15s 2>&1)
-  relay_rc=$?
-  if [ "$relay_rc" -eq 0 ]; then
-    green "relay 闭环验证通过（路由命中，dest 完成握手）: $relay_out"
+  if probe_h3 "$sni" "127.0.0.1:${H3_PORT}" 15s; then
+    green "relay 闭环验证通过（路由命中，dest 完成握手）: $probe_out"
   else
-    yellow "警告: relay 闭环未通过: $relay_out"
+    yellow "警告: relay 闭环未通过: $probe_out"
     yellow "配置已生效。请检查 dest/$sni 的 443 是否可达、fallbackDestRoutes 是否正确。"
   fi
 else
@@ -995,14 +745,14 @@ else
     LISTEN_INFO=$(netstat -tlnp 2>/dev/null | grep ":${H2_PORT} " || true)
   fi
   if [ -n "$LISTEN_INFO" ]; then
-    green "8443 TCP 监听确认:"
+    green "${H2_PORT} TCP 监听确认:"
     echo "$LISTEN_INFO" | sed 's/^/  /'
   else
     yellow "警告: 未在 ss -tlnp 输出中找到 :${H2_PORT}，请手动确认监听状态"
   fi
 fi
 
-# 8. 提取客户端参数（生成的新配置已在 gen_keys 中得到）
+# 7. 提取客户端参数（生成的新配置已在 gen_keys 中得到）
 if [ "$CONFIG_GENERATED" -eq 0 ]; then
   if [ "$DEGRADED" -eq 1 ]; then
     extract_client_params "$H2_PORT"
@@ -1011,16 +761,16 @@ if [ "$CONFIG_GENERATED" -eq 0 ]; then
   fi
 fi
 
-# 9. 输出：客户端提醒 + VLESS 分享链接
+# 8. 输出：客户端提醒 + VLESS 分享链接 + 安装 h3reality
 echo
-green "=========== 部署完成 ==========="
+banner green "部署完成"
 if [ "$DEGRADED" -eq 1 ]; then
-  echo "  模式:          官方内核 H2 降级（仅 8443，无 H3）"
+  echo "  模式:          官方内核 H2 降级（仅 ${H2_PORT}，无 H3）"
   echo "  配置:          $CONFIG_PATH"
   echo "  内核:          $XRAY_BIN"
   echo "  证书:          $(dirname "$CONFIG_PATH")/selfsigned.crt（自签，客户端需 allowInsecure）"
 else
-  green "8446 inbound 已切换 SNI -> $sni"
+  green "H3 inbound（端口 ${H3_PORT}）已切换 SNI -> $sni"
   echo "  当前 dest:        $sni:443"
   echo "  当前 serverNames: [$sni]"
   echo "  路由表条目:       fallbackDestRoutes[$sni] = $sni:443（其余条目未动）"
@@ -1031,17 +781,17 @@ fi
 
 SERVER_IP=$(get_server_ip)
 echo
-yellow "=========== VLESS 分享链接（可直接导入客户端） ==========="
+banner yellow "VLESS 分享链接（可直接导入客户端）"
 if [ "$DEGRADED" -eq 1 ]; then
   if [ -n "$UUID" ]; then
-    echo "vless://${UUID}@${SERVER_IP}:${H2_PORT}?encryption=none&security=tls&type=xhttp&mode=stream-one&path=%2Fv1%2Fcollect&sni=${sni}&allowInsecure=1#H2-DEGRADED-${H2_PORT}"
+    gen_vless_link degraded "$SERVER_IP" "$H2_PORT" "$UUID" "" "" "$sni"
   else
     yellow "警告: 无法生成分享链接（缺少 UUID），请从 $CONFIG_PATH 中手动提取"
   fi
 else
   if [ -n "$UUID" ] && [ -n "$PUBLIC_KEY" ] && [ -n "$SHORT_ID" ]; then
-    echo "vless://${UUID}@${SERVER_IP}:${H3_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&enableH3=1&path=%2Fv1%2Fcollect&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$PUBLIC_KEY")&sid=$(urlencode "$SHORT_ID")&host=$(urlencode "$sni")&alpn=h3#H3-REALITY-${H3_PORT}"
-    echo "vless://${UUID}@${SERVER_IP}:${H2_PORT}?encryption=none&security=reality&type=xhttp&mode=stream-one&path=%2Fv1%2Fcollect&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$PUBLIC_KEY")&sid=$(urlencode "$SHORT_ID")&host=$(urlencode "$sni")#H3-REALITY-H2-${H2_PORT}"
+    gen_vless_link fork "$SERVER_IP" "$H3_PORT" "$UUID" "$PUBLIC_KEY" "$SHORT_ID" "$sni"
+    gen_vless_link fork "$SERVER_IP" "$H2_PORT" "$UUID" "$PUBLIC_KEY" "$SHORT_ID" "$sni" h2
   else
     yellow "警告: 无法生成分享链接（缺少 UUID/publicKey/shortId），请从 $CONFIG_PATH 中手动提取"
   fi
@@ -1062,3 +812,6 @@ if [ -n "$BACKUP" ]; then
   yellow "回滚方式: cp $BACKUP $CONFIG_PATH && systemctl restart $SERVICE"
 fi
 green "部署完成，祝使用愉快！"
+
+# 9. 首次部署成功后自动安装 h3reality 便携管理命令
+install_h3reality
