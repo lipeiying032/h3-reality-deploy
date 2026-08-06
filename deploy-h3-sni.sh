@@ -358,16 +358,16 @@ generate_fork_config() {
   conf_dir=$(dirname "$CONFIG_PATH")
   mkdir -p "$conf_dir" || die "无法创建配置目录 $conf_dir"
 
-  # fallbackDestRoutes 固定条目；若当前 SNI 命中固定条目则跳过（旧 python 逻辑等价：
+  # fallbackDestRoutes 全部来自手测 SNI 维护库（snis.json，fetch_sni_list 拉取）；
+  # 若当前 SNI 命中库内条目则跳过，最后追加当前 SNI（旧 python 逻辑等价：
   # routes.pop(sni) 去重后最后追加当前 SNI），保证 JSON 无重复键
-  local route_snis=(
-    www.apple.com apple.com google.com www.google.com
-    youtube.com www.youtube.com facebook.com www.facebook.com
-    cloudflare-quic.com cdn.cloudflare.steamstatic.com steampipe.akamaized.net
-    ea.com eaassets-a.akamaihd.net ubisoft.com www.epicgames.com
-    www.nintendo.com www.xbox.com
-  )
-  for r in "${route_snis[@]}"; do
+  if [ "${#SNI_LIST[@]}" -eq 0 ]; then
+    fetch_sni_list || true
+  fi
+  if [ "${#SNI_LIST[@]}" -eq 0 ]; then
+    yellow "警告: SNI 库不可用（无网络且无缓存），路由表降级为仅当前 SNI"
+  fi
+  for r in "${SNI_LIST[@]}"; do
     [ "$r" = "$sni" ] && continue
     if [ "$first" -eq 1 ]; then
       printf -v routes_json '            "%s": "%s:443"' "$r" "$r"
@@ -489,7 +489,7 @@ generate_fork_config() {
           "alpn": [
             "h3"
           ],
-          "fallbackDest": "cloudflare-quic.com:443",
+          "fallbackDest": "$sni:443",
           "fallbackDestRoutes": {
 $routes_json
           }
