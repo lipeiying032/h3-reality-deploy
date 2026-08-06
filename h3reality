@@ -45,8 +45,6 @@ fi
 
 require_root
 command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
-command -v python3 >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 \
-  || die "需要 python3 或 jq 来编辑 JSON"
 
 # ---------------- 用法说明 ----------------
 usage() {
@@ -109,55 +107,9 @@ show_status() {
   fi
   cur_sni=$(get_current_sni) || cur_sni="?"
   port=$(get_h3_port) || port="?"
-  if command -v python3 >/dev/null 2>&1; then
-    sn_list=$(python3 - "$CONFIG_PATH" <<'PYEOF' || true
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-def is_h3_inbound(x):
-    ss = x.get("streamSettings") or {}
-    if ss.get("network") != "xhttp":
-        return False
-    rs = ss.get("realitySettings") or {}
-    return "h3" in (rs.get("alpn") or []) or "fallbackDest" in rs or bool(rs.get("fallbackDestRoutes"))
-for ib in cfg.get("inbounds", []):
-    if not is_h3_inbound(ib):
-        continue
-    rs = ib.get("streamSettings", {}).get("realitySettings", {})
-    print(" ".join(rs.get("serverNames") or []))
-    print(len(rs.get("fallbackDestRoutes") or {}))
-    sys.exit(0)
-sys.exit(1)
-PYEOF
-)
-  else
-    sn_list=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.serverNames][0] | join(" ")' "$CONFIG_PATH" 2>/dev/null || true)
-    route_count=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | length' "$CONFIG_PATH" 2>/dev/null || true)
-  fi
-  dest=$(python3 - "$CONFIG_PATH" <<'PYEOF' || true
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-def is_h3_inbound(x):
-    ss = x.get("streamSettings") or {}
-    if ss.get("network") != "xhttp":
-        return False
-    rs = ss.get("realitySettings") or {}
-    return "h3" in (rs.get("alpn") or []) or "fallbackDest" in rs or bool(rs.get("fallbackDestRoutes"))
-for ib in cfg.get("inbounds", []):
-    if not is_h3_inbound(ib):
-        continue
-    print(ib.get("streamSettings", {}).get("realitySettings", {}).get("dest", ""))
-    sys.exit(0)
-sys.exit(1)
-PYEOF
-)
-  route_count=$(echo "$sn_list" | sed -n '2p')
-  sn_list=$(echo "$sn_list" | sed -n '1p')
+  sn_list=$(get_h3_server_names) || sn_list=""
+  dest=$(get_h3_dest) || dest=""
+  route_count=$(get_h3_route_count) || route_count="0"
 
   banner green "h3reality status"
   echo "  配置路径:   $CONFIG_PATH"
@@ -189,32 +141,7 @@ list_routes() {
   local out="" i=0 cur_sni=""
   require_config || return 1
   cur_sni=$(get_current_sni) || cur_sni="?"
-  if command -v python3 >/dev/null 2>&1; then
-    out=$(python3 - "$CONFIG_PATH" <<'PYEOF' || true
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-def is_h3_inbound(x):
-    ss = x.get("streamSettings") or {}
-    if ss.get("network") != "xhttp":
-        return False
-    rs = ss.get("realitySettings") or {}
-    return "h3" in (rs.get("alpn") or []) or "fallbackDest" in rs or bool(rs.get("fallbackDestRoutes"))
-for ib in cfg.get("inbounds", []):
-    if not is_h3_inbound(ib):
-        continue
-    routes = ib.get("streamSettings", {}).get("realitySettings", {}).get("fallbackDestRoutes") or {}
-    for k in sorted(routes):
-        print(k + "\t" + routes[k])
-    sys.exit(0)
-sys.exit(1)
-PYEOF
-)
-  else
-    out=$(jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
-          ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
-          (.streamSettings.realitySettings | has("fallbackDest")) or
-          (.streamSettings.realitySettings.fallbackDestRoutes != null))) | .streamSettings.realitySettings.fallbackDestRoutes][0] | to_entries[] | (.key + "\t" + .value)' "$CONFIG_PATH" 2>/dev/null || true)
-  fi
+  out=$(get_h3_routes) || true
   banner green "fallbackDestRoutes"
   if [ -z "$out" ]; then
     yellow "  共 0 条路由（fallbackDestRoutes 为空）"
