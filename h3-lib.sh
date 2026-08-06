@@ -576,31 +576,308 @@ detect_config_path() {
   CONFIG_PATH="${XRAY_CONFIG:-/opt/xray/server.json}"
 }
 
+# --- sed/awk 兜底工具（无 jq 时使用；仅适配本项目生成式配置的固定格式） ---
+
+# 单行压缩 JSON → 多行展开（打印到 stdout）。
+# 字符串感知（值内逗号/转义不拆分），展开后每个结构单元占一行，
+# 行级 awk/sed 即可精确限定编辑范围。
+json_explode() {
+  # 字符串感知：只在字符串外把 { } [ ] , 当作结构字符分行，
+  # 值内的逗号（如 "gzip, deflate, br, zstd"）与转义字符保持原样
+  awk '
+    function indent(d, s, i) { s = ""; for (i = 0; i < d; i++) s = s "  "; return s }
+    {
+      line = ""; depth = 0; in_str = 0
+      n = split($0, ch, "")
+      for (i = 1; i <= n; i++) {
+        c = ch[i]
+        if (in_str) {
+          line = line c
+          if (c == "\\") { i++; if (i <= n) line = line ch[i] }
+          else if (c == "\"") in_str = 0
+          continue
+        }
+        if (c == "\"") { in_str = 1; line = line c; continue }
+        if (c == "{") {
+          printf "%s%s{\n", indent(depth), line
+          line = ""; depth++
+        } else if (c == "}") {
+          if (line != "") printf "%s%s\n", indent(depth), line
+          depth--
+          printf "%s}\n", indent(depth)
+          line = ""
+        } else if (c == "[") {
+          printf "%s%s[\n", indent(depth), line
+          line = ""; depth++
+        } else if (c == "]") {
+          if (line != "") printf "%s%s\n", indent(depth), line
+          depth--
+          printf "%s]\n", indent(depth)
+          line = ""
+        } else if (c == ",") {
+          printf "%s%s,\n", indent(depth), line
+          line = ""
+        } else {
+          line = line c
+        }
+      }
+      if (line != "") printf "%s%s\n", indent(depth), line
+    }
+  ' "$1"
+}
+
+# 判断配置是否为单行压缩 JSON（整个文件仅 1 行）
+json_is_compressed() {
+  [ "$(sed -n '$=' "$CONFIG_PATH" 2>/dev/null)" -le 1 ]
+}
+
+# 若配置为单行压缩 JSON，原地展开为多行（与 jq 分支一样会重排为多行格式）
+json_explode_if_compressed() {
+  if json_is_compressed; then
+    json_explode "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+  fi
+}
+
+# 逐 inbound 输出一行（以 | 分隔）：port|xhttp|h3mark|id|privateKey|shortId|serverName|dest
+#   xhttp=1  streamSettings.network == "xhttp"
+#   h3mark=1 realitySettings 含 alpn "h3" / fallbackDest / fallbackDestRoutes
+# 无 inbounds 或解析失败时输出为空
+scan_inbounds() {
+  local src="$CONFIG_PATH" tmp=""
+  if json_is_compressed; then
+    tmp="$CONFIG_PATH.scan.$$"
+    json_explode "$CONFIG_PATH" > "$tmp"
+    src="$tmp"
+  fi
+  awk '
+    function clean(v, x) {
+      x = v
+      sub(/^[[:space:]]*"/, "", x)
+      sub(/"[[:space:]]*,?[[:space:]]*$/, "", x)
+      return x
+    }
+    # 提取 key: "value" 行中的 value（值内允许含冒号，如 dest 的 host:443）
+    function val(v, x) {
+      x = v
+      sub(/^[^:]*:[[:space:]]*"/, "", x)
+      sub(/"[[:space:]]*,?[[:space:]]*$/, "", x)
+      return x
+    }
+    /"inbounds"[[:space:]]*:[[:space:]]*\[/ { in_list = 1 }
+    in_list && !in_obj && /^[[:space:]]*\{/ {
+      in_obj = 1; depth = 0; p = ""; xhttp = 0; h3mark = 0
+      id = ""; priv = ""; sid = ""; sn = ""; dest = ""; in_sid = 0; in_sn = 0
+    }
+    in_obj {
+      n_open = gsub(/\{/, "{")
+      n_close = gsub(/\}/, "}")
+      if (p == "" && $0 ~ /^[[:space:]]*"port"[[:space:]]*:[[:space:]]*[0-9]+/) {
+        p = $0
+        sub(/^[[:space:]]*"port"[[:space:]]*:[[:space:]]*/, "", p)
+        sub(/,?[[:space:]]*$/, "", p)
+      }
+      if ($0 ~ /"network"[[:space:]]*:[[:space:]]*"xhttp"/) xhttp = 1
+      if (h3mark == 0 && ($0 ~ /"fallbackDest"/ || $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/)) h3mark = 1
+      if (id == "" && $0 ~ /^[[:space:]]*"id"[[:space:]]*:[[:space:]]*/) id = val($0)
+      if (priv == "" && $0 ~ /^[[:space:]]*"privateKey"[[:space:]]*:[[:space:]]*/) priv = val($0)
+      if ($0 ~ /^[[:space:]]*"shortIds"[[:space:]]*:[[:space:]]*\[/) in_sid = 1
+      else if (in_sid == 1 && sid == "" && $0 ~ /^[[:space:]]*"/) { sid = clean($0); in_sid = 0 }
+      if ($0 ~ /^[[:space:]]*"serverNames"[[:space:]]*:[[:space:]]*\[/) in_sn = 1
+      else if (in_sn == 1 && sn == "" && $0 ~ /^[[:space:]]*"/) { sn = clean($0); in_sn = 0 }
+      if (dest == "" && $0 ~ /^[[:space:]]*"dest"[[:space:]]*:[[:space:]]*/) dest = val($0)
+      depth += n_open - n_close
+      if (depth <= 0) {
+        printf "%s|%s|%s|%s|%s|%s|%s|%s\n", p, xhttp, h3mark, id, priv, sid, sn, dest
+        in_obj = 0
+      }
+    }
+    in_list && !in_obj && /^[[:space:]]*\]/ { in_list = 0 }
+  ' "$src"
+  if [ -n "$tmp" ]; then rm -f "$tmp"; fi
+  return 0
+}
+
+# 输出第一个 H3 inbound（xhttp=1 且 h3mark=1）对象在配置中的起止行号（start|end）；
+# 未找到时输出为空。编辑函数据此把 sed/awk 修改限定在 H3 inbound 范围内，
+# 与 jq 分支（只改 h3mark=1 的 inbound）行为一致。
+scan_h3_range() {
+  json_explode_if_compressed
+  awk '
+    /"inbounds"[[:space:]]*:[[:space:]]*\[/ { in_list = 1 }
+    in_list && !in_obj && /^[[:space:]]*\{/ {
+      in_obj = 1; depth = 0; start = NR; xhttp = 0; h3mark = 0
+    }
+    in_obj {
+      n_open = gsub(/\{/, "{")
+      n_close = gsub(/\}/, "}")
+      if ($0 ~ /"network"[[:space:]]*:[[:space:]]*"xhttp"/) xhttp = 1
+      if (h3mark == 0 && ($0 ~ /"fallbackDest"/ || $0 ~ /^[[:space:]]*"h3"[[:space:]]*,?/)) h3mark = 1
+      depth += n_open - n_close
+      if (depth <= 0) {
+        if (xhttp == 1 && h3mark == 1) { print start "|" NR; exit }
+        in_obj = 0
+      }
+    }
+    in_list && !in_obj && /^[[:space:]]*\]/ { in_list = 0 }
+  ' "$CONFIG_PATH"
+}
+
+# 仅替换 H3 inbound 范围内 serverNames 数组的首个元素（保留行尾逗号与缩进）；
+# 数组为空时补入首元素
+sed_set_server_names() {
+  local sni="$1" range start end
+  range=$(scan_h3_range) || true
+  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  start=${range%%|*}; end=${range##*|}
+  awk -v sni="$sni" -v s="$start" -v e="$end" '
+    NR < s || NR > e { print; next }
+    /"serverNames"[[:space:]]*:[[:space:]]*\[/ {
+      in_sn = 1; replaced = 0
+      print
+      next
+    }
+    in_sn && /^[[:space:]]*"/ {
+      ind = $0; sub(/[^[:space:]].*$/, "", ind)
+      comma = ($0 ~ /,[[:space:]]*$/) ? "," : ""
+      printf "%s\"%s\"%s\n", ind, sni, comma
+      in_sn = 0; replaced = 1
+      next
+    }
+    in_sn && /]/ {
+      if (!replaced) {
+        ind = $0; sub(/[^[:space:]].*$/, "", ind)
+        printf "%s\"%s\"\n", ind, sni
+      }
+      in_sn = 0
+      print
+      next
+    }
+    { print }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+# 在 H3 inbound 的 fallbackDestRoutes 块末尾插入 <sni>: <sni>:443
+# （自动给原最后一条补逗号，缩进沿用块收尾行）
+sed_insert_route() {
+  local sni="$1" range start end
+  range=$(scan_h3_range) || true
+  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  start=${range%%|*}; end=${range##*|}
+  awk -v sni="$sni" -v s="$start" -v e="$end" '
+    NR < s || NR > e {
+      if (buf != "") { print buf; buf = "" }
+      print
+      next
+    }
+    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
+      if (buf != "") print buf
+      buf = ""
+      in_routes = 1
+      print
+      next
+    }
+    in_routes && /^[[:space:]]*\}/ {
+      ind = $0; sub(/[^[:space:]].*$/, "", ind)
+      if (buf != "") {
+        if (buf ~ /,[[:space:]]*$/) { print buf }
+        else { sub(/[[:space:]]*$/, ",", buf); print buf }
+      }
+      printf "%s\"%s\": \"%s:443\"\n", ind, sni, sni
+      print
+      in_routes = 0
+      buf = ""
+      next
+    }
+    { if (buf != "") print buf; buf = $0 }
+    END { if (buf != "") print buf }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+# 无 jq 时切换 SNI：仅改 H3 inbound 的 dest、serverNames[0]，
+# 并 upsert fallbackDestRoutes[<sni>]（存在改值，否则块尾插入补逗号）
+sed_update_sni_routes() {
+  local sni="$1" range start end
+  range=$(scan_h3_range) || true
+  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  start=${range%%|*}; end=${range##*|}
+  # 仅替换 H3 inbound 范围内的 dest
+  sed "${start},${end}s/\"dest\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"dest\": \"${sni}:443\"/" "$CONFIG_PATH" \
+    > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+  sed_set_server_names "$sni"
+  # upsert fallbackDestRoutes[<sni>]（仅在 H3 inbound 范围内判定与替换）
+  if sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:[[:space:]]*"'; then
+    sed "${start},${end}s/^\([[:space:]]*\)\"${sni}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"\([[:space:]]*,\)\{0,1\}[[:space:]]*$/\1\"${sni}\": \"${sni}:443\"\2/" "$CONFIG_PATH" \
+    > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+  else
+    sed_insert_route "$sni"
+  fi
+  return 0
+}
+
+# 无 jq 时添加路由条目（仅 H3 inbound；已存在则幂等成功）
+sed_add_sni_route() {
+  local sni="$1" range start end
+  range=$(scan_h3_range) || true
+  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  start=${range%%|*}; end=${range##*|}
+  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '"fallbackDestRoutes"[[:space:]]*:[[:space:]]*{' \
+    || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:[[:space:]]*"' && return 0
+  sed_insert_route "$sni"
+}
+
+# 无 jq 时删除路由条目（仅 H3 inbound；含存在性与至少保留 1 条的校验）
+sed_remove_sni_route() {
+  local sni="$1" count range start end
+  range=$(scan_h3_range) || true
+  [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  start=${range%%|*}; end=${range##*|}
+  sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '"fallbackDestRoutes"[[:space:]]*:[[:space:]]*{' \
+    || { red "ERROR: 未找到 H3 inbound"; return 1; }
+  if ! sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:'; then
+    red "ERROR: 路由不存在: $sni"
+    return 1
+  fi
+  count=$(sed -n "${start},${end}p" "$CONFIG_PATH" | awk '
+    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ { in_routes = 1; next }
+    in_routes && /^[[:space:]]*\}/ { exit }
+    in_routes && /^[[:space:]]*"/ { n++ }
+    END { print n + 0 }
+  ')
+  if [ "$count" -le 1 ]; then
+    red "ERROR: 至少需要保留 1 条路由，拒绝删除最后一个条目: $sni"
+    return 1
+  fi
+  awk -v sni="$sni" -v s="$start" -v e="$end" '
+    NR < s || NR > e {
+      if (buf != "") { print buf; buf = "" }
+      print
+      next
+    }
+    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
+      if (buf != "") print buf
+      buf = ""
+      in_routes = 1
+      print
+      next
+    }
+    in_routes && /^[[:space:]]*\}/ {
+      if (removed && buf ~ /,[[:space:]]*$/) sub(/,[[:space:]]*$/, "", buf)
+      if (buf != "") print buf
+      print
+      in_routes = 0; buf = ""; removed = 0
+      next
+    }
+    in_routes && index($0, "\"" sni "\":") { removed = 1; next }
+    { if (buf != "") print buf; buf = $0 }
+    END { if (buf != "") print buf }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+
 # 校验配置中存在结构正常的 H3 inbound（network=xhttp 且 alpn 含 h3，
 # 或存在 fallbackDest/fallbackDestRoutes）；0=存在，1=不存在
 find_h3_inbound() {
-  if command -v python3 >/dev/null 2>&1; then
-    if python3 - "$CONFIG_PATH" <<'PYEOF'
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-def is_h3_inbound(x):
-    ss = x.get("streamSettings") or {}
-    if ss.get("network") != "xhttp":
-        return False
-    rs = ss.get("realitySettings") or {}
-    return "h3" in (rs.get("alpn") or []) or "fallbackDest" in rs or bool(rs.get("fallbackDestRoutes"))
-for ib in cfg.get("inbounds", []):
-    if is_h3_inbound(ib):
-        print("OK: H3 inbound 存在，realitySettings 正常")
-        sys.exit(0)
-print("ERROR: 未找到 H3 inbound（network=xhttp 且 alpn 含 h3，或存在 fallbackDest/fallbackDestRoutes）", file=sys.stderr)
-sys.exit(1)
-PYEOF
-    then
-      return 0
-    fi
-    return 1
-  fi
   if command -v jq >/dev/null 2>&1; then
     if jq -e '[.inbounds[] | select(.streamSettings.network == "xhttp" and (
           ((.streamSettings.realitySettings.alpn // []) | index("h3")) or
