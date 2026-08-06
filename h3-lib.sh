@@ -14,7 +14,8 @@
 #   B. 配置常量       路径/服务名/SNI 库/内核 URL/默认端口
 #   C. 工具函数       urlencode/valid_domain/resolve_ip/port_in_use/
 #                     pick_random_port/get_server_ip/require_root
-#   D. SNI 库与探测   fetch_sni_list/random_sni/probe_h3/validate_sni_h3
+#   D. SNI 库与探测   fetch_sni_list/random_sni/probe_h3/validate_sni_h3/
+#                     curl_supports_h3/curl_supports_http3_only
 #   E. 探针获取       ensure_probe/build_probe_from_source/download_probe_release
 #   F. 内核获取       detect_xray/download_xray/build_xray_from_source
 #   G. 配置操作       detect_config_path/find_h3_inbound/backup_config/
@@ -254,10 +255,26 @@ probe_h3() {
   return "$rc"
 }
 
+# 检测 curl 是否带 HTTP/3 支持（Features 含 HTTP3，或 --help-all 有 --http3-only）
+curl_supports_h3() {
+  if command -v curl >/dev/null 2>&1; then
+    curl --version 2>/dev/null | grep -qi 'HTTP3' && return 0
+    curl --help-all 2>/dev/null | grep -q -- '--http3-only' && return 0
+  fi
+  return 1
+}
+
+# 检测 curl 是否支持 --http3-only（curl >= 8.2，严格只走 H3，禁止降级）
+curl_supports_http3_only() {
+  curl --help-all 2>/dev/null | grep -q -- '--http3-only'
+}
+
 # SNI 三段校验（与部署脚本完全一致）：域名格式 → DNS 解析 → H3 探测；
+# H3 探测优先用 curl 发真实 HTTP/3 请求（--http3-only，旧版 --http3 + 校验
+# http_version=3 防降级假阳性），curl 无 H3 支持时回退内置探针 probe_h3；
 # 成功返回 0，失败返回 1（内部已输出红色原因）
 validate_sni_h3() {
-  local sni="$1"
+  local sni="$1" curl_out="" curl_ver="" curl_code="" curl_timeout="" rc=0
   if ! valid_domain "$sni"; then
     red "SNI 格式不合法（示例: example.com / www.example.com）"
     return 1
@@ -266,6 +283,34 @@ validate_sni_h3() {
     red "DNS 解析失败: $sni（请检查域名是否真实存在）"
     return 1
   fi
+  if curl_supports_h3; then
+    yellow "正在测试 $sni 的 HTTP/3 支持（curl 实测，最长 ${PROBE_TIMEOUT}）..."
+    # PROBE_TIMEOUT 形如 12s（带单位），curl 的 --max-time 只接受纯数字秒
+    curl_timeout="${PROBE_TIMEOUT%s}"
+    if curl_supports_http3_only; then
+      curl_out=$(curl -sI --http3-only --connect-timeout 5 --max-time "${curl_timeout:-10}" \
+        -o /dev/null -w '%{http_version} %{http_code}' "https://$sni/" 2>&1) || rc=$?
+    else
+      # 旧版 curl 的 --http3 可能静默降级到 H2/H1，必须校验 http_version=3 防假阳性
+      curl_out=$(curl -sI --http3 --connect-timeout 5 --max-time "${curl_timeout:-10}" \
+        -o /dev/null -w '%{http_version} %{http_code}' "https://$sni/" 2>&1) || rc=$?
+    fi
+    curl_ver="${curl_out%% *}"
+    curl_code="${curl_out##* }"
+    if [ "$curl_ver" = "3" ] && [ "${curl_code:-0}" -ne 0 ] 2>/dev/null; then
+      green "SNI 支持 H3: $sni"
+      green "探测结果（HTTP/3 真实响应）: $curl_out"
+      return 0
+    fi
+    red "该 SNI 不支持 H3: $sni"
+    if [ -n "${curl_out# }" ]; then
+      red "探测结果: ${curl_out# }"
+    else
+      red "探测结果: curl 请求失败（未收到 HTTP/3 响应）"
+    fi
+    return 1
+  fi
+  yellow "curl 无 HTTP/3 支持，改用内置探针"
   yellow "正在测试 $sni 的 HTTP/3 支持（最长 ${PROBE_TIMEOUT}）..."
   if probe_h3 "$sni"; then
     green "SNI 支持 H3: $sni"
