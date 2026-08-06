@@ -19,9 +19,13 @@ type RealityQUICParams struct {
 	MaxClientVer []byte
 	MaxTimeDiff  time.Duration
 
-	// Dest is the QUIC dest used to fetch the real certificate chain the
-	// server presents instead of the built-in self-signed certificate.
-	// DestServerName is the SNI (certificate domain) for that fetch.
+	// Dest is the single REALITY dest (host:port). The server uses it to
+	// fetch the real certificate chain it presents instead of the built-in
+	// self-signed certificate, and the QUIC precheck relays every probe /
+	// unauthenticated flow verbatim to it (classic REALITY semantics: auth
+	// failure is always forwarded to Dest, never routed by SNI). Empty means
+	// the precheck stays inactive (no relay). DestServerName is the SNI
+	// (certificate domain) for the certificate fetch.
 	Dest           string
 	DestServerName string
 
@@ -36,17 +40,10 @@ type RealityQUICParams struct {
 	Show bool
 
 	// ServerNames is the full SNI whitelist used by the QUIC precheck to
-	// classify incoming Initial packets (all configured server names).
+	// verify the REALITY auth payload in incoming Initial packets (all
+	// configured server names).
 	ServerNames map[string]bool
 
-	// FallbackDest is the UDP target that probe / unauthenticated QUIC flows
-	// are relayed to. The precheck relays the client's packets verbatim and
-	// the fallback completes the handshake.
-	FallbackDest string
-	// FallbackDestRoutes maps a prober's ClientHello SNI (exact match) to the
-	// real UDP destination that flow is relayed to. Unknown SNIs fall back to
-	// FallbackDest. Empty when not configured.
-	FallbackDestRoutes map[string]string
 	// FallbackTimeout is how long an idle precheck/relay entry is kept alive
 	// (default 120s).
 	FallbackTimeout time.Duration

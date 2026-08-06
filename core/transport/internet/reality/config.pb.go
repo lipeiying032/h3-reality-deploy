@@ -47,8 +47,6 @@ type Config struct {
 	Alpn                  []string               `protobuf:"bytes,32,rep,name=alpn,proto3" json:"alpn,omitempty"`
 	H3CertificateFile     string                 `protobuf:"bytes,33,opt,name=h3_certificate_file,json=h3CertificateFile,proto3" json:"h3_certificate_file,omitempty"`
 	H3KeyFile             string                 `protobuf:"bytes,34,opt,name=h3_key_file,json=h3KeyFile,proto3" json:"h3_key_file,omitempty"`
-	FallbackDest          string                 `protobuf:"bytes,35,opt,name=fallback_dest,json=fallbackDest,proto3" json:"fallback_dest,omitempty"`
-	FallbackDestRoutes    map[string]string      `protobuf:"bytes,36,rep,name=fallback_dest_routes,json=fallbackDestRoutes,proto3" json:"fallback_dest_routes,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -251,20 +249,6 @@ func (x *Config) GetH3KeyFile() string {
 	return ""
 }
 
-func (x *Config) GetFallbackDest() string {
-	if x != nil {
-		return x.FallbackDest
-	}
-	return ""
-}
-
-func (x *Config) GetFallbackDestRoutes() map[string]string {
-	if x != nil {
-		return x.FallbackDestRoutes
-	}
-	return nil
-}
-
 type LimitFallback struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	AfterBytes       uint64                 `protobuf:"varint,1,opt,name=after_bytes,json=afterBytes,proto3" json:"after_bytes,omitempty"`
@@ -328,22 +312,34 @@ func (x *LimitFallback) GetBurstBytesPerSec() uint64 {
 var File_transport_internet_reality_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_reality_config_proto_rawDesc = "" +
-	"\n'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xdb\b\n\x06Config\x12\x12\n\x04show\x18\x01 " +
-	"\x01(\bR\x04show\x12\x12\n\x04dest\x18\x02 \x01(\tR\x04dest\x12\x12\n\x04type\x18\x03 \x01(\tR\x04type\x12\x12\n\x04xver\x18\x04 \x01(\x04R\x04xver\x12!\n\fserver_names\x18\x05 \x03(\tR\vser" +
-	"verNames\x12\x1f\n\vprivate_key\x18\x06 \x01(\fR\nprivateKey\x12$\n\x0emin_client_ver\x18\a \x01(\fR\fminClientVer\x12$\n\x0emax_client_ve" +
-	"r\x18\b \x01(\fR\fmaxClientVer\x12\"\n\rmax_time_diff\x18\t \x01(\x04R\vmaxTimeDiff\x12\x1b\n\tshort_ids\x18\n \x03(\fR\bshortIds\x12!\n\fmldsa6" +
-	"5_seed\x18\v \x01(\fR\vmldsa65Seed\x12b\n\x15limit_fallback_upload\x18\f \x01(\v2..xray.transport.internet.reality.Limit" +
-	"FallbackR\x13limitFallbackUpload\x12f\n\x17limit_fallback_download\x18\r \x01(\v2..xray.transport.internet.reality" +
-	".LimitFallbackR\x15limitFallbackDownload\x12 \n\vFingerprint\x18\x15 \x01(\tR\vFingerprint\x12\x1f\n\vserver_name\x18\x16 \x01(\tR\nse" +
-	"rverName\x12\x1d\n\npublic_key\x18\x17 \x01(\fR\tpublicKey\x12\x19\n\bshort_id\x18\x18 \x01(\fR\ashortId\x12%\n\x0emldsa65_verify\x18\x19 \x01(\fR\rmlds" +
-	"a65Verify\x12\x19\n\bspider_x\x18\x1a \x01(\tR\aspiderX\x12\x19\n\bspider_y\x18\x1b \x03(\x03R\aspiderY\x12$\n\x0emaster_key_log\x18\x1f \x01(\tR\fmasterK" +
-	"eyLog\x12\x12\n\x04alpn\x18  \x03(\tR\x04alpn\x12.\n\x13h3_certificate_file\x18! \x01(\tR\x11h3CertificateFile\x12\x1e\n\vh3_key_file\x18\" \x01(\tR\t" +
-	"h3KeyFile\x12#\n\rfallback_dest\x18# \x01(\tR\ffallbackDest\x12q\n\x14fallback_dest_routes\x18$ \x03(\v2?.xray.transport.in" +
-	"ternet.reality.Config.FallbackDestRoutesEntryR\x12fallbackDestRoutes\x1aE\n\x17FallbackDestRoutesEntry\x12\x10\n\x03" +
-	"key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x83\x01\n\rLimitFallback\x12\x1f\n\vafter_bytes\x18\x01 \x01(\x04R\nafterBytes\x12\"\n\rb" +
-	"ytes_per_sec\x18\x02 \x01(\x04R\vbytesPerSec\x12-\n\x13burst_bytes_per_sec\x18\x03 \x01(\x04R\x10burstBytesPerSecB\x7f\n#com.xray.trans" +
-	"port.internet.realityP\x01Z4github.com/xtls/xray-core/transport/internet/reality\xaa\x02\x1fXray.Transport.I" +
-	"nternet.Realityb\x06proto3"
+	"\x0a'transport/internet/reality/config.proto\x12\x1fxray.transport.int" +
+	"ernet.reality\"\xfc\x06\x0a\x06Config\x12\x12\x0a\x04show\x18\x01 \x01(" +
+	"\x08R\x04show\x12\x12\x0a\x04dest\x18\x02 \x01(\x09R\x04dest\x12\x12\x0a\x04t" +
+	"ype\x18\x03 \x01(\x09R\x04type\x12\x12\x0a\x04xver\x18\x04 \x01(\x04R\x04x" +
+	"ver\x12!\x0a\x0cserver_names\x18\x05 \x03(\x09R\x0bserverNames\x12\x1f\x0a\x0bp" +
+	"rivate_key\x18\x06 \x01(\x0cR\x0aprivateKey\x12$\x0a\x0emin_client_ver" +
+	"\x18\x07 \x01(\x0cR\x0cminClientVer\x12$\x0a\x0emax_client_ver\x18\x08 " +
+	"\x01(\x0cR\x0cmaxClientVer\x12\"\x0a\x0dmax_time_diff\x18\x09 \x01(\x04R" +
+	"\x0bmaxTimeDiff\x12\x1b\x0a\x09short_ids\x18\x0a \x03(\x0cR\x08shortId" +
+	"s\x12!\x0a\x0cmldsa65_seed\x18\x0b \x01(\x0cR\x0bmldsa65Seed\x12b\x0a\x15l" +
+	"imit_fallback_upload\x18\x0c \x01(\x0b2..xray.transport.internet.reali" +
+	"ty.LimitFallbackR\x13limitFallbackUpload\x12f\x0a\x17limit_fallback_do" +
+	"wnload\x18\x0d \x01(\x0b2..xray.transport.internet.reality.LimitFallba" +
+	"ckR\x15limitFallbackDownload\x12 \x0a\x0bFingerprint\x18\x15 \x01(\x09R" +
+	"\x0bFingerprint\x12\x1f\x0a\x0bserver_name\x18\x16 \x01(\x09R\x0aserve" +
+	"rName\x12\x1d\x0a\x0apublic_key\x18\x17 \x01(\x0cR\x09publicKey\x12\x19\x0a\x08s" +
+	"hort_id\x18\x18 \x01(\x0cR\x07shortId\x12%\x0a\x0emldsa65_verify\x18\x19 " +
+	"\x01(\x0cR\x0dmldsa65Verify\x12\x19\x0a\x08spider_x\x18\x1a \x01(\x09R" +
+	"\x07spiderX\x12\x19\x0a\x08spider_y\x18\x1b \x03(\x03R\x07spiderY\x12$" +
+	"\x0a\x0emaster_key_log\x18\x1f \x01(\x09R\x0cmasterKeyLog\x12\x12\x0a\x04a" +
+	"lpn\x18  \x03(\x09R\x04alpn\x12.\x0a\x13h3_certificate_file\x18! \x01(" +
+	"\x09R\x11h3CertificateFile\x12\x1e\x0a\x0bh3_key_file\x18\" \x01(\x09R" +
+	"\x09h3KeyFile\"\x83\x01\x0a\x0dLimitFallback\x12\x1f\x0a\x0bafter_byte" +
+	"s\x18\x01 \x01(\x04R\x0aafterBytes\x12\"\x0a\x0dbytes_per_sec\x18\x02 " +
+	"\x01(\x04R\x0bbytesPerSec\x12-\x0a\x13burst_bytes_per_sec\x18\x03 \x01(" +
+	"\x04R\x10burstBytesPerSecB\x7f\x0a#com.xray.transport.internet.reality" +
+	"P\x01Z4github.com/xtls/xray-core/transport/internet/reality\xaa\x02\x1fX" +
+	"ray.Transport.Internet.Realityb\x06proto3"
 
 var (
 	file_transport_internet_reality_config_proto_rawDescOnce sync.Once
@@ -357,21 +353,19 @@ func file_transport_internet_reality_config_proto_rawDescGZIP() []byte {
 	return file_transport_internet_reality_config_proto_rawDescData
 }
 
-var file_transport_internet_reality_config_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_transport_internet_reality_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_transport_internet_reality_config_proto_goTypes = []any{
 	(*Config)(nil),        // 0: xray.transport.internet.reality.Config
 	(*LimitFallback)(nil), // 1: xray.transport.internet.reality.LimitFallback
-	nil,                   // 2: xray.transport.internet.reality.Config.FallbackDestRoutesEntry
 }
 var file_transport_internet_reality_config_proto_depIdxs = []int32{
 	1, // 0: xray.transport.internet.reality.Config.limit_fallback_upload:type_name -> xray.transport.internet.reality.LimitFallback
 	1, // 1: xray.transport.internet.reality.Config.limit_fallback_download:type_name -> xray.transport.internet.reality.LimitFallback
-	2, // 2: xray.transport.internet.reality.Config.fallback_dest_routes:type_name -> xray.transport.internet.reality.Config.FallbackDestRoutesEntry
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_transport_internet_reality_config_proto_init() }
@@ -385,7 +379,7 @@ func file_transport_internet_reality_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_internet_reality_config_proto_rawDesc), len(file_transport_internet_reality_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

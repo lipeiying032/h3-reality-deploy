@@ -83,14 +83,12 @@ func (c *Config) GetRealityQUICParams() *tls.RealityQUICParams {
 	for _, serverName := range c.ServerNames {
 		params.ServerNames[serverName] = true
 	}
-	// The QUIC precheck relays probe flows to the fallback dest. It only
-	// activates when fallbackDest is explicitly configured (the hub gates on
-	// FallbackDest != ""): defaulting to Dest here would relay every
-	// no-session_id ClientHello — including the C-gamma data-plane client,
-	// whose authentication lives in X-Reality-Auth at the HTTP layer — and
-	// break the normal data path.
-	params.FallbackDest = c.FallbackDest
-	params.FallbackDestRoutes = c.FallbackDestRoutes
+	// The QUIC precheck relays probe / unauthenticated flows verbatim to the
+	// single Dest (classic REALITY semantics: serverNames only gates auth,
+	// never fallback target selection). The precheck activates whenever Dest
+	// is configured; the C-gamma data-plane client authenticates in the
+	// ClientHello random field, so it passes the precheck and stays on the
+	// proxy path.
 	params.FallbackTimeout = 120 * time.Second
 	if len(c.ShortIds) > 0 {
 		params.ShortIds = make(map[[8]byte]bool, len(c.ShortIds))
