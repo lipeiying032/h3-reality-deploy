@@ -93,7 +93,6 @@ jobs:
         run: sleep 90
 
   build:
-    needs: check-assets
     permissions:
       contents: write
     strategy:
@@ -119,6 +118,52 @@ jobs:
           else
             echo "ASSET_NAME=client-tui-linux-amd64" >> $GITHUB_ENV
           fi
+
+      - name: Restore Geodat Cache
+        uses: actions/cache/restore@v6
+        with:
+          path: resources
+          key: xray-geodat-
+
+      - name: Restore Wintun Cache
+        if: matrix.goos == 'windows'
+        uses: actions/cache/restore@v6
+        with:
+          path: resources
+          key: xray-wintun-
+
+      - name: Download Geodat if Cache Missed
+        run: |
+          [ -d 'resources' ] || mkdir resources
+          if [ -s 'resources/geoip.dat' ] && [ -s 'resources/geosite.dat' ]; then
+            echo "Geodat cache hit, no download needed."
+            exit 0
+          fi
+          echo "Geodat cache missed, downloading Xray-linux-64.zip fallback..."
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/Xray-linux-64.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o -j /tmp/Xray-linux-64.zip geoip.dat geosite.dat -d resources/
+          [ -s 'resources/geoip.dat' ] && [ -s 'resources/geosite.dat' ] \
+            || { echo "Failed to extract geoip.dat/geosite.dat"; exit 1; }
+
+      - name: Download Wintun if Cache Missed
+        if: matrix.goos == 'windows'
+        env:
+          # Same pinned version/hash as scheduled-assets-update.yml.
+          WINTUN_VERSION: 0.14.1
+          WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+        run: |
+          if [ -s 'resources/wintun/bin/amd64/wintun.dll' ] && [ -s 'resources/wintun/LICENSE.txt' ]; then
+            echo "Wintun cache hit, no download needed."
+            exit 0
+          fi
+          echo "Wintun cache missed, downloading wintun-${WINTUN_VERSION}.zip fallback..."
+          curl -fL --retry 5 --retry-delay 3 -o /tmp/wintun.zip \
+            "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          echo "${WINTUN_SHA256}  /tmp/wintun.zip" | sha256sum -c -
+          unzip -o /tmp/wintun.zip -d resources/
+          [ -s 'resources/wintun/bin/amd64/wintun.dll' ] && [ -s 'resources/wintun/LICENSE.txt' ] \
+            || { echo "Failed to extract wintun assets"; exit 1; }
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -153,19 +198,6 @@ jobs:
           fi
           cd client-tui
           go build -mod=mod -o "${TUI_OUT}" .
-
-      - name: Restore Geodat Cache
-        uses: actions/cache/restore@v6
-        with:
-          path: resources
-          key: xray-geodat-
-
-      - name: Restore Wintun Cache
-        if: matrix.goos == 'windows'
-        uses: actions/cache/restore@v6
-        with:
-          path: resources
-          key: xray-wintun-
 
       - name: Add additional assets into package
         run: |
