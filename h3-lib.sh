@@ -6,7 +6,8 @@
 # 保证 SNI 校验、H3 探测、配置修改、VLESS 链接生成等核心行为完全一致。
 #
 # 依赖：bash 4+（mapfile）；curl 或 wget；openssl（自签证书/shortId/UUID 兜底）；
-#      root 或 sudo。不依赖 python3/jq/dig（JSON 编辑优先 jq，无 jq 用 sed/awk 兜底）。
+#      tar/sha256sum（H3 版 curl 校验安装）；root 或 sudo。
+#      不依赖 python3/jq/dig（JSON 编辑优先 jq，无 jq 用 sed/awk 兜底）。
 # 调用方必须启用 set -euo pipefail；本库函数均兼容 set -e。
 #
 # 函数分组：
@@ -15,7 +16,8 @@
 #   C. 工具函数       urlencode/valid_domain/resolve_ip/port_in_use/
 #                     pick_random_port/get_server_ip/require_root
 #   D. SNI 库与探测   fetch_sni_list/random_sni/probe_h3/validate_sni_h3/
-#                     curl_supports_h3/curl_supports_http3_only
+#                     curl_supports_h3/curl_supports_http3_only/
+#                     curl_bin_supports_http3_only/ensure_curl_h3/install_curl_h3
 #   E. 探针获取       ensure_probe/build_probe_from_source/download_probe_release
 #   F. 内核获取       detect_xray/download_xray/build_xray_from_source
 #   G. 配置操作       detect_config_path/find_h3_inbound/backup_config/
@@ -78,6 +80,10 @@ DEGRADED=0        # 1=官方内核 H2 降级模式
 CONFIG_GENERATED=0 # 1=本次新生成的配置（回滚时整体移除）
 sni=""
 probe_out=""
+# H3 版 curl：系统 curl 支持 H3 时=系统 curl 路径，否则=$CURL_H3_BIN；
+# 两者皆不可用时为空（validate_sni_h3 回退内置探针），由 ensure_curl_h3 填充。
+CURL_H3_BIN="${CURL_H3_BIN:-/usr/local/bin/curl-http3}"
+CURL_H3=""
 TS=""
 BACKUP=""
 UUID=""
@@ -269,9 +275,163 @@ curl_supports_http3_only() {
   curl --help-all 2>/dev/null | grep -q -- '--http3-only'
 }
 
+# 判断指定 curl 二进制是否支持 --http3-only（curl >= 8.2，严格只走 H3，禁止降级）。
+# 不依赖 --help 文本（curl 8.20+ 移除 --help-all，且无 H3 的构建也会列出该选项），
+# 而是真实调用一次：选项被接受（出现网络层错误/成功）即支持；
+# 选项不存在或构建不支持则报 "is unknown"/"doesn't support this"，判定不支持
+curl_bin_supports_http3_only() {
+  local bin="$1" out="" rc=0
+  out=$("$bin" --http3-only -sS -o /dev/null --connect-timeout 1 --max-time 2 "https://127.0.0.1/" 2>&1) || rc=$?
+  case "$out" in
+    *"doesn't support this"*|*"is unknown"*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# 从 stunnel/static-curl 官方 GitHub Releases 下载静态编译、带 HTTP/3（ngtcp2）
+# 的 Linux curl，校验通过后安装为系统级独立二进制 $CURL_H3_BIN（默认
+# /usr/local/bin/curl-http3，chmod 755，绝不覆盖 apt 管理的 /usr/bin/curl）：
+#   ① 查询官方 API（/releases/latest）拿最新 tag 与资产名
+#      curl-linux-<arch>-glibc-<tag>.tar.xz（x86_64/aarch64，glibc 静态构建）
+#   ② 官方 sha256 取该资产在 API 中的 digest 字段（GitHub 对每个资产维护的
+#      官方校验值），下载后先比对压缩包 sha256
+#   ③ 解压后再校验包内官方 SHA256SUMS（curl 二进制），双重校验
+#   ④ 全部通过且二进制支持 --http3-only 才安装并设置 CURL_H3
+# 成功返回 0；任一环节失败 yellow/red 提示并返回 1（不静默使用损坏文件，
+# 由调用方回退内置探针）
+install_curl_h3() {
+  local arch="" libc="glibc" api_url="https://api.github.com/repos/stunnel/static-curl/releases/latest"
+  local api_json="" tag="" asset="" expected="" actual="" url="" tmpdir=""
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *)
+      yellow "警告: 不支持的 CPU 架构 $(uname -m)，无法自动获取 H3 版 curl（仅支持 x86_64/aarch64）"
+      return 1
+      ;;
+  esac
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    yellow "警告: 未找到 curl/wget，无法下载 H3 版 curl（SNI 校验将回退内置探针）"
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    yellow "警告: 未找到 sha256sum，无法校验 H3 版 curl（SNI 校验将回退内置探针）"
+    return 1
+  fi
+  yellow "系统 curl 无 HTTP/3 支持，尝试下载静态编译的 H3 版 curl（stunnel/static-curl）..."
+  # ① 官方 API：最新版本号 + 目标资产名 + 官方 sha256（资产 digest）
+  api_json=$(curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null) || api_json=""
+  tag=$(printf '%s' "$api_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1) || tag=""
+  if [ -z "$tag" ]; then
+    yellow "警告: 查询 static-curl 最新版本失败（网络或 GitHub API 限制），无法安全获取 H3 版 curl"
+    return 1
+  fi
+  asset="curl-linux-${arch}-${libc}-${tag}.tar.xz"
+  expected=$(printf '%s' "$api_json" | awk -v a="$asset" '
+    $0 ~ "\"name\": \"" a "\"" { found=1 }
+    found && /"digest": "sha256:[0-9a-f]+"/ { sub(/.*"digest": "sha256:/, ""); sub(/".*/, ""); print; exit }
+  ') || expected=""
+  if [ -z "$expected" ]; then
+    yellow "警告: 官方 Release 中未找到资产 $asset 的 sha256，无法安全下载 H3 版 curl"
+    return 1
+  fi
+  url="https://github.com/stunnel/static-curl/releases/download/${tag}/${asset}"
+  yellow "  下载 $url"
+  tmpdir=$(mktemp -d) || return 1
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fL --connect-timeout 15 --max-time 300 -o "$tmpdir/curl.tar.xz" "$url"; then
+      yellow "警告: 下载 H3 版 curl 失败（网络错误或超时），SNI 校验将回退内置探针"
+      rm -rf "$tmpdir"
+      return 1
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget -q --timeout=15 -T 300 -O "$tmpdir/curl.tar.xz" "$url"; then
+      yellow "警告: 下载 H3 版 curl 失败（网络错误或超时），SNI 校验将回退内置探针"
+      rm -rf "$tmpdir"
+      return 1
+    fi
+  else
+    yellow "警告: 未找到 curl/wget，无法下载 H3 版 curl"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  # ② 官方 sha256 比对（GitHub API digest）
+  actual=$(sha256sum "$tmpdir/curl.tar.xz" | awk '{print $1}')
+  if [ "$actual" != "$expected" ]; then
+    red "错误: H3 版 curl sha256 校验失败（预期 $expected，实际 $actual），中止安装"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  green "sha256 校验通过: $asset"
+  # ③ 解压 + 包内官方 SHA256SUMS 二次校验 curl 二进制
+  if ! tar -xJf "$tmpdir/curl.tar.xz" -C "$tmpdir"; then
+    yellow "警告: 解压 H3 版 curl 失败"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if ! ( cd "$tmpdir" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
+    red "错误: H3 版 curl 压缩包内 SHA256SUMS 校验失败，中止安装"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if [ ! -x "$tmpdir/curl" ] || ! curl_bin_supports_http3_only "$tmpdir/curl"; then
+    yellow "警告: 下载的 curl 二进制不可用或不支持 --http3-only，放弃安装"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  # ④ 安装为系统级独立二进制（不覆盖系统 curl）
+  if ! cp -f "$tmpdir/curl" "$CURL_H3_BIN" || ! chmod 755 "$CURL_H3_BIN"; then
+    yellow "警告: 安装 $CURL_H3_BIN 失败（需要 root 权限），SNI 校验将回退内置探针"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  rm -rf "$tmpdir"
+  CURL_H3="$CURL_H3_BIN"
+  green "已安装 H3 版 curl（静态编译，HTTP/3 支持）: $CURL_H3_BIN"
+  yellow "  版本: $("$CURL_H3_BIN" --version 2>/dev/null | head -n1 || true)"
+  return 0
+}
+
+# 确保 H3 版 curl 可用并填充全局 CURL_H3（幂等，重复调用不重复下载）：
+#   ① 系统 curl 支持 H3 → CURL_H3=系统 curl 路径
+#   ② $CURL_H3_BIN 已存在且支持 --http3-only → 直接复用，跳过下载
+#   ③ 都没有 → install_curl_h3 下载安装
+# 成功返回 0；最终失败 yellow 提示并返回 1（调用方回退内置探针，不阻断部署）
+ensure_curl_h3() {
+  local sys_curl_ver=""
+  if [ -n "$CURL_H3" ]; then
+    return 0
+  fi
+  if curl_supports_h3; then
+    CURL_H3="$(command -v curl)"
+    green "检测到系统 curl 支持 HTTP/3: $CURL_H3"
+    return 0
+  fi
+  if [ -x "$CURL_H3_BIN" ] && curl_bin_supports_http3_only "$CURL_H3_BIN"; then
+    CURL_H3="$CURL_H3_BIN"
+    green "检测到已安装的 H3 版 curl（跳过下载）: $CURL_H3"
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    sys_curl_ver=$(curl --version 2>/dev/null | head -n1 || true)
+    yellow "系统 curl 无 HTTP/3 支持（${sys_curl_ver:-未知版本}），尝试获取 H3 版 curl..."
+  else
+    yellow "未找到系统 curl，尝试下载 H3 版 curl（用于 SNI 校验）..."
+  fi
+  if install_curl_h3; then
+    return 0
+  fi
+  yellow "警告: H3 版 curl 获取失败，SNI 校验将回退内置探针（不影响部署流程）"
+  CURL_H3=""
+  return 1
+}
+
 # SNI 三段校验（与部署脚本完全一致）：域名格式 → DNS 解析 → H3 探测；
 # H3 探测优先用 curl 发真实 HTTP/3 请求（--http3-only，旧版 --http3 + 校验
-# http_version=3 防降级假阳性），curl 无 H3 支持时回退内置探针 probe_h3；
+# http_version=3 防降级假阳性）；curl 来源链为「系统 curl（有 H3）→
+# /usr/local/bin/curl-http3（无 H3 时自动下载安装，幂等）→ 内置探针 probe_h3 兜底」；
 # 成功返回 0，失败返回 1（内部已输出红色原因）
 validate_sni_h3() {
   local sni="$1" curl_out="" curl_ver="" curl_code="" curl_timeout="" rc=0
@@ -283,16 +443,20 @@ validate_sni_h3() {
     red "DNS 解析失败: $sni（请检查域名是否真实存在）"
     return 1
   fi
-  if curl_supports_h3; then
-    yellow "正在测试 $sni 的 HTTP/3 支持（curl 实测，最长 ${PROBE_TIMEOUT}）..."
+  # curl 来源：系统 curl（支持 H3）→ /usr/local/bin/curl-http3（自动下载安装）→ 内置探针
+  if [ -z "$CURL_H3" ]; then
+    ensure_curl_h3 || true
+  fi
+  if [ -n "$CURL_H3" ]; then
+    yellow "正在测试 $sni 的 HTTP/3 支持（$CURL_H3 实测，最长 ${PROBE_TIMEOUT}）..."
     # PROBE_TIMEOUT 形如 12s（带单位），curl 的 --max-time 只接受纯数字秒
     curl_timeout="${PROBE_TIMEOUT%s}"
-    if curl_supports_http3_only; then
-      curl_out=$(curl -sI --http3-only --connect-timeout 5 --max-time "${curl_timeout:-10}" \
+    if curl_bin_supports_http3_only "$CURL_H3"; then
+      curl_out=$("$CURL_H3" -sI --http3-only --connect-timeout 5 --max-time "${curl_timeout:-10}" \
         -o /dev/null -w '%{http_version} %{http_code}' "https://$sni/" 2>&1) || rc=$?
     else
       # 旧版 curl 的 --http3 可能静默降级到 H2/H1，必须校验 http_version=3 防假阳性
-      curl_out=$(curl -sI --http3 --connect-timeout 5 --max-time "${curl_timeout:-10}" \
+      curl_out=$("$CURL_H3" -sI --http3 --connect-timeout 5 --max-time "${curl_timeout:-10}" \
         -o /dev/null -w '%{http_version} %{http_code}' "https://$sni/" 2>&1) || rc=$?
     fi
     curl_ver="${curl_out%% *}"
