@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
   release:
     types: [published]
-  push:
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -56,6 +55,13 @@ jobs:
               break
             fi
           done
+          echo -e "Checking wintun/LICENSE.txt..."
+          if [ -s "./resources/wintun/LICENSE.txt" ]; then
+            echo -e "wintun/LICENSE.txt exists."
+          else
+            echo -e "wintun/LICENSE.txt is missing."
+            echo "missing=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Trigger Asset Update Workflow if Assets Missing
         if: steps.check-assets.outputs.missing == 'true'
@@ -191,39 +197,37 @@ jobs:
       - name: Show workflow information
         run: |
           _NAME=${{ matrix.patch-assetname }}
-          [ -n "$_NAME" ] || _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOMIPS\"].friendlyName" -r < .github/build/friendly-filenames.json)
-          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, GOMIPS: $GOMIPS, RELEASE_NAME: $_NAME"
+          [ -n "$_NAME" ] || _NAME="${GOOS}-${GOARCH}${GOARM}"
+          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: core/go.mod
           check-latest: true
 
-      - name: Get project dependencies
-        run: go mod download
-
       - name: Build Xray
+        working-directory: core
         run: |
-          mkdir -p build_assets
+          mkdir -p ../build_assets
           COMMID=$(git describe --always --dirty)
           if [[ ${GOOS} == 'windows' ]]; then
             echo 'Building Xray for Windows...'
-            go build -o build_assets/xray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
+            go build -mod=vendor -o ../build_assets/xray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
             # The line below is for without running conhost.exe version. Commented for not being used. Provided for reference.
-            # go build -o build_assets/wxray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-H windowsgui -X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
+            # go build -mod=vendor -o ../build_assets/wxray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-H windowsgui -X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
           elif [[ ${GOOS} == 'android' ]]; then
             echo 'Building Xray for Android...'
-            go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid= -checklinkname=0" -v ./main
+            go build -mod=vendor -o ../build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid= -checklinkname=0" -v ./main
           else
             echo 'Building Xray...'
             if [[ ${GOARCH} == 'mips' || ${GOARCH} == 'mipsle' ]]; then
-              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
+              go build -mod=vendor -o ../build_assets/xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
               echo 'Building soft-float Xray for MIPS/MIPSLE 32-bit...'
-              GOMIPS=softfloat go build -o build_assets/xray_softfloat -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
+              GOMIPS=softfloat go build -mod=vendor -o ../build_assets/xray_softfloat -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
             else
-              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
+              go build -mod=vendor -o ../build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
             fi
           fi
 
@@ -244,9 +248,6 @@ jobs:
         run: |
           mv -f resources/geo* build_assets/
           if [[ ${GOOS} == 'windows' ]]; then
-            cp .github/build/windows/* build_assets/
-          fi
-          if [[ ${GOOS} == 'windows' ]]; then
             echo 'Adding Wintun into packages'
             if [[ ${GOARCH} == 'amd64' ]]; then
               mv resources/wintun/bin/amd64/wintun.dll build_assets/
@@ -258,6 +259,16 @@ jobs:
               mv resources/wintun/bin/arm64/wintun.dll build_assets/
             fi
             mv resources/wintun/LICENSE.txt build_assets/LICENSE-Wintun
+            echo 'Adding Windows no-console launcher scripts'
+            cat > build_assets/xray_no_window.cmd <<'EOF'
+          powershell.exe -ExecutionPolicy Bypass -File ".\xray_no_window.ps1"
+          EOF
+            cat > build_assets/xray_no_window.ps1 <<'EOF'
+          Start-Process -FilePath ".\xray.exe" -ArgumentList "-config .\config.json" -WindowStyle Hidden
+          EOF
+            cat > build_assets/xray_no_window.vbs <<'EOF'
+          CreateObject("Wscript.Shell").Run "xray.exe -config config.json",0
+          EOF
           fi
 
       - name: Copy README.md & LICENSE
