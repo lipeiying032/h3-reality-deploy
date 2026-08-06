@@ -75,8 +75,22 @@ GOOS=windows GOARCH=amd64 go build -mod=vendor -o xray-h3-win-amd64.exe ./main
 ## 快速开始（全新 VPS）
 
 ```bash
-# 全新 VPS 一键部署（若已 clone 过会自动 git pull 更新到最新）
-git clone https://github.com/lipeiying032/h3-reality-deploy.git 2>/dev/null || (cd h3-reality-deploy && git pull)
+# 全新 VPS 一键部署（目录已存在会重新下载并覆盖，等价于更新到最新版）
+rm -rf h3-reality-deploy
+mkdir -p h3-reality-deploy
+curl -fsSL -o h3-reality-deploy.tar.gz https://codeload.github.com/lipeiying032/h3-reality-deploy/tar.gz/refs/heads/main || {
+  rm -f h3-reality-deploy.tar.gz
+  echo "错误：仓库下载失败，请检查："
+  echo "  1. GitHub 网络是否可达（可验证：curl -fsSI https://github.com）"
+  echo "  2. 是否被防火墙或代理拦截"
+  exit 1
+}
+tar -xzf h3-reality-deploy.tar.gz --strip-components=1 -C h3-reality-deploy || {
+  rm -f h3-reality-deploy.tar.gz
+  echo "错误：解压失败，请检查磁盘空间或网络下载是否完整"
+  exit 1
+}
+rm -f h3-reality-deploy.tar.gz
 cd h3-reality-deploy
 sudo bash deploy-h3-sni.sh
 ```
