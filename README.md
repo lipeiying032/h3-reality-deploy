@@ -15,7 +15,7 @@
 - **探测伪装**：无认证的 QUIC 探测流被 SNI 感知的字节级 UDP relay 原样转发到真实站点，
   探测者看到的握手/证书/响应与直连真实站点完全一致；
 - **Chrome 指纹**：客户端握手指纹对齐 Chrome（uTLS quicifySpec，5 组 groups、ALPS→h3、TP 干净）；
-- **一键部署**：全新 VPS 上 `git clone` 后单条命令完成 SNI 探测、配置生成、systemd 服务、部署验证；
+- **一键部署**：全新 VPS 上 curl 下载仓库后单条命令完成 SNI 探测、配置生成、systemd 服务、部署验证；
 - **探针自给自足**：无 Go 环境也能跑——同目录二进制 → 源码自动编译 → GitHub Release 下载三级兜底；
 - **自动引导**：内核检测、server.json 生成、systemd 服务创建、端口冲突检测、VLESS 分享链接输出全自动。
 
