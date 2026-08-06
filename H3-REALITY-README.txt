@@ -1,137 +1,98 @@
-# H3 REALITY：VLESS + XHTTP + REALITY 在 QUIC/H3 传输层的完整实现
+# H3 REALITY: VLESS+XHTTP+REALITY在QUIC/H3传输层的实现
 
-## 1. 项目定位
+## 1. 目的
 
-**让 VLESS + XHTTP + REALITY 节点在 H3/QUIC 传输层与"真实浏览器访问真实网站"不可区分**：
-客户端握手指纹对齐 Chrome（uTLS quicifySpec），认证载荷藏进 TLS 1.3 ClientHello 的 random 字段（与真随机不可区分），
-服务端对无认证的探测流量做 SNI 感知的字节级 UDP relay——探测者看到的握手、证书、响应与直连真实站点完全一致。
+使得VLESS+XHTTP+H3 REALITY达到流量分析不可区分性(这与隐写术中的不可区分性不同,(我们希望)后者只是前者的必要条件罢了,因为(我们希望)不存在一个多项式时间的区分器能以不可忽略的优势把T_proxy和T_cover区分开,但很遗憾鹦鹉确是反审查中很难避开的一环,而且QUIC特征将会更多,多麻了.):
+客户端ClientHello JA3/JA4对齐Chrome(uTLS quicifySpec),认证载荷藏进TLS 1.3 ClientHello的random字段(与伪随机不可区分,这里的不可区分见姚氏伪随机定义,因为不可区分性具有传递性,所以也与真随机不可区分.），
+无认证的流量会被转发到fallbackDest,然后把fallbackDest返回的数据给它.(代号relay)
+官版Xray-core v26.7.28中,REALITY+XHTTP在传输层是HTTP/2:
+transport/internet/reality/config.go里的NextProtos硬编码nil,注释也说should be nil.
+transport/internet/splithttp/hub.go中
+l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
+在匹配["h3"]这个值.当配置文件中有security: "reality"时isH3应该是false.
+即使NextProtos是[]string{"h3"},也对这个分支无作用,因为isH3用的是getTLSConfig而不是GetREALITYConfig.
+故h3分支没有REALITY(本就挂在net.Listener上的)的接入点,h1/h2分支倒是可以接入.
+至于XHTTP: Beyond REALITY那个Discussion(我戏称是上行h3过cdn 下行REALITY,简写H3 REALITY).
+个人总结下XHTTP(前置段落):
+XHTTP是一种传输方式,采用分包上行和流式下行的思想,分包上行指的是客户端把要上传的数据拆成多个独立的短HTTP POST请求(带序号seq和关联标识UUID)依次发送,不必等待上一个请求完全响应,服务器收到后按序号重组,用来过CDN.(因为传统的长连接和大文件POST上传容易被CDN拦截缓存或断开)
+流式下行 服务器通过一个长连接的HTTP GET响应(伪装成SSE(Server-Sent Events)流,同时配置X-Accel-Buffering: no等头信息禁止中间代理缓存数据),持续不断,实时地向客户端推送下载数据.
+如果还用官版二进制,REALITY就只会停留在TCP(RAW,gRPC,h1/h2 XHTTP),QUIC依旧TLS.
+凡是世界说过的话都是正确的: 关于反审查,越特定于GFW的应对测试就越意淫,意淫程度从高到低: 假设GFW会看你网站并干什么的伪装和回落,假设GFW会验证你证书的fake-tls,假设GFW会主动分析你TLS 指纹的uTLS和naive,流量特征随机化可以说是其中最正常的了.
+所以我们的目的是意淫程度最高,最不正常.
 
----
+### 2.2 QUIC主动探测
 
-## 2. 背景与动机
+UDP端口(8443/8446)直接把代理服务暴露在公网(当然占QUIC的端口是为了伪装成QUIC).GFW要主动探测成本很低:
+发一个标准QUIC Initial,只要握手能完成,返回行为与真实站点不一致,端口即被标记为代理.
+防QUIC主动探测设计
+1. ClientHello中的transport-parameters,legacy_session_id,NamedGroup,ALPS etc.与Chrome一致.
+2. relay
+3. 防重放.
 
-### 2.1 官方 REALITY + XHTTP 永远走 H2
+### 2.3 为什么要fork
+官版REALITY把认证载体塞到TLS 1.3中的legacy_session_id里,但主流浏览器在QUIC协议中用的字段legacy_session_id长度是0,况且在其它QUIC客户端的实现中,例如Python库aioquic中有以下代码
+580:    legacy_session_id: bytes
+718:    legacy_session_id: bytes
+1342:            self.legacy_session_id = b""
+说明它被硬编码为空字符串.而作者的实现也一样:
+uconn.HandshakeState.Hello.SessionId = nil
+作者用c.quic != nil 做了分流,applyRealityClientHello才是老路子,applyRealityClientHelloRandom才是我描述的,故不要盲信AI评价,例如我刚开始被Haiku误导了.
 
-官方 Xray-core v26.7.28 中，"REALITY + XHTTP" 这个组合在传输层永远是 HTTP/2：
+quic-go二开
+做了一个插口QUICTLSFactory,原来TLS用的是握手引擎被换成了作者自己的.
+把阻塞式Read/Write握手换成协程/通道,借鉴了Go标准库里的crypto/tls里的tls.QUICConn,不再赘述.
 
-- `transport/internet/reality/config.go` 的 `GetREALITYConfig()` 里 `NextProtos` 默认 `nil`（只有显式配置 `alpn` 才非空）；
-- `transport/internet/splithttp/hub.go` 的 `isH3` 判定要求 `tlsConfig.NextProtos` 恰为 `["h3"]`。
 
-两者互斥：REALITY 侧不会主动注入 `h3`，H3 侧必须 ALPN=`h3` 才走 QUIC。结果是官方二进制里
-REALITY 节点只能以 H2/XHTTP 形态存在，拿不到 QUIC 的传输特性。
+## 3. 可认证
 
-### 2.2 QUIC 探测威胁
-
-UDP 端口（默认 443）直接把 QUIC 服务暴露在公网。GFW 的主动探测对 QUIC 非常廉价：
-发一个标准 QUIC Initial（随机 SNI、标准 ClientHello），只要握手能完成、返回行为与真实站点不一致
-（自签证书、REALITY 特殊字段、错误码、时序），端口即被标记为代理。
-
-要扛住 QUIC 主动探测，需要同时满足三条：
-
-1. **握手特征无异常**——ClientHello 与真实 Chrome 的 QUIC 指纹一致（session_id=0、5 组 groups、ALPS 指 h3、TP 干净）；
-2. **无认证流被原样转发**——探测者的 QUIC 包被字节级 relay 到真实 H3 站点，由真实站点完成握手；
-3. **认证不可伪造、不可重放**——服务端仍能区分真客户端与探测者，且凭据在线上不可见。
-
-### 2.3 为什么必须 fork
-
-认证凭据需要一个"隐身载体"，而官方 REALITY 的认证载体（TLS 1.3 `session_id`）在 QUIC 上是强指纹
-（见 4.4 节演进史）。实现"隐身认证 + 无认证 relay"需要动三层：
-
-1. **quic-go fork**（`github.com/apernet/quic-go`）：TLS 层改为可插拔 `QUICTLSFactory`，允许把
-   REALITY fork 的 TLS 状态机接到 QUIC 握手上；
-2. **xtls/reality fork**（`vendor/github.com/xtls/reality/`）：TLS 1.3 客户端握手函数支持把认证载荷
-   注入 ClientHello 标准字段（`applyRealityClientHelloRandom`），并导出无连接状态的
-   `ClientHelloVerifier` 供预检复用；**客户端跳过 CertificateVerify 签名校验**——服务端持 dest
-   真实证书链但不可能持有 dest 私钥，只能配一次性密钥签名（`applyDestCertChain` +
-   `newThrowawayKeyForCert`），标准 crypto/tls 客户端无法完成该校验；
-3. **xray 桥接**：`transport/internet/tls/reality_quic.go`（客户端侧 `NewRealityQUICFactory` 适配
-   qtls.Factory）、`transport/internet/splithttp/` 下的预检状态机与 UDP relay。
-
----
-
-## 3. 架构总览
-
-```
-┌─────────────────────────── 客户端（fork xray，Windows zip / Linux） ───────────────────────────┐
-│  VLESS outbound                                                                               │
-│    network=xhttp  security=reality  fingerprint=chrome                                        │
-│    serverName=SNI  publicKey  shortId  alpn=["h3"]                                            │
-│    xhttpSettings: mode=stream-one  enableH3  path=/v1/collect  xPadding 32-96  obfsMode       │
-│                                                                                               │
-│  HTTP/3 客户端栈（quic-go fork + reality TLS fork via QUICTLSFactory）                         │
-│    ClientHello: session_id=0                                                                  │
-│                 groups = [0xaaaa(GREASE), 0x11ec(X25519MLKEM768), 0x1d, 0x17, 0x18]           │
-│                 ALPS→h3  ALPN=h3  5 组 groups（对齐 Chrome）                                   │
-│    random 字段 = AES-GCM(ClientVer + UnixTime + ShortId) 32B（与真随机不可区分）               │
-└──────────────────────────────────────────┬────────────────────────────────────────────────────┘
-                                           │ QUIC UDP（公网 :443）
-                                           ▼
-┌─────────────────────────── 服务端（fork xray，XHTTP/3 listener） ─────────────────────────────┐
-│  UDP listener :443（sockopt SO_RCVBUF/SO_SNDBUF=8MB，finalmask.quicParams: BBR aggressive）    │
-│                                                                                               │
-│  ① QUIC 预检（reality_precheck.go / reality_precheck_conn.go）                                │
-│     解密 Initial（RFC9001 §5.2）→ CRYPTO 跨包重组 → 提取 ClientHello                          │
-│     → ClientHelloVerifier.Verify（random 优先，session_id 回退兼容 TCP）                       │
-│        ├─ 通过 → AUTH：缓冲包+后续包进 FIFO 队列 → quic-go → HTTP/3 → VLESS 数据面             │
-│        └─ 失败/不可解析 → RELAY：整流原样转发到真实站点                                        │
-│                                                                                               │
-│  ② SNI 感知 UDP relay（reality_relay.go，5-tuple NAT）                                        │
-│     决策链（首包定死）：fallbackDestRoutes[SNI] 精确匹配 → fallbackDest → 静默丢弃             │
-│     client──(DialUDP connect, 只收 dest 来源)──► dest :443                                    │
-│     dest 应答 ←──(经服务端监听 socket WriteTo 写回, 源地址保持)──client                        │
-│     30s ticker 回收 120s 空闲；表上限 65536、per-IP 512；多 IP 故障转移                         │
-└──────────────────────────────────────────┬────────────────────────────────────────────────────┘
-                                           │
-                                           ▼
-                                  真实站点（如 ea.com:443）
-                                  探测者视角 = 直连该站点（证书/握手/HTTP 响应一致）
-```
-
----
-
-## 4. 认证机制原理（最终形态：client_random）
-
-### 4.1 密钥派生与 AD 构造
-
-客户端与服务端都复用 ClientHello 里**已经存在**的 X25519 key share 做 ECDH，不新增任何扩展：
-
-```
-sharedSecret = ECDH(clientKeySharePriv, serverPublicKey)     // X25519
-AD           = 完整 ClientHello 原始字节，random 字段(偏移 6..38)置全零
-               （偏移：handshake type 1B + length 3B + legacy_version 2B = 6，random 32B）
-adHash       = SHA-256(AD)
-salt         = adHash[0:20]
-nonce        = adHash[20:32]
-authKey      = HKDF-SHA256(sharedSecret, salt, info="REALITY")
-```
-
-### 4.2 AES-GCM 布局（4 + 4 + 8 + 16）
-
-```
-明文 16B:
-  [0:3]   ClientVer   = 26.4.17（0x1A 0x04 0x11）
-  [3]     0x00（填充）
-  [4:8]   UnixTime    = uint32(big-endian)
-  [8:16]  ShortId     = 8B short id
-密文 32B = AES-128-GCM.Seal(nonce, 明文16B, AD)   // 16B 密文 + 16B tag
-         → 恰好填满 TLS 1.3 的 32B random 字段
-```
-
-服务端 `verifyClientHelloRandom` 镜像该流程：提取 key share（纯 X25519 或混合
-X25519MLKEM768 的尾部 32B）→ ECDH → 把 `hello.original[6:38]` 临时清零做 AD → GCM Open →
-校验版本窗口（`MinClientVer`/`MaxClientVer`）、时间偏差（`MaxTimeDiff`）、shortId 白名单。
-
-### 4.3 为什么不可重放、为什么与真随机不可区分
-
-- **不可重放**：AEAD 的 AD 绑定到"这个 ClientHello 去掉 random 后的全部字节"（SNI、key share、
-  扩展、顺序、GREASE 全部参与）。把同一个 32B 密文 random 挪到任何一个不同的 ClientHello，
-  服务端算出的 AD 就不同 → GCM Open 失败；时间戳 + `MaxTimeDiff` 进一步限制截获重放窗口。
-- **与真随机不可区分**：AES-GCM 输出 = 密文（keystream ⊕ 明文）+ 16B tag，key/nonce 均由
-  HKDF 从每次握手独立的 ECDH 共享秘密派生。实测 12 条连接：位密度 0.5055 vs 官方客户端
-  0.5007、χ² 254.7 vs 249.3、12/12 互异——统计上与真随机无法区分。
-- **兼容标准 TLS**：random 参与 TLS 1.3 密钥派生，密文 random 就是协议意义上的 random，
-  任何标准实现都正常处理。
-
+### 3.2,3.3 client_random与IND$性质
+我将用游戏G0,G1,G2,G3来证明,每个游戏之间的差异由已知很难破解的密码学假设所限定.如果每一个差异都可忽略,那么加起来的差异也可忽略,但在理论密码学中,渐进可忽略性只在一族群上成立,安全参数趋向于正无穷大,而这里的优势是一个常数,Curve25519是一个阶为常数的群,所以我给的是优势上界.倘若先入为主以通用攻击复杂度规定安全参数,不可取.(不会难,也不会严谨,享受展示吧,先告诉你我在做什么.)
+在applyRealityClientHelloRandom/verifyClientHelloRandom/verifyClientHelloAuth中,密钥材料(以后叫IKM)如下
+一对X25519密钥(keySharePrivateKeys.ecdhe,peerPub),
+其中keySharePrivateKeys.ecdhe(keys.ecdhe)是客户端的X25519私钥,peerPub是客户端的X25519公钥,分别记作sk_c,pk_c.
+服务器公钥Config.PublicKey(c.PublicKey),客户端用于得到共享秘密的公钥;服务器私钥Config.PrivateKey(cfg.PrivateKey),服务端用于恢复共享秘密的私钥.分别记作pk_s,sk_s.
+plainText := make([]byte, 16)
+plainText[0] = 26
+plainText[1] = 4
+plainText[2] = 17
+binary.BigEndian.PutUint32(plainText[4:], uint32(time.Now().Unix()))
+copy(plainText[8:], c.ShortId)
+可以看出,plainText共16字节,等于clientVer || Unix... || ShortId,记为M.
+authKey(keys.ecdhe.ECDH(publicKey)),X25519的共享秘密(32字节,256比特,所以AES-256-GCM,安全参数\lambda 256),记为Z = pk_s^{sk_c}=g^{sk_s\cdot sk_c},(PS. ECDH方法封装了群的标量乘法,所以看不到幂之类的.)
+adHash := sha256.Sum256(associatedData)
+(用associated data派生salt) H=SHA-256(AD),哈希前20字节当HKDF的salt,后12字节当AES-GCM的Nonce N.
+hkdf.New(sha256.New, authKey, hello.random[:20], []byte("REALITY")).Read(authKey)
+此时Z被更新为K_auth.[]byte("REALITY"),可选参数CtxInfo.(上下文信息)
+block, _ := aes.NewCipher(authKey)
+aead, _ := cipher.NewGCM(block)
+hello.random = aead.Seal(nil, adHash[20:32], plainText, associatedData)
+用K_auth和Nonce N(adHash[20:32])对M作AEAD.hello.C和T分别为hello.random的前16字节和后16字节.
+证明敌手(审查者)无法区分C||T和等长真随机(通过外部物理环境产生(TRNG)的随机字节.即便用了硬件,也很难做到真随机,目前只有基于量子算法生成的随机字节才是真正意义的随机字节.)字节这个命题.
+G0启动.(敌手观测到的random(R_0))
+R_0 = AES-GCM_{K_auth}(N, M, AD)
+G1启动.(规则如下)
+DDH假设在X25519上成立.由于pk_s = g^(sk_s),pk_c = g^(sk_c)敌手已知.但敌手不知sk_c,sk_s.
+DDH假设指出,给定(g, g^{sk_s}, g^{sk_c}),敌手不可区分g^(sk_s\cdot sk_c) 和一个从群\mathbb{G}中均匀分布抽样的元素Z_rand.任给Z_rand \in \mathbb{G} \Pr[Z=Z_rand]=\frac{1}{\vert{}\mathbb{G}\vert{}},也即每个群元素被选到的概率相等.
+将HKDF的IKM从Z = g^(sk_s\cdot sk_c)换到Z_rand.
+不可区分的表示,攻击者返回相同猜测结果1的概率差异,假设有一个敌手,他在执行完猜测后,得到的概率差值|\Pr[G_{0}]-\Pr[G_{1}]|为0,这说明,这个攻击者在不同游戏中,输出相同猜测结果的概率是相等的,很明显,这个敌手根本搞不清楚自己处于哪个游戏.安全参数\lambda越大,攻击者越难破坏DDH,这就叫规约.
+|\Pr[G_{0}]-\Pr[G_{1}]|\leq \mathrm{Adv}^{\mathrm{DDH}}_{\mathcal{G}}(\lambda)
+G2启动
+HKDF-SHA256是一个安全的伪随机函数,既然G1中Z_rand已经是随机的了,那把K_auth替换成从\{0,1\}^{128}中均匀分布抽样的密钥K_rand.
+敌手区分G1和G2的优势.
+\lvert \Pr[G_{1}] - \Pr[G_{2}] \rvert \le \mathrm{Adv}_{\mathrm{HKDF}}^{\mathrm{PRF}}(\lambda)
+G3启动
+在G2中,使用K_rand执行AES-256-GCM加密,考虑C || T的不可区分性.
+密文C的不可区分性
+AES-GCM使用CTR模式加密明文,C = M \oplus \mathrm{AES}_{K_{\mathrm{rand}}}(N \parallel \mathrm{counter}),假设AES是一个安全的PRP,且作为PRF使用.在K_rand未知且Nonce N不碰撞(N碰撞的概率为O(q^2/2^{96}))的情况下,密钥流\mathrm{AES}_{K_{\mathrm{rand}}}(\cdot)与真随机比特流不可区分.
+T = \mathrm{GHASH}_H(AD, C) \oplus \mathrm{AES}_{K_{\mathrm{rand}}}(N \parallel 0^{31}1)
+因为\mathrm{AES}_{K_{\mathrm{rand}}}(N \parallel 0^{31}1)是密钥流的另一个独立输出块,和真随机不可区分,与GHASH的结果进行了异或.根据一次性密码本的完美保密性,(GHASH的结果,基于AD,C算出的哈希值)异或一个与真随机不可区分的掩码(AES单独算出的伪随机掩码)后,得到的标签T同样与真随机字符串不可区分.
+将R_2=C||T替换为一个从\{0,1\}^{256}中均匀分布抽样的32字节字符串U_32.所以
+\lvert \Pr[G_2] - \Pr[G_3] \rvert \le \mathrm{Adv}_{\mathrm{AES}}^{\mathrm{PRF}}(\lambda) + \frac{q^2}{2^{97}}
+根据柯西施瓦茨不等式得到三角不等式.
+\lvert \Pr[G_0] - \Pr[G_3] \rvert 
+\le \lvert \Pr[G_0] - \Pr[G_1] \rvert + \lvert \Pr[G_1] - \Pr[G_2] \rvert + \lvert \Pr[G_2] - \Pr[G_3] \rvert \\
+\le \mathrm{Adv}_{\mathrm{DDH}}(\lambda) + \mathrm{Adv}_{\mathrm{HKDF}}^{\mathrm{PRF}}(\lambda) + \left(\mathrm{Adv}_{\mathrm{AES}}^{\mathrm{PRF}}(\lambda) + \frac{q^2}{2^{97}}\right)
+至此,我完成了证明.防重放则留作习题答案略.
 ### 4.4 演进历史
 
 | 阶段 | 载体 | 结论 |
@@ -226,7 +187,7 @@ Chrome 的 QUIC ClientHello 中，ALPS（application_settings）的 `supported_p
 
 - **防伪造源**：每个客户端流一个 `DialUDP` connect socket，`conn.Read` 只收 dest 来源的包；
 - **源地址保持**：dest 的应答经服务端自己的监听 socket `WriteTo` 写回，客户端看到单一源地址
-  （服务器 IP:443）；
+  （服务器 IP:8446）；
 - **超时回收**：30s ticker，默认 120s 空闲回收（`FallbackTimeout` 可配）；表上限 65536、per-IP
   512、单包 64KB；
 - **多 IP 故障转移**：`resolveRelayDest` 启动时解析目标全部 A/AAAA（去重）作候选集；
@@ -273,22 +234,7 @@ QUIC 的 `CRYPTO_ERROR` 码 = `0x100 + TLS alert`（RFC 9000 §20.1 / RFC 8446�
 脚本已做成**自包含引导版**：探针、配置、systemd 服务全部自动搞定，使用者只需：
 
 ```bash
-# 全新 VPS 一键部署（目录已存在会重新下载并覆盖，等价于更新到最新版）
-rm -rf h3-reality-deploy
-mkdir -p h3-reality-deploy
-curl -fsSL -o h3-reality-deploy.tar.gz https://codeload.github.com/lipeiying032/h3-reality-deploy/tar.gz/refs/heads/main || {
-  rm -f h3-reality-deploy.tar.gz
-  echo "错误：仓库下载失败，请检查："
-  echo "  1. GitHub 网络是否可达（可验证：curl -fsSI https://github.com）"
-  echo "  2. 是否被防火墙或代理拦截"
-  exit 1
-}
-tar -xzf h3-reality-deploy.tar.gz --strip-components=1 -C h3-reality-deploy || {
-  rm -f h3-reality-deploy.tar.gz
-  echo "错误：解压失败，请检查磁盘空间或网络下载是否完整"
-  exit 1
-}
-rm -f h3-reality-deploy.tar.gz
+git clone https://github.com/lipeiying032/h3-reality-deploy.git
 cd h3-reality-deploy
 sudo bash deploy-h3-sni.sh
 ```
@@ -298,32 +244,30 @@ sudo bash deploy-h3-sni.sh
 - 探针自给自足：同目录二进制 → 同目录源码 + Go 自动编译 → GitHub Release 下载预编译二进制；
 - xray 内核自动检测（`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH`），
   找不到时黄色警告并给出引导（从仓库 `core/` 源码构建 fork 内核 / 官方内核 H2 降级模式）；
-- 没有 `server.json` 自动生成最小可运行配置（默认端口 443：H2 TCP + H3 UDP，非标准端口可用
-  `H2_PORT`/`H3_PORT` 环境变量覆盖），UUID/x25519 keypair/shortId 用内核二进制自动生成；
-  已有配置按特征定位 H3 inbound，只改其 dest/serverNames/fallbackDestRoutes[SNI]；
+- 没有 `server.json` 自动生成最小可运行配置（8443 H2 + 8446 H3），UUID/x25519 keypair/
+  shortId 用内核二进制自动生成；已有配置只改 8446 的 dest/serverNames/fallbackDestRoutes[SNI]；
 - 没有 `xray-h3.service` 自动创建并 `enable`；
 - 部署后输出完整 VLESS 分享链接（`vless://...`，含 sni/pbk/sid/fp/type），可直接导入客户端。
 
-> 注意：fork 内核源码已开源在仓库 [`core/`](core/)（v26.7.28 + 全部魔改，MIT）。H3 节点
-> 必须使用 fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅部署 H2，自签证书 + 明确警告）。
+> 注意：fork 内核源码已开源在仓库 [`core/`](core/)（v26.7.28 + 全部魔改，MIT）。H3（8446）
+> 节点必须使用 fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅 8443，自签证书 + 明确警告）。
 
-### 8.1 单节点部署拓扑
+### 8.1 双 VPS 拓扑
 
-| 节点 | 地址 | H2 端口 | H3 端口 |
-|------|------|---------|---------|
-| 你的服务器 | `YOUR_SERVER_IP` | 443 (TCP) | 443 (UDP) |
+| 节点 | 地址 | H2 | H3 |
+|---|---|---|---|
+| 主 VPS | `YOUR_MAIN_VPS_IP` | 8443 | 8446 |
+| 小 VPS | `YOUR_SMALL_VPS_IP` | 8445 | 8446 |
 
-默认端口为 443（TCP 与 UDP 可共存）；非标准端口可用环境变量 `H2_PORT`/`H3_PORT` 覆盖
-（本项目作者生产环境实际用 8443/8446）。所有节点 H3 inbound 结构相同：示例 SNI = ea.com，
-部署时用你自己的 SNI（脚本会自动验证 H3 支持），路由表 17 条。
+两台 VPS 的 8446 inbound 结构相同（当前 SNI = ea.com，2026-08-05 更新，路由表 17 条）。
 
-### 8.2 server.json —— H3 inbound 完整示例（默认端口 443）
+### 8.2 server.json —— 8446 inbound 完整示例
 
 ```jsonc
-// /opt/xray/server.json 中的 H3 inbound（默认端口 443；密钥字段已脱敏，真实值以实际部署为准）
+// /opt/xray/server.json 中的 8446 inbound（密钥字段已脱敏，真实值见生产文件）
 {
   "listen": "0.0.0.0",
-  "port": 443,
+  "port": 8446,
   "protocol": "vless",
   "settings": {
     "clients": [
@@ -410,7 +354,7 @@ sudo bash deploy-h3-sni.sh
   原样转发，探测者看到的是真实站点完成的握手，而不是服务端自己签的假证书；
 - `fallbackDest` 必须显式（预检启用开关），`fallbackDestRoutes` 提供 SNI 精确路由；
 - `sockopt` UDP 收发缓冲 8MB；`finalmask.quicParams` 配 BBR aggressive + 大窗口；
-- H2 inbound 不包含以上任何 H3 专属字段，与官方 H2 REALITY 完全兼容。
+- 8443/8445（H2）inbound 不包含以上任何 H3 专属字段，与官方 H2 REALITY 完全兼容。
 
 ### 8.3 systemd 服务
 
@@ -440,8 +384,8 @@ WantedBy=multi-user.target
   "settings": {
     "vnext": [
       {
-        "address": "YOUR_SERVER_IP",        // 你的服务器公网 IP
-        "port": 443,
+        "address": "YOUR_MAIN_VPS_IP",      // 主 VPS；小 VPS 用 YOUR_SMALL_VPS_IP
+        "port": 8446,
         "users": [
           {
             "id": "REPLACE_WITH_REAL_UUID",
@@ -535,7 +479,7 @@ WantedBy=multi-user.target
 
 ### 11.1 连通性
 
-- 客户端连上后访问测速/下载站，204/200 即通；`curl --http3 https://<SNI>/` 从外部打 443（UDP）
+- 客户端连上后访问测速/下载站，204/200 即通；`curl --http3 https://<SNI>/` 从外部打 8446
   应看到真实站点的响应（relay 生效）。
 
 ### 11.2 抓包特征核对（Wireshark，QUIC + TLS 解密）
@@ -557,8 +501,8 @@ WantedBy=multi-user.target
 ./probe-h3-sni -sni apple.com              # ERR: context deadline exceeded（不支持）
 ./probe-h3-sni -sni www.apple.com          # ERR: ... CRYPTO_ERROR 0x150 ...（不支持）
 
-# 部署后验证 relay 闭环：连本机 443（UDP），SNI 仍用目标域名
-./probe-h3-sni -sni ea.com -addr 127.0.0.1:443    # STATUS: 400/301 = 路由命中
+# 部署后验证 relay 闭环：连本机 8446，SNI 仍用目标域名
+./probe-h3-sni -sni ea.com -addr 127.0.0.1:8446   # STATUS: 400/301 = 路由命中
 ```
 
 退出码：0 = 完整握手；1 = 不支持；2 = 参数错误。
@@ -602,7 +546,7 @@ WantedBy=multi-user.target
 # 部署（root 直跑；非 root 自动 sudo 重执行）
 sudo bash deploy-h3-sni.sh
 # 交互输入 SNI（默认 ea.com），流程：
-#   格式校验 → DNS 解析 → 探针测 H3 → 支持则改 H3 inbound + 备份 + run -test + 重启 + 验证
+#   格式校验 → DNS 解析 → 探针测 H3 → 支持则改 8446 + 备份 + run -test + 重启 + 验证
 #   不支持则红字拒绝并建议换 SNI（最多 5 次，q/quit 退出）
 ```
 
@@ -615,28 +559,26 @@ sudo bash deploy-h3-sni.sh
 - 内核检测：`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH` 中的 `xray`，
   找到后 `version` 校验；找不到 → 黄色警告（提示从仓库 `core/` 源码构建内核）+ 两种引导：
   按 README「core/ 内核源码」自行构建 fork 内核，或已装官方 xray 则走 **H2 降级模式**
-  （只部署 H2 + 自签证书，明确提示跳过 H3）；
-- 无 `server.json` → 自动生成最小可运行配置：H2（默认端口 443，vless+xhttp+reality，dest
-  真证书需 fork 内核）+ H3（默认端口 443 UDP，alpn=h3 + `fallbackDest` + 17 条
-  `fallbackDestRoutes`），UUID/privateKey/publicKey/shortId 由内核二进制自动生成；
-  非标准端口可用 `H2_PORT`/`H3_PORT` 环境变量覆盖；
-- 已有配置 → 按特征定位 H3 inbound（network=xhttp 且 alpn 含 h3），只改其：
-  `dest=<SNI>:443`、`serverNames=[<SNI>]`、`fallbackDestRoutes[<SNI>]=<SNI>:443`
-  （已有则更新，没有则新增，其余 17 条不动）；不碰其他 inbound；
+  （只部署 8443 + 自签证书，明确提示跳过 H3）；
+- 无 `server.json` → 自动生成最小可运行配置：8443 H2（vless+xhttp+reality，dest 真证书需
+  fork 内核）+ 8446 H3（alpn=h3 + `fallbackDest` + 17 条 `fallbackDestRoutes`），
+  UUID/privateKey/publicKey/shortId 由内核二进制自动生成；
+- 已有配置 → 只改 8446 inbound：`dest=<SNI>:443`、`serverNames=[<SNI>]`、
+  `fallbackDestRoutes[<SNI>]=<SNI>:443`（已有则更新，没有则新增，其余 17 条不动）；不碰 8443/8445；
 - 无 `xray-h3.service` → 自动生成并 `daemon-reload` + `enable`；ExecStart 与当前内核/配置
   不一致时自动更新；已一致只 `restart`；
-- 端口冲突检测：改配置前用 `ss` 检查 H3（默认 443）UDP / H2（默认 443）TCP，被非 xray
-  进程占用时黄色警告 + 询问是否继续（默认继续，覆盖端口说明）；
+- 端口冲突检测：改配置前用 `ss` 检查 8446 UDP / 8443 TCP，被非 xray 进程占用时黄色警告 +
+  询问是否继续（默认继续，覆盖端口说明）；
 - 自动备份 `server.json.bak-sni-<SNI>-<时间戳>`；`run -test` 失败或 `systemctl restart
   xray-h3` 失败自动回滚；
-- 验证：`ss -ulnp` 确认 H3（默认 443）UDP 监听 + 探针 `-sni <SNI> -addr 127.0.0.1:443`
-  验证 relay 闭环（返回 400/任何 HTTP 状态码即路由命中）；
+- 验证：`ss -ulnp` 确认 8446 UDP 监听 + 探针 `-sni <SNI> -addr 127.0.0.1:8446` 验证
+  relay 闭环（返回 400/任何 HTTP 状态码即路由命中）；
 - 完成后提醒客户端只需同步 `serverName`（SNI），keypair/UUID/shortId 不变，并打印完整
   VLESS 分享链接（`vless://...`，含 sni/pbk/sid/fp=chrome/type=xhttp），可直接导入客户端。
 
 ### 12.3 常见问题（FAQ）
 
-**Q：探测我 H3 端口（默认 443）返回 0x128，是 relay 坏了？**
+**Q：探测我 8446 端口返回 0x128，是 relay 坏了？**
 A：不是。0x128 = 真实站点（如 CF）对未知 SNI 的拒绝，说明 relay 已经生效、探测流被转给了
 真实站点。换个在路由表里的 SNI 再探，应看到完整握手。
 
