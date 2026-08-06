@@ -43,7 +43,7 @@
 #   - 端口冲突检测始终运行（不被"存在配置文件"短路）：已有配置时端口以配置为准，
 #     但官方 xray 等进程占用目标端口（443 TCP/UDP）时仍黄色警告并询问
 #   - 非 root 自动用 sudo 重执行（已 root 则跳过）
-#   - JSON 编辑优先 python3，其次 jq
+#   - JSON 编辑优先 jq，无 jq 用 sed/awk 兜底（不依赖 python3）
 #   - 中文输出，红=错误/拒绝，绿=成功，黄=警告
 # =============================================================================
 
@@ -67,8 +67,6 @@ fi
 
 require_root
 command -v systemctl >/dev/null 2>&1 || die "未找到 systemctl"
-command -v python3 >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 \
-  || die "需要 python3 或 jq 来编辑 JSON"
 
 # ===== 阶段 1: 端口冲突检测（始终运行，已有配置时端口以配置为准） =====
 
@@ -356,132 +354,175 @@ no_kernel_guide() {
 
 # fork 模式：${H2_PORT} H2 + ${H3_PORT} H3 最小可运行模板（新配置生成）
 generate_fork_config() {
-  local conf_dir
+  local conf_dir routes_json r first=1
   conf_dir=$(dirname "$CONFIG_PATH")
   mkdir -p "$conf_dir" || die "无法创建配置目录 $conf_dir"
-  python3 - "$CONFIG_PATH" "$UUID" "$PRIVATE_KEY" "$SHORT_ID" "$sni" "$H2_PORT" "$H3_PORT" <<'PYEOF' || die "配置模板生成失败"
-import json, sys
-conf, uuid, priv, sid, sni, h2port, h3port = sys.argv[1:8]
-routes = {
-    "www.apple.com": "www.apple.com:443",
-    "apple.com": "apple.com:443",
-    "google.com": "google.com:443",
-    "www.google.com": "www.google.com:443",
-    "youtube.com": "youtube.com:443",
-    "www.youtube.com": "www.youtube.com:443",
-    "facebook.com": "facebook.com:443",
-    "www.facebook.com": "www.facebook.com:443",
-    "cloudflare-quic.com": "cloudflare-quic.com:443",
-    "cdn.cloudflare.steamstatic.com": "cdn.cloudflare.steamstatic.com:443",
-    "steampipe.akamaized.net": "steampipe.akamaized.net:443",
-    "ea.com": "ea.com:443",
-    "eaassets-a.akamaihd.net": "eaassets-a.akamaihd.net:443",
-    "ubisoft.com": "ubisoft.com:443",
-    "www.epicgames.com": "www.epicgames.com:443",
-    "www.nintendo.com": "www.nintendo.com:443",
-    "www.xbox.com": "www.xbox.com:443",
-}
-routes.pop(sni, None)   # 避免与占位 SNI 重复
-routes[sni] = sni + ":443"
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": int(h2port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "reality",
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                },
-                "realitySettings": {
-                    "show": False,
-                    "dest": sni + ":443",
-                    "serverNames": [sni],
-                    "privateKey": priv,
-                    "shortIds": [sid],
-                    "fingerprint": "chrome",
-                },
-            },
+
+  # fallbackDestRoutes 固定条目；若当前 SNI 命中固定条目则跳过（旧 python 逻辑等价：
+  # routes.pop(sni) 去重后最后追加当前 SNI），保证 JSON 无重复键
+  local route_snis=(
+    www.apple.com apple.com google.com www.google.com
+    youtube.com www.youtube.com facebook.com www.facebook.com
+    cloudflare-quic.com cdn.cloudflare.steamstatic.com steampipe.akamaized.net
+    ea.com eaassets-a.akamaihd.net ubisoft.com www.epicgames.com
+    www.nintendo.com www.xbox.com
+  )
+  for r in "${route_snis[@]}"; do
+    [ "$r" = "$sni" ] && continue
+    if [ "$first" -eq 1 ]; then
+      printf -v routes_json '            "%s": "%s:443"' "$r" "$r"
+      first=0
+    else
+      printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$r" "$r"
+    fi
+  done
+  if [ "$first" -eq 1 ]; then
+    printf -v routes_json '            "%s": "%s:443"' "$sni" "$sni"
+  else
+    printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$sni" "$sni"
+  fi
+
+  cat > "$CONFIG_PATH" <<EOF || die "配置模板生成失败"
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $H2_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/v1/collect",
+          "noGRPCHeader": true
         },
-        {
-            "listen": "0.0.0.0",
-            "port": int(h3port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
+        "realitySettings": {
+          "show": false,
+          "dest": "$sni:443",
+          "serverNames": [
+            "$sni"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ],
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": $H3_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "sockopt": {
+          "customSockopt": [
+            {
+              "system": "linux",
+              "network": "udp",
+              "level": "1",
+              "opt": "8",
+              "value": "8388608",
+              "type": "int"
             },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "reality",
-                "sockopt": {
-                    "customSockopt": [
-                        {"system": "linux", "network": "udp", "level": "1", "opt": "8", "value": "8388608", "type": "int"},
-                        {"system": "linux", "network": "udp", "level": "1", "opt": "7", "value": "8388608", "type": "int"},
-                    ]
-                },
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "enableH3": True,
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                    "headers": {
-                        "accept-encoding": "gzip, deflate, br, zstd",
-                        "content-type": "application/octet-stream",
-                        "dnt": "",
-                    },
-                    "xPaddingBytes": "32-96",
-                    "xPaddingObfsMode": True,
-                    "xPaddingPlacement": "query",
-                    "xPaddingKey": "cb",
-                    "xPaddingMethod": "tokenish",
-                },
-                "realitySettings": {
-                    "show": False,
-                    "dest": sni + ":443",
-                    "serverNames": [sni],
-                    "privateKey": priv,
-                    "shortIds": [sid],
-                    "fingerprint": "chrome",
-                    "alpn": ["h3"],
-                    "fallbackDest": "cloudflare-quic.com:443",
-                    "fallbackDestRoutes": routes,
-                },
-                "finalmask": {
-                    "quicParams": {
-                        "congestion": "bbr",
-                        "bbrProfile": "aggressive",
-                        "initStreamReceiveWindow": 4194304,
-                        "maxStreamReceiveWindow": 16777216,
-                        "initConnectionReceiveWindow": 8388608,
-                        "maxConnectionReceiveWindow": 67108864,
-                        "maxIdleTimeout": 60,
-                        "keepAlivePeriod": 30,
-                        "maxIncomingStreams": 1000,
-                    }
-                },
-            },
+            {
+              "system": "linux",
+              "network": "udp",
+              "level": "1",
+              "opt": "7",
+              "value": "8388608",
+              "type": "int"
+            }
+          ]
         },
-    ],
-    "outbounds": [
-        {"protocol": "freedom", "tag": "direct"},
-        {"protocol": "blackhole", "tag": "blocked"},
-    ],
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "enableH3": true,
+          "path": "/v1/collect",
+          "noGRPCHeader": true,
+          "headers": {
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "content-type": "application/octet-stream",
+            "dnt": ""
+          },
+          "xPaddingBytes": "32-96",
+          "xPaddingObfsMode": true,
+          "xPaddingPlacement": "query",
+          "xPaddingKey": "cb",
+          "xPaddingMethod": "tokenish"
+        },
+        "realitySettings": {
+          "show": false,
+          "dest": "$sni:443",
+          "serverNames": [
+            "$sni"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ],
+          "fingerprint": "chrome",
+          "alpn": [
+            "h3"
+          ],
+          "fallbackDest": "cloudflare-quic.com:443",
+          "fallbackDestRoutes": {
+$routes_json
+          }
+        },
+        "finalmask": {
+          "quicParams": {
+            "congestion": "bbr",
+            "bbrProfile": "aggressive",
+            "initStreamReceiveWindow": 4194304,
+            "maxStreamReceiveWindow": 16777216,
+            "initConnectionReceiveWindow": 8388608,
+            "maxConnectionReceiveWindow": 67108864,
+            "maxIdleTimeout": 60,
+            "keepAlivePeriod": 30,
+            "maxIncomingStreams": 1000
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
 }
-with open(conf, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-print("OK: 已生成最小可运行配置（H2 port " + h2port + " + H3 port " + h3port + "）")
-PYEOF
+EOF
+  green "OK: 已生成最小可运行配置（H2 port $H2_PORT + H3 port $H3_PORT）"
   green "配置已生成: $CONFIG_PATH"
 }
 
@@ -505,46 +546,57 @@ generate_degraded_config() {
       die "降级模式需要 openssl 生成自签证书（或先自行提供证书），请安装 openssl 后重试"
     fi
   fi
-  python3 - "$CONFIG_PATH" "$UUID" "$cert" "$key" "$H2_PORT" <<'PYEOF' || die "降级配置生成失败"
-import json, sys
-conf, uuid, cert, key, h2port = sys.argv[1:6]
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": int(h2port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "flow": ""}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "xhttp",
-                "security": "tls",
-                "tlsSettings": {
-                    "certificates": [
-                        {"certificateFile": cert, "keyFile": key}
-                    ]
-                },
-                "xhttpSettings": {
-                    "mode": "stream-one",
-                    "path": "/v1/collect",
-                    "noGRPCHeader": True,
-                },
-            },
+  cat > "$CONFIG_PATH" <<EOF || die "降级配置生成失败"
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $H2_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "$cert",
+              "keyFile": "$key"
+            }
+          ]
+        },
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/v1/collect",
+          "noGRPCHeader": true
         }
-    ],
-    "outbounds": [
-        {"protocol": "freedom", "tag": "direct"},
-        {"protocol": "blackhole", "tag": "blocked"},
-    ],
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
 }
-with open(conf, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-print("OK: 已生成 H2 降级配置（仅 port " + h2port + "）")
-PYEOF
+EOF
+  green "OK: 已生成 H2 降级配置（仅 port $H2_PORT）"
   green "配置已生成: $CONFIG_PATH"
   yellow "警告: 降级模式使用自签证书（非 REALITY 伪装），仅作为临时 H2 节点；"
   yellow "      正式 H3 部署仍需要 xray-h3 fork 内核。"
