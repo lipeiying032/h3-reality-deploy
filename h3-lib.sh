@@ -21,7 +21,9 @@
 #   E. 探针获取       ensure_probe/build_probe_from_source/download_probe_release
 #   F. 内核获取       detect_xray/download_xray/build_xray_from_source
 #   G. 配置操作       detect_config_path/find_h3_inbound/backup_config/
-#                     update_sni_routes/add_sni_route/remove_sni_route/
+#                     update_sni_routes（切换 SNI：dest+serverNames+fallbackDest，
+#                     清除路由表）/add_sni_route/remove_sni_route（手动高级配置，
+#                     fallbackDestRoutes 路由表，默认部署不再使用）/
 #                     run_test/restart_service/start_service/stop_service/
 #                     service_is_active/rollback/extract_client_params/gen_keys
 #   H. VLESS 链接     gen_vless_link/get_current_sni/get_h3_port
@@ -974,6 +976,11 @@ sed_set_server_names() {
   ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 }
 
+# ===== 手动高级配置：fallbackDestRoutes 路由表（默认部署不再生成/维护） =====
+# 经典 REALITY 不按 SNI 分流 fallback：路由表是额外特征（表外 SNI 统一落
+# fallbackDest、换 SNI 主动探测多测必露馅）。以下函数仅供确实需要该行为的
+# 高级用户手动使用，普通 switch/add/remove 流程不再触碰路由表。
+
 # 在 H3 inbound 的 fallbackDestRoutes 块末尾插入 <sni>: <sni>:443
 # （自动给原最后一条补逗号，缩进沿用块收尾行）
 sed_insert_route() {
@@ -1011,28 +1018,47 @@ sed_insert_route() {
   ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 }
 
-# 无 jq 时切换 SNI：仅改 H3 inbound 的 dest、serverNames[0]，
-# 并 upsert fallbackDestRoutes[<sni>]（存在改值，否则块尾插入补逗号）
+# 无 jq 时切换 SNI：改 H3 inbound 的 dest、fallbackDest、serverNames[0]，
+# 并删除 fallbackDestRoutes 路由表（经典 REALITY 语义：fallback 一律转发
+# 单一 dest，不按 SNI 分流；旧配置残留的路由表在此一并清除）
 sed_update_sni_routes() {
   local sni="$1" range start end
   range=$(scan_h3_range) || true
   [ -n "$range" ] || { red "ERROR: 未找到 H3 inbound"; return 1; }
   start=${range%%|*}; end=${range##*|}
-  # 仅替换 H3 inbound 范围内的 dest
+  # 替换 H3 inbound 范围内的 dest 与 fallbackDest（"fallbackDestRoutes" 不会被
+  # 误匹配：其 "fallbackDest" 后跟的是 Routes" 而非冒号）
   sed "${start},${end}s/\"dest\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"dest\": \"${sni}:443\"/" "$CONFIG_PATH" \
     > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-  sed_set_server_names "$sni"
-  # upsert fallbackDestRoutes[<sni>]（仅在 H3 inbound 范围内判定与替换）
-  if sed -n "${start},${end}p" "$CONFIG_PATH" | grep -q '^[[:space:]]*"'"$sni"'"[[:space:]]*:[[:space:]]*"'; then
-    sed "${start},${end}s/^\([[:space:]]*\)\"${sni}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"\([[:space:]]*,\)\{0,1\}[[:space:]]*$/\1\"${sni}\": \"${sni}:443\"\2/" "$CONFIG_PATH" \
+  sed "${start},${end}s/\"fallbackDest\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"fallbackDest\": \"${sni}:443\"/" "$CONFIG_PATH" \
     > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-  else
-    sed_insert_route "$sni"
-  fi
+  sed_set_server_names "$sni"
+  # 删除 fallbackDestRoutes 块（本项目模板中它是 realitySettings 的末键，
+  # 删除时给前一行补掉尾逗号；无该键时原样输出）
+  awk -v s="$start" -v e="$end" '
+    NR < s || NR > e {
+      if (buf != "") { print buf; buf = "" }
+      print
+      next
+    }
+    /"fallbackDestRoutes"[[:space:]]*:[[:space:]]*\{/ {
+      if (buf != "") {
+        if (buf ~ /,[[:space:]]*$/) sub(/,[[:space:]]*$/, "", buf)
+        print buf
+        buf = ""
+      }
+      in_routes = 1
+      next
+    }
+    in_routes && /^[[:space:]]*\}/ { in_routes = 0; next }
+    in_routes { next }
+    { if (buf != "") print buf; buf = $0 }
+    END { if (buf != "") print buf }
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
   return 0
 }
 
-# 无 jq 时添加路由条目（仅 H3 inbound；已存在则幂等成功）
+# 无 jq 时添加路由条目（手动高级配置；仅 H3 inbound；已存在则幂等成功）
 sed_add_sni_route() {
   local sni="$1" range start end
   range=$(scan_h3_range) || true
@@ -1044,7 +1070,7 @@ sed_add_sni_route() {
   sed_insert_route "$sni"
 }
 
-# 无 jq 时删除路由条目（仅 H3 inbound；含存在性与至少保留 1 条的校验）
+# 无 jq 时删除路由条目（手动高级配置；仅 H3 inbound；含存在性与至少保留 1 条的校验）
 sed_remove_sni_route() {
   local sni="$1" count range start end
   range=$(scan_h3_range) || true
@@ -1121,11 +1147,13 @@ backup_config() {
   green "已备份: $BACKUP"
 }
 
-# 切换/更新当前 SNI：改 H3 inbound 的 dest、serverNames[0] 与
-# fallbackDestRoutes[<sni>]（其余 inbound 与路由条目不动）；成功返回 0
+# 切换/更新当前 SNI：改 H3 inbound 的 dest、fallbackDest、serverNames[0]，
+# 并删除 fallbackDestRoutes 路由表（经典 REALITY 语义：fallback 一律转发
+# 单一 dest，不按 SNI 分流，路由表是额外特征；部署流程不生成/不维护路由表）；
+# 成功返回 0
 update_sni_routes() {
   local sni="$1" edit_ok=0
-  yellow "更新 H3 inbound: dest=$sni:443 serverNames[0]=$sni fallbackDestRoutes[$sni]=$sni:443"
+  yellow "更新 H3 inbound: dest=$sni:443 serverNames[0]=$sni fallbackDest=$sni:443（清除 fallbackDestRoutes 路由表）"
   if command -v jq >/dev/null 2>&1; then
     if jq --arg sni "$sni" '
       .inbounds = [ .inbounds[] | if (.streamSettings.network == "xhttp" and
@@ -1133,8 +1161,9 @@ update_sni_routes() {
            (.streamSettings.realitySettings | has("fallbackDest")) or
            (.streamSettings.realitySettings.fallbackDestRoutes != null))) then
         .streamSettings.realitySettings.dest = ($sni + ":443")
+        | .streamSettings.realitySettings.fallbackDest = ($sni + ":443")
         | .streamSettings.realitySettings.serverNames[0] = $sni
-        | .streamSettings.realitySettings.fallbackDestRoutes[$sni] = ($sni + ":443")
+        | del(.streamSettings.realitySettings.fallbackDestRoutes)
       else . end ]' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     then
       edit_ok=1
@@ -1145,7 +1174,8 @@ update_sni_routes() {
   [ "$edit_ok" -eq 1 ]
 }
 
-# 添加 SNI 到 fallbackDestRoutes（不动当前 dest/serverNames）；成功返回 0
+# 添加 SNI 到 fallbackDestRoutes（手动高级配置；不动当前 dest/serverNames）；
+# 成功返回 0
 add_sni_route() {
   local sni="$1" edit_ok=0
   yellow "添加 fallbackDestRoutes[$sni]=$sni:443（不改动当前 dest/serverNames）"
@@ -1166,8 +1196,8 @@ add_sni_route() {
   [ "$edit_ok" -eq 1 ]
 }
 
-# 从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删清空路由表）；
-# 目标不存在（4）或仅剩 1 条（5）时输出红色原因并返回 1
+# 从 fallbackDestRoutes 移除 SNI（手动高级配置；至少保留 1 条，防误删清空
+# 路由表）；目标不存在（4）或仅剩 1 条（5）时输出红色原因并返回 1
 remove_sni_route() {
   local sni="$1" edit_ok=0
   yellow "删除 fallbackDestRoutes[$sni]（至少保留 1 条路由）"
@@ -1453,7 +1483,7 @@ get_h3_server_names() {
   return 0
 }
 
-# 输出 H3 inbound 的 fallbackDestRoutes 条目数
+# 输出 H3 inbound 的 fallbackDestRoutes 条目数（手动高级配置；无路由表时输出 0）
 get_h3_route_count() {
   if command -v jq >/dev/null 2>&1; then
     local n
@@ -1479,7 +1509,8 @@ get_h3_route_count() {
   return 0
 }
 
-# 输出 H3 inbound 的 fallbackDestRoutes 全部条目（每行 key<TAB>value，按 key 排序）
+# 输出 H3 inbound 的 fallbackDestRoutes 全部条目（手动高级配置；
+# 每行 key<TAB>value，按 key 排序；无路由表时输出为空）
 get_h3_routes() {
   if command -v jq >/dev/null 2>&1; then
     jq -r '[.inbounds[] | select(.streamSettings.network == "xhttp" and (

@@ -358,33 +358,15 @@ no_kernel_guide() {
 
 # fork 模式：${H2_PORT} H2 + ${H3_PORT} H3 最小可运行模板（新配置生成）
 generate_fork_config() {
-  local conf_dir routes_json r first=1
+  local conf_dir
   conf_dir=$(dirname "$CONFIG_PATH")
   mkdir -p "$conf_dir" || die "无法创建配置目录 $conf_dir"
 
-  # fallbackDestRoutes 全部来自手测 SNI 维护库（snis.json，fetch_sni_list 拉取）；
-  # 若当前 SNI 命中库内条目则跳过，最后追加当前 SNI（旧 python 逻辑等价：
-  # routes.pop(sni) 去重后最后追加当前 SNI），保证 JSON 无重复键
-  if [ "${#SNI_LIST[@]}" -eq 0 ]; then
-    fetch_sni_list || true
-  fi
-  if [ "${#SNI_LIST[@]}" -eq 0 ]; then
-    yellow "警告: SNI 库不可用（无网络且无缓存），路由表降级为仅当前 SNI"
-  fi
-  for r in "${SNI_LIST[@]}"; do
-    [ "$r" = "$sni" ] && continue
-    if [ "$first" -eq 1 ]; then
-      printf -v routes_json '            "%s": "%s:443"' "$r" "$r"
-      first=0
-    else
-      printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$r" "$r"
-    fi
-  done
-  if [ "$first" -eq 1 ]; then
-    printf -v routes_json '            "%s": "%s:443"' "$sni" "$sni"
-  else
-    printf -v routes_json '%s,\n            "%s": "%s:443"' "$routes_json" "$sni" "$sni"
-  fi
+  # 经典 REALITY 语义（core/vendor/github.com/xtls/reality/tls.go Server()）：
+  # fallback 一律原样转发到单一 dest，不按 SNI 分流（serverNames 只决定是否
+  # 尝试认证，不参与 fallback 目标选择）；SNI 不匹配时由真实站点自己拒绝。
+  # 因此不生成 fallbackDestRoutes 路由表（额外特征，主动探测换 SNI 多测必露馅），
+  # fallbackDest 固定等于 dest，未认证/探测流量统一原样转发 dest。
 
   cat > "$CONFIG_PATH" <<EOF || die "配置模板生成失败"
 {
@@ -493,10 +475,7 @@ generate_fork_config() {
           "alpn": [
             "h3"
           ],
-          "fallbackDest": "$sni:443",
-          "fallbackDestRoutes": {
-$routes_json
-          }
+          "fallbackDest": "$sni:443"
         },
         "finalmask": {
           "quicParams": {
@@ -741,10 +720,10 @@ if [ "$DEGRADED" -eq 0 ]; then
 
   yellow "relay 闭环验证: probe-h3-sni -sni $sni -addr 127.0.0.1:${H3_PORT}"
   if probe_h3 "$sni" "127.0.0.1:${H3_PORT}" 15s; then
-    green "relay 闭环验证通过（路由命中，dest 完成握手）: $probe_out"
+    green "relay 闭环验证通过（未认证流量转发 dest，dest 完成握手）: $probe_out"
   else
     yellow "警告: relay 闭环未通过: $probe_out"
-    yellow "配置已生效。请检查 dest/$sni 的 443 是否可达、fallbackDestRoutes 是否正确。"
+    yellow "配置已生效。请检查 dest/$sni 的 443（TCP/UDP）是否可达、fallbackDest 是否与 dest 一致。"
   fi
 else
   if command -v ss >/dev/null 2>&1; then
@@ -781,7 +760,7 @@ else
   green "H3 inbound（端口 ${H3_PORT}）已切换 SNI -> $sni"
   echo "  当前 dest:        $sni:443"
   echo "  当前 serverNames: [$sni]"
-  echo "  路由表条目:       fallbackDestRoutes[$sni] = $sni:443（其余条目未动）"
+  echo "  路由表:           无（fallbackDest=$sni:443，未认证流量统一转发 dest）"
   if [ -n "$BACKUP" ]; then
     echo "  配置备份:         $BACKUP"
   fi

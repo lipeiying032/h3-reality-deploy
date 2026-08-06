@@ -7,10 +7,10 @@
 #
 # 子命令（用户可记忆的短命令）：
 #   h3reality status            当前状态：SNI/dest/serverNames、端口、服务 active、监听端口、配置路径
-#   h3reality list              列出 fallbackDestRoutes 全部 SNI 路由条目
-#   h3reality switch <sni>      切换当前 SNI（改 dest + serverNames[0] + 路由，校验 H3 支持）
-#   h3reality add <sni>         添加 SNI 到 fallbackDestRoutes（校验 H3 支持 + DNS）
-#   h3reality remove <sni>      从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删）
+#   h3reality list              查看路由表（默认无路由表，仅 fallbackDest 固定转发 dest）
+#   h3reality switch <sni>      切换当前 SNI（改 dest + serverNames[0] + fallbackDest 并清除路由表）
+#   h3reality add <sni>         添加 SNI 到 fallbackDestRoutes（手动高级配置）
+#   h3reality remove <sni>      从 fallbackDestRoutes 移除 SNI（手动高级配置）
 #   h3reality link              输出当前 VLESS 分享链接（全参数）
 #   h3reality restart|start|stop|log   服务管理（xray-h3 systemd）
 #   h3reality help              用法说明
@@ -53,10 +53,11 @@ usage() {
 
 子命令:
   status                 查看当前状态（SNI/dest/serverNames、端口、服务、监听、配置路径）
-  list                   列出 fallbackDestRoutes 全部 SNI 路由条目
-  switch <sni>           切换当前 SNI（改 dest + serverNames[0]，校验 H3 支持）
-  add <sni>              添加 SNI 到 fallbackDestRoutes（校验 H3 支持 + DNS）
-  remove <sni>           从 fallbackDestRoutes 移除 SNI（至少保留 1 条，防误删）
+  list                   查看路由表（默认无路由表，仅 fallbackDest 固定转发 dest）
+  switch <sni>           切换当前 SNI（改 dest + serverNames[0] + fallbackDest，
+                         并清除路由表，校验 H3 支持）
+  add <sni>              添加 SNI 到 fallbackDestRoutes（手动高级配置，校验 H3 支持 + DNS）
+  remove <sni>           从 fallbackDestRoutes 移除 SNI（手动高级配置，至少保留 1 条）
   link                   输出当前 VLESS 分享链接（全参数）
   restart | start | stop 服务管理（xray-h3 systemd）
   log                    查看 xray-h3 最近日志（journalctl 最近 100 行）
@@ -117,7 +118,11 @@ show_status() {
   echo "  dest:       $dest"
   echo "  serverNames: [ ${sn_list} ]"
   echo "  H3 端口:    $port (UDP)"
-  echo "  路由条目数: ${route_count:-0}"
+  if [ "${route_count:-0}" -gt 0 ]; then
+    echo "  路由条目数: ${route_count}（fallbackDestRoutes，手动高级配置）"
+  else
+    echo "  路由表:     无（未认证/探测流量统一转发 fallbackDest=$dest）"
+  fi
   if service_is_active; then
     green "  服务状态:   active（$SERVICE）"
   else
@@ -136,15 +141,16 @@ show_status() {
   fi
 }
 
-# ---------------- 列出 fallbackDestRoutes ----------------
+# ---------------- 列出 fallbackDestRoutes（手动高级配置；默认无路由表） ----------------
 list_routes() {
-  local out="" i=0 cur_sni=""
+  local out="" i=0 cur_sni="" dest=""
   require_config || return 1
   cur_sni=$(get_current_sni) || cur_sni="?"
+  dest=$(get_h3_dest) || dest=""
   out=$(get_h3_routes) || true
-  banner green "fallbackDestRoutes"
+  banner green "路由表（fallbackDestRoutes）"
   if [ -z "$out" ]; then
-    yellow "  共 0 条路由（fallbackDestRoutes 为空）"
+    yellow "  无路由表（经典 REALITY 语义：fallback 一律转发 fallbackDest=${dest:-dest}，不按 SNI 分流）"
     return 0
   fi
   echo "  共 $(echo "$out" | wc -l | tr -d ' ') 条路由:"
@@ -186,7 +192,7 @@ cmd_add() {
     die "添加路由失败，已回滚"
   fi
   apply_and_reload
-  green "已添加路由: $new_sni -> $new_sni:443"
+  green "已添加路由（手动高级配置）: $new_sni -> $new_sni:443"
   echo
   list_routes
 }
@@ -204,7 +210,7 @@ cmd_remove() {
     die "移除失败，已回滚"
   fi
   apply_and_reload
-  green "已移除路由: $old_sni"
+  green "已移除路由（手动高级配置）: $old_sni"
   echo
   list_routes
 }
