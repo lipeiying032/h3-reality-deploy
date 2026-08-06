@@ -22,7 +22,7 @@ REALITY 节点只能以 H2/XHTTP 形态存在，拿不到 QUIC 的传输特性�
 
 ### 2.2 QUIC 探测威胁
 
-UDP 端口（8443/8446）直接把 QUIC 服务暴露在公网。GFW 的主动探测对 QUIC 非常廉价：
+UDP 端口（默认 443）直接把 QUIC 服务暴露在公网。GFW 的主动探测对 QUIC 非常廉价：
 发一个标准 QUIC Initial（随机 SNI、标准 ClientHello），只要握手能完成、返回行为与真实站点不一致
 （自签证书、REALITY 特殊字段、错误码、时序），端口即被标记为代理。
 
@@ -64,10 +64,10 @@ UDP 端口（8443/8446）直接把 QUIC 服务暴露在公网。GFW 的主动探
 │                 ALPS→h3  ALPN=h3  5 组 groups（对齐 Chrome）                                   │
 │    random 字段 = AES-GCM(ClientVer + UnixTime + ShortId) 32B（与真随机不可区分）               │
 └──────────────────────────────────────────┬────────────────────────────────────────────────────┘
-                                           │ QUIC UDP（公网 :8446）
+                                           │ QUIC UDP（公网 :443）
                                            ▼
 ┌─────────────────────────── 服务端（fork xray，XHTTP/3 listener） ─────────────────────────────┐
-│  UDP listener :8446（sockopt SO_RCVBUF/SO_SNDBUF=8MB，finalmask.quicParams: BBR aggressive）   │
+│  UDP listener :443（sockopt SO_RCVBUF/SO_SNDBUF=8MB，finalmask.quicParams: BBR aggressive）    │
 │                                                                                               │
 │  ① QUIC 预检（reality_precheck.go / reality_precheck_conn.go）                                │
 │     解密 Initial（RFC9001 §5.2）→ CRYPTO 跨包重组 → 提取 ClientHello                          │
@@ -226,7 +226,7 @@ Chrome 的 QUIC ClientHello 中，ALPS（application_settings）的 `supported_p
 
 - **防伪造源**：每个客户端流一个 `DialUDP` connect socket，`conn.Read` 只收 dest 来源的包；
 - **源地址保持**：dest 的应答经服务端自己的监听 socket `WriteTo` 写回，客户端看到单一源地址
-  （服务器 IP:8446）；
+  （服务器 IP:443）；
 - **超时回收**：30s ticker，默认 120s 空闲回收（`FallbackTimeout` 可配）；表上限 65536、per-IP
   512、单包 64KB；
 - **多 IP 故障转移**：`resolveRelayDest` 启动时解析目标全部 A/AAAA（去重）作候选集；
@@ -283,30 +283,32 @@ sudo bash deploy-h3-sni.sh
 - 探针自给自足：同目录二进制 → 同目录源码 + Go 自动编译 → GitHub Release 下载预编译二进制；
 - xray 内核自动检测（`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH`），
   找不到时黄色警告并给出引导（从仓库 `core/` 源码构建 fork 内核 / 官方内核 H2 降级模式）；
-- 没有 `server.json` 自动生成最小可运行配置（8443 H2 + 8446 H3），UUID/x25519 keypair/
-  shortId 用内核二进制自动生成；已有配置只改 8446 的 dest/serverNames/fallbackDestRoutes[SNI]；
+- 没有 `server.json` 自动生成最小可运行配置（默认端口 443：H2 TCP + H3 UDP，非标准端口可用
+  `H2_PORT`/`H3_PORT` 环境变量覆盖），UUID/x25519 keypair/shortId 用内核二进制自动生成；
+  已有配置按特征定位 H3 inbound，只改其 dest/serverNames/fallbackDestRoutes[SNI]；
 - 没有 `xray-h3.service` 自动创建并 `enable`；
 - 部署后输出完整 VLESS 分享链接（`vless://...`，含 sni/pbk/sid/fp/type），可直接导入客户端。
 
-> 注意：fork 内核源码已开源在仓库 [`core/`](core/)（v26.7.28 + 全部魔改，MIT）。H3（8446）
-> 节点必须使用 fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅 8443，自签证书 + 明确警告）。
+> 注意：fork 内核源码已开源在仓库 [`core/`](core/)（v26.7.28 + 全部魔改，MIT）。H3 节点
+> 必须使用 fork 内核；若只有官方内核，脚本会走 H2 降级模式（仅部署 H2，自签证书 + 明确警告）。
 
-### 8.1 双 VPS 拓扑
+### 8.1 单节点部署拓扑
 
-| 节点 | 地址 | H2 | H3 |
-|---|---|---|---|
-| 主 VPS | `YOUR_MAIN_VPS_IP` | 8443 | 8446 |
-| 小 VPS | `YOUR_SMALL_VPS_IP` | 8445 | 8446 |
+| 节点 | 地址 | H2 端口 | H3 端口 |
+|------|------|---------|---------|
+| 你的服务器 | `YOUR_SERVER_IP` | 443 (TCP) | 443 (UDP) |
 
-两台 VPS 的 8446 inbound 结构相同（当前 SNI = ea.com，2026-08-05 更新，路由表 17 条）。
+默认端口为 443（TCP 与 UDP 可共存）；非标准端口可用环境变量 `H2_PORT`/`H3_PORT` 覆盖
+（本项目作者生产环境实际用 8443/8446）。所有节点 H3 inbound 结构相同：示例 SNI = ea.com，
+部署时用你自己的 SNI（脚本会自动验证 H3 支持），路由表 17 条。
 
-### 8.2 server.json —— 8446 inbound 完整示例
+### 8.2 server.json —— H3 inbound 完整示例（默认端口 443）
 
 ```jsonc
-// /opt/xray/server.json 中的 8446 inbound（密钥字段已脱敏，真实值见生产文件）
+// /opt/xray/server.json 中的 H3 inbound（默认端口 443；密钥字段已脱敏，真实值以实际部署为准）
 {
   "listen": "0.0.0.0",
-  "port": 8446,
+  "port": 443,
   "protocol": "vless",
   "settings": {
     "clients": [
@@ -393,7 +395,7 @@ sudo bash deploy-h3-sni.sh
   原样转发，探测者看到的是真实站点完成的握手，而不是服务端自己签的假证书；
 - `fallbackDest` 必须显式（预检启用开关），`fallbackDestRoutes` 提供 SNI 精确路由；
 - `sockopt` UDP 收发缓冲 8MB；`finalmask.quicParams` 配 BBR aggressive + 大窗口；
-- 8443/8445（H2）inbound 不包含以上任何 H3 专属字段，与官方 H2 REALITY 完全兼容。
+- H2 inbound 不包含以上任何 H3 专属字段，与官方 H2 REALITY 完全兼容。
 
 ### 8.3 systemd 服务
 
@@ -423,8 +425,8 @@ WantedBy=multi-user.target
   "settings": {
     "vnext": [
       {
-        "address": "YOUR_MAIN_VPS_IP",      // 主 VPS；小 VPS 用 YOUR_SMALL_VPS_IP
-        "port": 8446,
+        "address": "YOUR_SERVER_IP",        // 你的服务器公网 IP
+        "port": 443,
         "users": [
           {
             "id": "REPLACE_WITH_REAL_UUID",
@@ -518,7 +520,7 @@ WantedBy=multi-user.target
 
 ### 11.1 连通性
 
-- 客户端连上后访问测速/下载站，204/200 即通；`curl --http3 https://<SNI>/` 从外部打 8446
+- 客户端连上后访问测速/下载站，204/200 即通；`curl --http3 https://<SNI>/` 从外部打 443（UDP）
   应看到真实站点的响应（relay 生效）。
 
 ### 11.2 抓包特征核对（Wireshark，QUIC + TLS 解密）
@@ -540,8 +542,8 @@ WantedBy=multi-user.target
 ./probe-h3-sni -sni apple.com              # ERR: context deadline exceeded（不支持）
 ./probe-h3-sni -sni www.apple.com          # ERR: ... CRYPTO_ERROR 0x150 ...（不支持）
 
-# 部署后验证 relay 闭环：连本机 8446，SNI 仍用目标域名
-./probe-h3-sni -sni ea.com -addr 127.0.0.1:8446   # STATUS: 400/301 = 路由命中
+# 部署后验证 relay 闭环：连本机 443（UDP），SNI 仍用目标域名
+./probe-h3-sni -sni ea.com -addr 127.0.0.1:443    # STATUS: 400/301 = 路由命中
 ```
 
 退出码：0 = 完整握手；1 = 不支持；2 = 参数错误。
@@ -585,7 +587,7 @@ WantedBy=multi-user.target
 # 部署（root 直跑；非 root 自动 sudo 重执行）
 sudo bash deploy-h3-sni.sh
 # 交互输入 SNI（默认 ea.com），流程：
-#   格式校验 → DNS 解析 → 探针测 H3 → 支持则改 8446 + 备份 + run -test + 重启 + 验证
+#   格式校验 → DNS 解析 → 探针测 H3 → 支持则改 H3 inbound + 备份 + run -test + 重启 + 验证
 #   不支持则红字拒绝并建议换 SNI（最多 5 次，q/quit 退出）
 ```
 
@@ -598,26 +600,28 @@ sudo bash deploy-h3-sni.sh
 - 内核检测：`/opt/xray/xray-linux-amd64` → `/usr/local/bin/xray` → `PATH` 中的 `xray`，
   找到后 `version` 校验；找不到 → 黄色警告（提示从仓库 `core/` 源码构建内核）+ 两种引导：
   按 README「core/ 内核源码」自行构建 fork 内核，或已装官方 xray 则走 **H2 降级模式**
-  （只部署 8443 + 自签证书，明确提示跳过 H3）；
-- 无 `server.json` → 自动生成最小可运行配置：8443 H2（vless+xhttp+reality，dest 真证书需
-  fork 内核）+ 8446 H3（alpn=h3 + `fallbackDest` + 17 条 `fallbackDestRoutes`），
-  UUID/privateKey/publicKey/shortId 由内核二进制自动生成；
-- 已有配置 → 只改 8446 inbound：`dest=<SNI>:443`、`serverNames=[<SNI>]`、
-  `fallbackDestRoutes[<SNI>]=<SNI>:443`（已有则更新，没有则新增，其余 17 条不动）；不碰 8443/8445；
+  （只部署 H2 + 自签证书，明确提示跳过 H3）；
+- 无 `server.json` → 自动生成最小可运行配置：H2（默认端口 443，vless+xhttp+reality，dest
+  真证书需 fork 内核）+ H3（默认端口 443 UDP，alpn=h3 + `fallbackDest` + 17 条
+  `fallbackDestRoutes`），UUID/privateKey/publicKey/shortId 由内核二进制自动生成；
+  非标准端口可用 `H2_PORT`/`H3_PORT` 环境变量覆盖；
+- 已有配置 → 按特征定位 H3 inbound（network=xhttp 且 alpn 含 h3），只改其：
+  `dest=<SNI>:443`、`serverNames=[<SNI>]`、`fallbackDestRoutes[<SNI>]=<SNI>:443`
+  （已有则更新，没有则新增，其余 17 条不动）；不碰其他 inbound；
 - 无 `xray-h3.service` → 自动生成并 `daemon-reload` + `enable`；ExecStart 与当前内核/配置
   不一致时自动更新；已一致只 `restart`；
-- 端口冲突检测：改配置前用 `ss` 检查 8446 UDP / 8443 TCP，被非 xray 进程占用时黄色警告 +
-  询问是否继续（默认继续，覆盖端口说明）；
+- 端口冲突检测：改配置前用 `ss` 检查 H3（默认 443）UDP / H2（默认 443）TCP，被非 xray
+  进程占用时黄色警告 + 询问是否继续（默认继续，覆盖端口说明）；
 - 自动备份 `server.json.bak-sni-<SNI>-<时间戳>`；`run -test` 失败或 `systemctl restart
   xray-h3` 失败自动回滚；
-- 验证：`ss -ulnp` 确认 8446 UDP 监听 + 探针 `-sni <SNI> -addr 127.0.0.1:8446` 验证
-  relay 闭环（返回 400/任何 HTTP 状态码即路由命中）；
+- 验证：`ss -ulnp` 确认 H3（默认 443）UDP 监听 + 探针 `-sni <SNI> -addr 127.0.0.1:443`
+  验证 relay 闭环（返回 400/任何 HTTP 状态码即路由命中）；
 - 完成后提醒客户端只需同步 `serverName`（SNI），keypair/UUID/shortId 不变，并打印完整
   VLESS 分享链接（`vless://...`，含 sni/pbk/sid/fp=chrome/type=xhttp），可直接导入客户端。
 
 ### 12.3 常见问题（FAQ）
 
-**Q：探测我 8446 端口返回 0x128，是 relay 坏了？**
+**Q：探测我 H3 端口（默认 443）返回 0x128，是 relay 坏了？**
 A：不是。0x128 = 真实站点（如 CF）对未知 SNI 的拒绝，说明 relay 已经生效、探测流被转给了
 真实站点。换个在路由表里的 SNI 再探，应看到完整握手。
 
