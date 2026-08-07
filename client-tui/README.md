@@ -89,6 +89,7 @@ go vet ./...    # 静态检查
 
 - **端口 10808/10809 被占用**：启动前会自动检测并红字提示，关闭占用程序后重试。
 - **启动失败**：红字会附上内核最后 40 行日志；完整日志在 `logs/run-*.log`。
-- **连不上目标服务器**：先确认服务端已按 `deploy-h3-sni.sh` 部署、链接参数
-  （sni/pbk/sid/path）与服务端一致。
+- **连不上目标服务器**：先确认服务端已按
+  [h3-reality-deploy-scripts](https://github.com/lipeiying032/h3-reality-deploy-scripts)
+  的一键脚本部署、链接参数（sni/pbk/sid/path）与服务端一致。
 - **首次启动稍慢**：需要把约 75MB 的内核与规则文件从单文件里释放出来，属正常现象。
