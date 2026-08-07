@@ -42,17 +42,6 @@ message Config {
   // paired with a mismatched throwaway key.
   string h3_certificate_file = 33;
   string h3_key_file = 34;
-
-  // fallbackDest is the UDP address that probe / unauthenticated XHTTP/3
-  // (QUIC) flows are relayed to. The QUIC precheck forwards such flows
-  // verbatim and the fallback completes the handshake.
-  string fallback_dest = 35;
-
-  // fallbackDestRoutes maps the SNI a prober sends in its ClientHello to the
-  // real destination it should be relayed to (exact match). When a probe's
-  // SNI is not present the flow falls back to fallbackDest. Each relayed
-  // client flow keeps the destination chosen by its first packet.
-  map<string, string> fallback_dest_routes = 36;
 }
 
 message LimitFallback {

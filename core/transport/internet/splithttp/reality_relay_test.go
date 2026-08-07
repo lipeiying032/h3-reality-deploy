@@ -39,7 +39,7 @@ func TestRealityRelayFailoverOnRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serverConn.Close()
-	relay, err := newRealityRelay(serverConn, "", nil, time.Minute)
+	relay, err := newRealityRelay(serverConn, "", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -638,13 +638,13 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		// QUIC precheck + probe relay: inspect each client's first QUIC
 		// Initial flight, verify the REALITY ClientHello (session_id payload)
 		// and relay unauthenticated / unparseable flows verbatim to the
-		// destination chosen for the flow (exact SNI route match, else the
-		// configured fallback dest), which completes the handshake. Only
-		// active when a fallback dest or SNI routes and full server auth
-		// secrets are configured.
+		// single configured dest (classic REALITY semantics: auth failure is
+		// always forwarded to dest, never routed by SNI), which completes the
+		// handshake. Only active when a dest and full server auth secrets are
+		// configured.
 		if r := reality.ConfigFromStreamSettings(streamSettings); r != nil {
 			params := r.GetRealityQUICParams()
-			if params != nil && len(params.PrivateKey) == 32 && len(params.ShortIds) > 0 && (params.FallbackDest != "" || len(params.FallbackDestRoutes) > 0) {
+			if params != nil && len(params.PrivateKey) == 32 && len(params.ShortIds) > 0 && params.Dest != "" {
 				Conn, err = newRealityPrecheckPacketConn(ctx, Conn, params)
 				if err != nil {
 					Conn.Close()

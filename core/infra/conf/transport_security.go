@@ -57,15 +57,6 @@ type REALITYConfig struct {
 	// configured dest serves).
 	H3CertificateFile string `json:"h3CertificateFile"`
 	H3KeyFile         string `json:"h3KeyFile"`
-	// FallbackDest is the UDP address probe / unauthenticated XHTTP/3 (QUIC)
-	// flows are relayed to by the QUIC precheck. When empty it defaults to
-	// the REALITY dest.
-	FallbackDest string `json:"fallbackDest"`
-	// FallbackDestRoutes maps a prober's ClientHello SNI (exact match) to the
-	// real UDP destination that flow is relayed to. Unknown SNIs fall back to
-	// FallbackDest. Optional; empty means every relayed flow goes to
-	// FallbackDest.
-	FallbackDestRoutes map[string]string `json:"fallbackDestRoutes"`
 }
 
 func (c *REALITYConfig) Build() (proto.Message, error) {
@@ -170,8 +161,6 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		config.Alpn = c.Alpn
 		config.H3CertificateFile = c.H3CertificateFile
 		config.H3KeyFile = c.H3KeyFile
-		config.FallbackDest = c.FallbackDest
-		config.FallbackDestRoutes = c.FallbackDestRoutes
 
 		if c.Mldsa65Seed != "" {
 			if c.Mldsa65Seed == c.PrivateKey {

@@ -10,10 +10,11 @@ package splithttp
 //     handed to quic-go through an internal FIFO queue.
 //   - RELAY:   verification failed or the flow is not parseable QUIC — the
 //     flow is treated as a probe and every packet is relayed verbatim to the
-//     destination chosen for that flow: exact match on the ClientHello SNI in
-//     fallbackDestRoutes, else fallbackDest, else the flow is dropped. The
-//     target is fixed at the first packet's decision; the destination
-//     completes the handshake.
+//     single configured dest (classic REALITY semantics: auth failure is
+//     always forwarded to dest, never routed by SNI; serverNames only gates
+//     auth). Without a configured dest such flows are dropped. The target is
+//     fixed at the first packet's decision; the destination completes the
+//     handshake and the real site rejects a mismatched SNI by itself.
 //
 // The wrapper runs its own read loop on the underlying conn; quic-go's
 // ReadFrom is served from the AUTH queue so it is never blocked by precheck
@@ -63,9 +64,9 @@ type precheckClientState struct {
 	firstSeen time.Time
 	ip        string
 	// relayDest is the destination set pinned for this flow at the RELAY
-	// decision (all resolved addresses of the routed hostname). It is only
+	// decision (all resolved addresses of the configured dest). It is only
 	// touched by the read loop, alongside state. nil means the flow is
-	// dropped (no route and no fallbackDest).
+	// dropped (no dest configured).
 	relayDest    []*net.UDPAddr
 	cryptoBuf    []byte
 	pending      [][]byte // raw datagrams held until the decision is made
@@ -94,14 +95,13 @@ type realityPrecheckPacketConn struct {
 }
 
 // newRealityPrecheckPacketConn wraps conn with the QUIC precheck + UDP relay.
-// It is a no-op (returns conn) when neither FallbackDest nor
-// FallbackDestRoutes are configured. The returned conn owns the relay: Close
-// tears both down.
+// It is a no-op (returns conn) when no Dest is configured. The returned conn
+// owns the relay: Close tears both down.
 func newRealityPrecheckPacketConn(ctx context.Context, conn net.PacketConn, params *tls.RealityQUICParams) (net.PacketConn, error) {
-	if params == nil || (params.FallbackDest == "" && len(params.FallbackDestRoutes) == 0) {
+	if params == nil || params.Dest == "" {
 		return conn, nil
 	}
-	relay, err := newRealityRelay(conn, params.FallbackDest, params.FallbackDestRoutes, params.FallbackTimeout)
+	relay, err := newRealityRelay(conn, params.Dest, params.FallbackTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -217,9 +217,9 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 	if st == nil {
 		if len(c.states) >= precheckMaxStates || c.perIP[addrIPKey(addr)] >= precheckMaxPerIP {
 			// Limits reached: relay unclassified traffic directly to the
-			// default (fallback) destination.
+			// configured dest.
 			c.mu.Unlock()
-			c.relay.relayClientToDest(addr, c.relay.fallback, data)
+			c.relay.relayClientToDest(addr, c.relay.dest, data)
 			return
 		}
 		st = &precheckClientState{state: precheckPending, lastSeen: time.Now(), firstSeen: time.Now(), ip: addrIPKey(addr)}
@@ -243,14 +243,14 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 // decidePending processes one datagram while the ClientHello is still being
 // reassembled, then either keeps waiting (buffering the datagram), marks the
 // client AUTH (flushing everything to the quic-go queue) or marks it RELAY
-// (flushing everything to the fallback dest).
+// (flushing everything to the dest).
 func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data []byte, addr net.Addr) {
 	work := make([]byte, len(data))
 	copy(work, data)
 	pkt, err := parseQUICInitial(work)
 	if err != nil {
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (unparseable: ", err, ")")
-		c.relayDecision(st, nil, data, addr)
+		c.relayDecision(st, data, addr)
 		return
 	}
 	for _, frag := range parseCryptoFrames(pkt.Payload) {
@@ -262,7 +262,7 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 		if len(st.pending) >= precheckMaxPendingPkts || st.pendingBytes >= precheckMaxPendingBytes ||
 			time.Since(st.firstSeen) > c.relayTimeout() {
 			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello incomplete)")
-			c.relayDecision(st, nil, data, addr)
+			c.relayDecision(st, data, addr)
 			return
 		}
 		st.pending = append(st.pending, data)
@@ -271,7 +271,7 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 	}
 	if c.verifier == nil || c.verifier.Verify(hello) != nil {
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String())
-		c.relayDecision(st, hello, data, addr)
+		c.relayDecision(st, data, addr)
 		return
 	}
 	errors.LogInfo(c.ctx, "REALITY: QUIC precheck AUTH for ", addr.String())
@@ -281,18 +281,18 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 	c.flushPending(st, data, addr, false)
 }
 
-// relayDecision marks the client RELAY, pins the flow's destination (route
-// match on the ClientHello SNI, else fallbackDest, else nil = drop) and
-// forwards all buffered datagrams plus the current one to that destination
-// (no packet is dropped for a configured destination).
-func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, hello []byte, data []byte, addr net.Addr) {
-	target := c.relay.targetForSNI(clientHelloServerName(hello))
+// relayDecision marks the client RELAY, pins the flow's destination (the
+// single configured dest, nil = drop) and forwards all buffered datagrams
+// plus the current one to that destination (no packet is dropped for a
+// configured destination).
+func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, data []byte, addr net.Addr) {
+	target := c.relay.dest
 	c.mu.Lock()
 	st.state = precheckRelay
 	st.relayDest = target
 	c.mu.Unlock()
 	if len(target) == 0 {
-		errors.LogInfo(c.ctx, "REALITY: QUIC precheck DROP for ", addr.String(), " (no route for SNI, no fallbackDest)")
+		errors.LogInfo(c.ctx, "REALITY: QUIC precheck DROP for ", addr.String(), " (no dest configured)")
 		st.pending = nil
 		st.pendingBytes = 0
 		return

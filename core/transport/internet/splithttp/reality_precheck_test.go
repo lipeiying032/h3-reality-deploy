@@ -370,17 +370,17 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serverConn.Close()
-	fallbackConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fallbackConn.Close()
+	defer destConn.Close()
 
 	params := &tls.RealityQUICParams{
 		PrivateKey:      serverPriv,
 		ShortIds:        map[[8]byte]bool{shortID: true},
 		ServerNames:     map[string]bool{"www.apple.com": true},
-		FallbackDest:    fallbackConn.LocalAddr().String(),
+		Dest:            destConn.LocalAddr().String(),
 		FallbackTimeout: 5 * time.Second,
 	}
 	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
@@ -399,7 +399,7 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 		return c, c.LocalAddr()
 	}
 
-	// 1. Probe ClientHello (no session_id) -> RELAY to fallback, packet kept.
+	// 1. Probe ClientHello (no session_id) -> RELAY to dest, packet kept.
 	probeClient, probeAddr := mkClient()
 	ephPriv := make([]byte, 32)
 	rand.Read(ephPriv)
@@ -407,11 +407,11 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 	if _, err := probeClient.WriteToUDP(probePkt, serverConn.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatal(err)
 	}
-	fallbackConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	destConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 2048)
-	n, _, err := fallbackConn.ReadFromUDP(buf)
+	n, _, err := destConn.ReadFromUDP(buf)
 	if err != nil {
-		t.Fatalf("fallback did not receive relayed probe: %v", err)
+		t.Fatalf("dest did not receive relayed probe: %v", err)
 	}
 	if n != len(probePkt) || string(buf[:n]) != string(probePkt) {
 		t.Fatalf("relayed probe packet corrupted: got %d bytes, want %d", n, len(probePkt))
@@ -497,29 +497,6 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 	}
 }
 
-func TestClientHelloServerName(t *testing.T) {
-	ephPub := make([]byte, 32)
-	rand.Read(ephPub)
-	hello := buildTestClientHelloBodySNI(make([]byte, 32), nil, ephPub, "www.apple.com")
-	if got := clientHelloServerName(hello); got != "www.apple.com" {
-		t.Fatalf("clientHelloServerName = %q, want www.apple.com", got)
-	}
-	// A session_id-bearing (stage-1 auth) ClientHello must parse identically.
-	if got := clientHelloServerName(buildTestClientHelloBody(make([]byte, 32), make([]byte, 32), ephPub)); got != "www.apple.com" {
-		t.Fatalf("clientHelloServerName(session_id) = %q, want www.apple.com", got)
-	}
-	// Malformed / non-ClientHello inputs return "".
-	if got := clientHelloServerName(nil); got != "" {
-		t.Fatalf("clientHelloServerName(nil) = %q, want empty", got)
-	}
-	if got := clientHelloServerName([]byte{0x02, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc}); got != "" {
-		t.Fatalf("clientHelloServerName(ServerHello) = %q, want empty", got)
-	}
-	if got := clientHelloServerName(buildTestClientHelloBodySNI(make([]byte, 32), nil, ephPub, "")[:10]); got != "" {
-		t.Fatalf("clientHelloServerName(truncated) = %q, want empty", got)
-	}
-}
-
 // relayedProbe is a helper that sends one probe-style Initial datagram with
 // the given SNI and returns the raw datagram that the precheck relayed.
 type relayedProbe struct {
@@ -550,7 +527,13 @@ func expectNoRelay(t *testing.T, conn *net.UDPConn) {
 	}
 }
 
-func TestPrecheckRouteSelection(t *testing.T) {
+// TestPrecheckSingleDestRelay verifies the classic REALITY QUIC relay
+// semantics: every probe flow — a known serverNames SNI, a different SNI, an
+// unknown SNI — is forwarded verbatim to the single configured dest (auth
+// failure is never routed by SNI; the real site rejects a mismatched SNI
+// itself). Only REALITY-authenticated ClientHellos stay on the proxy path.
+// The destination is pinned per client flow at the first packet.
+func TestPrecheckSingleDestRelay(t *testing.T) {
 	serverPriv := make([]byte, 32)
 	serverPub, _ := curve25519.X25519(serverPriv, curve25519.Basepoint)
 	var shortID [8]byte
@@ -561,31 +544,17 @@ func TestPrecheckRouteSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serverConn.Close()
-	fallbackConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fallbackConn.Close()
-	appleConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer appleConn.Close()
-	googleConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer googleConn.Close()
+	defer destConn.Close()
 
 	params := &tls.RealityQUICParams{
-		PrivateKey:   serverPriv,
-		ShortIds:     map[[8]byte]bool{shortID: true},
-		ServerNames:  map[string]bool{"www.apple.com": true},
-		FallbackDest: fallbackConn.LocalAddr().String(),
-		FallbackDestRoutes: map[string]string{
-			"www.apple.com": appleConn.LocalAddr().String(),
-			"google.com":    googleConn.LocalAddr().String(),
-		},
+		PrivateKey:      serverPriv,
+		ShortIds:        map[[8]byte]bool{shortID: true},
+		ServerNames:     map[string]bool{"www.apple.com": true},
+		Dest:            destConn.LocalAddr().String(),
 		FallbackTimeout: 5 * time.Second,
 	}
 	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
@@ -614,42 +583,38 @@ func TestPrecheckRouteSelection(t *testing.T) {
 		return pkt
 	}
 
-	// 1. SNI=www.apple.com -> appleConn (route match), not fallback.
+	// 1. Probe with the configured serverNames SNI -> relayed verbatim to
+	// dest (SNI does not select any special target).
 	client1, _ := mkClient()
 	pkt1 := sendProbe(client1, "www.apple.com")
-	if got := expectRelay(t, appleConn); !bytes.Equal(got, pkt1) {
-		t.Fatalf("apple relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt1))
+	if got := expectRelay(t, destConn); !bytes.Equal(got, pkt1) {
+		t.Fatalf("dest relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt1))
 	}
-	expectNoRelay(t, fallbackConn)
 	if w.IsAuthenticated(client1.LocalAddr()) {
 		t.Fatal("probe client marked authenticated")
 	}
 
-	// 2. Same client, later packet: target stays pinned to appleConn even if
-	// the payload's SNI would have matched another route.
+	// 2. Same client, later packet with a different SNI: the target stays
+	// pinned to dest (no per-SNI routing).
 	pkt1b := sendProbe(client1, "google.com")
-	if got := expectRelay(t, appleConn); !bytes.Equal(got, pkt1b) {
+	if got := expectRelay(t, destConn); !bytes.Equal(got, pkt1b) {
 		t.Fatalf("pinned relay target not kept: got %d bytes, want %d", len(got), len(pkt1b))
 	}
-	expectNoRelay(t, googleConn)
 
-	// 3. SNI=google.com (fresh client) -> googleConn.
+	// 3. Fresh client, different SNI -> still dest.
 	client2, _ := mkClient()
 	pkt2 := sendProbe(client2, "google.com")
-	if got := expectRelay(t, googleConn); !bytes.Equal(got, pkt2) {
-		t.Fatalf("google relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt2))
+	if got := expectRelay(t, destConn); !bytes.Equal(got, pkt2) {
+		t.Fatalf("dest relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt2))
 	}
-	expectNoRelay(t, appleConn)
-	expectNoRelay(t, fallbackConn)
 
-	// 4. Unknown SNI -> fallbackConn.
+	// 4. Unknown SNI -> still dest (classic REALITY: the real site rejects a
+	// mismatched SNI by itself).
 	client3, _ := mkClient()
 	pkt3 := sendProbe(client3, "unknown.example.com")
-	if got := expectRelay(t, fallbackConn); !bytes.Equal(got, pkt3) {
-		t.Fatalf("fallback relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt3))
+	if got := expectRelay(t, destConn); !bytes.Equal(got, pkt3) {
+		t.Fatalf("dest relayed packet corrupted: got %d bytes, want %d", len(got), len(pkt3))
 	}
-	expectNoRelay(t, appleConn)
-	expectNoRelay(t, googleConn)
 
 	// 5. Authenticated (stage-2 random auth) ClientHello still goes AUTH.
 	authClient, _ := mkClient()
@@ -679,14 +644,16 @@ func TestPrecheckRouteSelection(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("ReadFrom did not return AUTH packet")
 	}
-	expectNoRelay(t, appleConn)
-	expectNoRelay(t, googleConn)
-	expectNoRelay(t, fallbackConn)
+	// The auth flow never touches the relay.
+	expectNoRelay(t, destConn)
 }
 
-func TestPrecheckNoFallbackDropsUnrouted(t *testing.T) {
+// TestPrecheckInactiveWithoutDest verifies the precheck is a no-op when no
+// Dest is configured: the wrapper is not installed and the underlying conn is
+// returned unchanged, so unauthenticated flows are neither relayed nor
+// classified.
+func TestPrecheckInactiveWithoutDest(t *testing.T) {
 	serverPriv := make([]byte, 32)
-	serverPub, _ := curve25519.X25519(serverPriv, curve25519.Basepoint)
 	var shortID [8]byte
 	copy(shortID[:], []byte{0xde, 0x08, 0x5a, 0xa9, 0, 0, 0, 0})
 
@@ -695,56 +662,19 @@ func TestPrecheckNoFallbackDropsUnrouted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serverConn.Close()
-	googleConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer googleConn.Close()
 
-	// No fallbackDest: only the routed SNI is relayed, everything else drops.
 	params := &tls.RealityQUICParams{
-		PrivateKey:  serverPriv,
-		ShortIds:    map[[8]byte]bool{shortID: true},
-		ServerNames: map[string]bool{"google.com": true},
-		FallbackDestRoutes: map[string]string{
-			"google.com": googleConn.LocalAddr().String(),
-		},
+		PrivateKey:      serverPriv,
+		ShortIds:        map[[8]byte]bool{shortID: true},
+		ServerNames:     map[string]bool{"www.apple.com": true},
 		FallbackTimeout: 5 * time.Second,
 	}
 	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wrapped.Close()
-
-	mkClient := func() *net.UDPConn {
-		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { c.Close() })
-		return c
+	if wrapped != net.PacketConn(serverConn) {
+		wrapped.Close()
+		t.Fatal("precheck wrapped the conn despite empty Dest; want no-op")
 	}
-	sendProbe := func(client *net.UDPConn, sni string) []byte {
-		t.Helper()
-		ephPriv := make([]byte, 32)
-		rand.Read(ephPriv)
-		pkt := testInitialPacket(t, testClientHelloSNI(t, ephPriv, serverPub, sni))
-		if _, err := client.WriteToUDP(pkt, serverConn.LocalAddr().(*net.UDPAddr)); err != nil {
-			t.Fatal(err)
-		}
-		return pkt
-	}
-
-	// Routed SNI is relayed.
-	client1 := mkClient()
-	pkt1 := sendProbe(client1, "google.com")
-	if got := expectRelay(t, googleConn); !bytes.Equal(got, pkt1) {
-		t.Fatalf("routed packet corrupted: got %d bytes, want %d", len(got), len(pkt1))
-	}
-
-	// Unrouted SNI with no fallbackDest is silently dropped (no packet leaves).
-	client2 := mkClient()
-	sendProbe(client2, "www.apple.com")
-	expectNoRelay(t, googleConn)
 }

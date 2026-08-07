@@ -2,12 +2,12 @@ package splithttp
 
 // UDP NAT relay for QUIC flows that the XHTTP/3 REALITY precheck decides to
 // fall back (probe / unauthenticated traffic). Client datagrams are forwarded
-// verbatim to the destination chosen for the flow (exact SNI route match, or
-// the configured fallback dest), and that destination's replies are written
-// back to the client from the server's own listening socket, so the client
-// sees a single, consistent source address. The destination set is fixed when
-// a flow's first packet is classified; every later packet of the same flow
-// uses the same targets.
+// verbatim to the single configured dest (classic REALITY semantics: auth
+// failure is always relayed to dest, never routed by SNI), and the
+// destination's replies are written back to the client from the server's own
+// listening socket, so the client sees a single, consistent source address.
+// The destination set is fixed when a flow's first packet is classified;
+// every later packet of the same flow uses the same targets.
 //
 // Each configured destination hostname is resolved to all of its A/AAAA
 // addresses at startup (DNS order, deduplicated), and a flow fails over to the
@@ -17,8 +17,8 @@ package splithttp
 // longer black-holes the whole destination.
 
 import (
-	"net"
 	stderrors "errors"
+	"net"
 	"sync"
 	"syscall"
 	"time"
@@ -41,7 +41,7 @@ const (
 
 // relayEntry is one client -> dest flow.
 type relayEntry struct {
-	clientAddr    net.Addr
+	clientAddr     net.Addr
 	destCandidates []*net.UDPAddr
 	destIdx        int
 	destConn       *net.UDPConn
@@ -53,12 +53,10 @@ type relayEntry struct {
 // so the destination sees one connection per relayed client.
 type realityRelay struct {
 	serverConn net.PacketConn
-	// fallback is the default destination set for flows whose SNI has no
-	// route entry; nil means no fallback (such flows are dropped).
-	fallback []*net.UDPAddr
-	// routes maps a ClientHello SNI (exact match) to its relay destination
-	// set (all resolved addresses of the configured hostname).
-	routes  map[string][]*net.UDPAddr
+	// dest is the single destination set every relayed (probe /
+	// unauthenticated) flow is forwarded to; nil means such flows are
+	// dropped (no dest configured).
+	dest    []*net.UDPAddr
 	timeout time.Duration
 
 	mu      sync.Mutex
@@ -70,20 +68,18 @@ type realityRelay struct {
 }
 
 // newRealityRelay builds a UDP relay that forwards client datagrams to the
-// destination chosen for each flow and writes the destination's replies back
-// through serverConn (the server's own listening socket, so replies keep the
-// same source address the client dialed). fallbackDest may be empty (flows
-// without a route are then dropped); an invalid fallbackDest is an error.
-// Invalid route entries are skipped with a warning (they fall back to
-// fallbackDest). timeout is the idle lifetime of an entry; <= 0 defaults to
-// 120s.
-func newRealityRelay(serverConn net.PacketConn, fallbackDest string, routes map[string]string, timeout time.Duration) (*realityRelay, error) {
-	var fallback []*net.UDPAddr
-	if fallbackDest != "" {
+// single dest and writes the destination's replies back through serverConn
+// (the server's own listening socket, so replies keep the same source
+// address the client dialed). dest may be empty (relayed flows are then
+// dropped); an invalid dest is an error. timeout is the idle lifetime of an
+// entry; <= 0 defaults to 120s.
+func newRealityRelay(serverConn net.PacketConn, dest string, timeout time.Duration) (*realityRelay, error) {
+	var destAddrs []*net.UDPAddr
+	if dest != "" {
 		var err error
-		fallback, err = resolveRelayDest(fallbackDest)
+		destAddrs, err = resolveRelayDest(dest)
 		if err != nil {
-			return nil, errors.New("REALITY: invalid fallbackDest ", fallbackDest, ": ", err)
+			return nil, errors.New("REALITY: invalid dest ", dest, ": ", err)
 		}
 	}
 	if timeout <= 0 {
@@ -91,20 +87,11 @@ func newRealityRelay(serverConn net.PacketConn, fallbackDest string, routes map[
 	}
 	r := &realityRelay{
 		serverConn: serverConn,
-		fallback:   fallback,
-		routes:     make(map[string][]*net.UDPAddr, len(routes)),
+		dest:       destAddrs,
 		timeout:    timeout,
 		entries:    make(map[string]*relayEntry),
 		perIP:      make(map[string]int),
 		closed:     make(chan struct{}),
-	}
-	for sni, dest := range routes {
-		addrs, err := resolveRelayDest(dest)
-		if err != nil {
-			errors.LogErrorInner(nil, err, "REALITY: invalid fallbackDestRoutes entry ", sni, " -> ", dest, ", skipped")
-			continue
-		}
-		r.routes[sni] = addrs
 	}
 	go r.reapLoop()
 	return r, nil
@@ -141,17 +128,6 @@ func resolveRelayDest(hostport string) ([]*net.UDPAddr, error) {
 		return nil, errors.New("REALITY: no usable address for ", hostport)
 	}
 	return dests, nil
-}
-
-// targetForSNI picks the relay destination set for a probe flow: the exact
-// SNI route match, else the fallback dest, else nil (flow dropped).
-func (r *realityRelay) targetForSNI(sni string) []*net.UDPAddr {
-	if sni != "" {
-		if dests, ok := r.routes[sni]; ok {
-			return dests
-		}
-	}
-	return r.fallback
 }
 
 // relayClientToDest forwards one client datagram (unmodified) to dest,
@@ -211,7 +187,7 @@ func (r *realityRelay) writeToDest(entry *relayEntry, data []byte) {
 	}
 }
 
-// destToClient reads replies from the fallback dest socket for one client and
+// destToClient reads replies from the dest socket for one client and
 // writes them back through the server's listening socket. It exits when the
 // entry is reaped or the relay is closed (the socket close unblocks Read). A
 // read-side ICMP port-unreachable ("connection refused") also closes the
