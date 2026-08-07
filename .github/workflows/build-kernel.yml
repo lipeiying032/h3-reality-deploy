@@ -96,7 +96,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -H "Content-Type: application/octet-stream" \
-            "repos/${{ github.repository }}/releases/${{ steps.release.outputs.release_id }}/assets?name=xray-h3-server-linux-amd64-new" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.release.outputs.release_id }}/assets?name=xray-h3-server-linux-amd64-new" \
             --input core/xray-h3-server-linux-amd64 --jq '{id, name, size}' > /tmp/new-asset.json
           cat /tmp/new-asset.json
           echo "new_asset_id=$(jq -r .id /tmp/new-asset.json)" >> "$GITHUB_OUTPUT"
