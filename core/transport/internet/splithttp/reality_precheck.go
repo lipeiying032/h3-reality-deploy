@@ -11,10 +11,27 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"golang.org/x/crypto/hkdf"
 )
+
+// errNotQUICInitial is wrapped into parseQUICInitial errors when the datagram
+// is definitely not a QUIC v1 Initial packet: a 1-RTT short header, a
+// non-Initial long-header type (0-RTT/Handshake/Retry), an unsupported
+// version, or garbage that cannot be parsed into a complete Initial header.
+// Such datagrams must be dropped silently, never relayed. Errors WITHOUT this
+// marker mean the datagram IS a QUIC Initial whose decryption failed, and
+// those keep the relay (real-site) semantics.
+var errNotQUICInitial = errors.New("not a QUIC Initial packet")
+
+// isNotQUICInitial reports whether a parseQUICInitial error means the
+// datagram is not a QUIC Initial at all (as opposed to an Initial whose
+// decryption failed).
+func isNotQUICInitial(err error) bool {
+	return errors.Is(err, errNotQUICInitial)
+}
 
 // quicInitialSalt is the RFC 9001 Section 5.2 Initial salt for QUIC v1.
 var quicInitialSalt = []byte{
@@ -108,37 +125,37 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	var p initialPkt
 
 	if len(data) < 6 {
-		return nil, fmt.Errorf("packet too short")
+		return nil, fmt.Errorf("%w: packet too short", errNotQUICInitial)
 	}
 
 	// Check long header and Initial type (0xC0 with 1-byte PN)
 	firstByte := data[0]
 	if firstByte&0x80 == 0 {
-		return nil, fmt.Errorf("not a long header")
+		return nil, fmt.Errorf("%w: not a long header", errNotQUICInitial)
 	}
 	pktType := (firstByte >> 4) & 0x03
 	if pktType != 0 {
-		return nil, fmt.Errorf("not an Initial packet (type=%d)", pktType)
+		return nil, fmt.Errorf("%w: not an Initial packet (type=%d)", errNotQUICInitial, pktType)
 	}
 
 	// Version (4 bytes) — only handle QUIC v1
 	if len(data) < 5 {
-		return nil, fmt.Errorf("packet too short for version")
+		return nil, fmt.Errorf("%w: packet too short for version", errNotQUICInitial)
 	}
 	if v := binary.BigEndian.Uint32(data[1:5]); v != 1 {
-		return nil, fmt.Errorf("not QUIC v1 (version=%d)", v)
+		return nil, fmt.Errorf("%w: not QUIC v1 (version=%d)", errNotQUICInitial, v)
 	}
 
 	offset := 5
 
 	// DCID Length and DCID
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at DCID length")
+		return nil, fmt.Errorf("%w: truncated at DCID length", errNotQUICInitial)
 	}
 	dcidLen := int(data[offset])
 	offset++
 	if offset+dcidLen > len(data) {
-		return nil, fmt.Errorf("truncated at DCID")
+		return nil, fmt.Errorf("%w: truncated at DCID", errNotQUICInitial)
 	}
 	p.DCID = make([]byte, dcidLen)
 	copy(p.DCID, data[offset:offset+dcidLen])
@@ -146,12 +163,12 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 
 	// SCID Length and SCID
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at SCID length")
+		return nil, fmt.Errorf("%w: truncated at SCID length", errNotQUICInitial)
 	}
 	scidLen := int(data[offset])
 	offset++
 	if offset+scidLen > len(data) {
-		return nil, fmt.Errorf("truncated at SCID")
+		return nil, fmt.Errorf("%w: truncated at SCID", errNotQUICInitial)
 	}
 	p.SCID = make([]byte, scidLen)
 	copy(p.SCID, data[offset:offset+scidLen])
@@ -159,18 +176,18 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 
 	// Token Length (varint) and Token
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at token length")
+		return nil, fmt.Errorf("%w: truncated at token length", errNotQUICInitial)
 	}
 	tokenLen, varintBytes := readVarint(data[offset:])
 	offset += varintBytes
 	if offset+int(tokenLen) > len(data) {
-		return nil, fmt.Errorf("truncated at token")
+		return nil, fmt.Errorf("%w: truncated at token", errNotQUICInitial)
 	}
 	offset += int(tokenLen)
 
 	// Length (varint) of remaining packet
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at length")
+		return nil, fmt.Errorf("%w: truncated at length", errNotQUICInitial)
 	}
 	_, varintBytes = readVarint(data[offset:])
 	offset += varintBytes

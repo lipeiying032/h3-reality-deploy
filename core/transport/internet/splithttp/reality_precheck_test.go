@@ -256,6 +256,62 @@ func TestParseQUICInitialRoundTrip(t *testing.T) {
 	}
 }
 
+// TestParseQUICInitialClassification verifies that parseQUICInitial
+// distinguishes datagrams that are definitely not a QUIC Initial (must be
+// dropped silently) from Initials whose decryption failed (must keep the
+// relay semantics).
+func TestParseQUICInitialClassification(t *testing.T) {
+	// 1-RTT short header (no long-header bit) -> not Initial.
+	shortHeader := []byte{0x40, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x00}
+	if _, err := parseQUICInitial(shortHeader); !isNotQUICInitial(err) {
+		t.Fatalf("short header: err=%v, want not-Initial", err)
+	}
+
+	// Non-Initial long-header types: 0-RTT (0xd0), Handshake (0xe0), Retry
+	// (0xf0).
+	for name, firstByte := range map[string]byte{"0-RTT": 0xd0, "Handshake": 0xe0, "Retry": 0xf0} {
+		pkt := []byte{firstByte, 0x00, 0x00, 0x00, 0x01, 0x08, 0x11, 0x22, 0x33, 0x44}
+		if _, err := parseQUICInitial(pkt); !isNotQUICInitial(err) {
+			t.Fatalf("%s long header: err=%v, want not-Initial", name, err)
+		}
+	}
+
+	// Initial-type long header with an unsupported version (version
+	// negotiation 0 and QUIC v2) -> not Initial.
+	for name, ver := range map[string]uint32{"version negotiation": 0, "QUIC v2": 2} {
+		pkt := []byte{0xc0, byte(ver >> 24), byte(ver >> 16), byte(ver >> 8), byte(ver), 0x08, 0x11, 0x22, 0x33, 0x44}
+		if _, err := parseQUICInitial(pkt); !isNotQUICInitial(err) {
+			t.Fatalf("%s: err=%v, want not-Initial", name, err)
+		}
+	}
+
+	// Unparseable garbage -> not Initial.
+	if _, err := parseQUICInitial([]byte{0x28, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05}); !isNotQUICInitial(err) {
+		t.Fatalf("garbage: err=%v, want not-Initial", err)
+	}
+
+	// Truncated Initial header (DCID cut short) -> not Initial.
+	trunc := testInitialPacket(t, []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc})[:8]
+	if _, err := parseQUICInitial(trunc); !isNotQUICInitial(err) {
+		t.Fatalf("truncated header: err=%v, want not-Initial", err)
+	}
+
+	// A structurally complete QUIC v1 Initial header with no decryptable
+	// payload is still an Initial (decryption could not proceed) -> relay.
+	noPayload := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x04, 0x99, 0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x00}
+	if _, err := parseQUICInitial(noPayload); isNotQUICInitial(err) {
+		t.Fatalf("header-only Initial: err=%v, want Initial (relay)", err)
+	}
+
+	// Valid Initial with a corrupted auth tag -> decryption failure, still an
+	// Initial -> relay.
+	corrupt := testInitialPacket(t, []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc})
+	corrupt[len(corrupt)-1] ^= 0xff
+	if _, err := parseQUICInitial(corrupt); isNotQUICInitial(err) {
+		t.Fatalf("corrupted Initial: err=%v, want Initial (relay)", err)
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},
@@ -494,6 +550,98 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 	}
 	if !w.IsAuthenticated(randAddr) {
 		t.Fatal("random-auth client not marked AUTH")
+	}
+}
+
+// TestPrecheckNonInitialDrop verifies that datagrams which are not a QUIC
+// Initial at all are dropped silently: no relay to dest, no AUTH, no outbound
+// traffic. The client flow stays PENDING so a later real Initial from the
+// same address still goes through the normal decision, and an Initial whose
+// decryption failed still relays (probe semantics).
+func TestPrecheckNonInitialDrop(t *testing.T) {
+	serverPriv := make([]byte, 32)
+	serverPub, _ := curve25519.X25519(serverPriv, curve25519.Basepoint)
+	var shortID [8]byte
+	copy(shortID[:], []byte{0xde, 0x08, 0x5a, 0xa9, 0, 0, 0, 0})
+
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destConn.Close()
+
+	params := &tls.RealityQUICParams{
+		PrivateKey:      serverPriv,
+		ShortIds:        map[[8]byte]bool{shortID: true},
+		ServerNames:     map[string]bool{"www.apple.com": true},
+		Dest:            destConn.LocalAddr().String(),
+		FallbackTimeout: 5 * time.Second,
+	}
+	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrapped.Close()
+	w := wrapped.(*realityPrecheckPacketConn)
+
+	mkClient := func() (*net.UDPConn, net.Addr) {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c, c.LocalAddr()
+	}
+	send := func(client *net.UDPConn, pkt []byte) {
+		t.Helper()
+		if _, err := client.WriteToUDP(pkt, serverConn.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. 1-RTT short header -> dropped: no relay, no AUTH.
+	client, clientAddr := mkClient()
+	shortHeader := []byte{0x40, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x00, 0x01, 0x02, 0x03, 0x04}
+	send(client, shortHeader)
+	expectNoRelay(t, destConn)
+	if w.IsAuthenticated(clientAddr) {
+		t.Fatal("short-header client marked authenticated")
+	}
+
+	// 2. Handshake long header -> dropped.
+	handshake := []byte{0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x04, 0x99, 0xaa, 0xbb, 0xcc}
+	send(client, handshake)
+	expectNoRelay(t, destConn)
+
+	// 3. Same client, real probe Initial -> still relayed (the drops above
+	// kept the flow PENDING; a genuine Initial keeps its first-packet
+	// decision).
+	ephPriv := make([]byte, 32)
+	rand.Read(ephPriv)
+	probePkt := testInitialPacket(t, testClientHello(t, ephPriv, serverPub, nil))
+	send(client, probePkt)
+	if got := expectRelay(t, destConn); !bytes.Equal(got, probePkt) {
+		t.Fatalf("relayed Initial corrupted: got %d bytes, want %d", len(got), len(probePkt))
+	}
+
+	// 4. Fresh client, Initial with corrupted auth tag (decryption failure)
+	// -> still relayed (probe semantics).
+	badClient, _ := mkClient()
+	ephPriv2 := make([]byte, 32)
+	rand.Read(ephPriv2)
+	badPkt := testInitialPacket(t, testClientHello(t, ephPriv2, serverPub, nil))
+	badPkt[len(badPkt)-1] ^= 0xff
+	send(badClient, badPkt)
+	if got := expectRelay(t, destConn); !bytes.Equal(got, badPkt) {
+		t.Fatalf("relayed corrupted Initial corrupted: got %d bytes, want %d", len(got), len(badPkt))
+	}
+	if w.IsAuthenticated(badClient.LocalAddr()) {
+		t.Fatal("corrupted-Initial client marked authenticated")
 	}
 }
 

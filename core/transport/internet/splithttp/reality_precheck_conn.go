@@ -8,13 +8,18 @@ package splithttp
 //     are buffered until the decision is made so no packet is lost.
 //   - AUTH:    verification passed — all (buffered + subsequent) packets are
 //     handed to quic-go through an internal FIFO queue.
-//   - RELAY:   verification failed or the flow is not parseable QUIC — the
-//     flow is treated as a probe and every packet is relayed verbatim to the
-//     single configured dest (classic REALITY semantics: auth failure is
+//   - RELAY:   verification failed or decryption failed for a QUIC Initial —
+//     the flow is treated as a probe and every packet is relayed verbatim to
+//     the single configured dest (classic REALITY semantics: auth failure is
 //     always forwarded to dest, never routed by SNI; serverNames only gates
 //     auth). Without a configured dest such flows are dropped. The target is
 //     fixed at the first packet's decision; the destination completes the
 //     handshake and the real site rejects a mismatched SNI by itself.
+//
+// Datagrams that are not a QUIC Initial at all — 1-RTT short headers,
+// Handshake/0-RTT/Retry long headers, unsupported versions or unparseable
+// garbage — are dropped silently: no reply, no relay, no outbound traffic,
+// matching the native behaviour of quic-go for unknown connections.
 //
 // The wrapper runs its own read loop on the underlying conn; quic-go's
 // ReadFrom is served from the AUTH queue so it is never blocked by precheck
@@ -249,6 +254,17 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 	copy(work, data)
 	pkt, err := parseQUICInitial(work)
 	if err != nil {
+		if isNotQUICInitial(err) {
+			// Not a QUIC Initial at all (1-RTT short header, Handshake /
+			// 0-RTT / Retry long header, or unparseable garbage): drop the
+			// datagram silently — no reply, no relay, no outbound traffic.
+			// The client stays PENDING so a later real Initial from the same
+			// address still goes through the normal decision.
+			errors.LogInfo(c.ctx, "REALITY: QUIC precheck DROP for ", addr.String(), " (not Initial: ", err, ")")
+			return
+		}
+		// The datagram IS a QUIC Initial but decryption failed: that is an
+		// active probe, so it keeps the relay (real-site) semantics.
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (unparseable: ", err, ")")
 		c.relayDecision(st, data, addr)
 		return
