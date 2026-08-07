@@ -279,12 +279,14 @@ curl_supports_http3_only() {
 # 判断指定 curl 二进制是否支持 --http3-only（curl >= 8.2，严格只走 H3，禁止降级）。
 # 不依赖 --help 文本（curl 8.20+ 移除 --help-all，且无 H3 的构建也会列出该选项），
 # 而是真实调用一次：选项被接受（出现网络层错误/成功）即支持；
-# 选项不存在或构建不支持则报 "is unknown"/"doesn't support this"，判定不支持
+# 选项不存在或构建不支持则报 "is unknown"/"doesn't support this"，判定不支持；
+# 启动即崩溃的旧 glibc 静态版（Fatal glibc error，ld.so 与 libc 不匹配）同样判定不支持，
+# 触发 ensure_curl_h3 重新下载 musl 版覆盖，避免复用损坏二进制误判 SNI
 curl_bin_supports_http3_only() {
   local bin="$1" out="" rc=0
   out=$("$bin" --http3-only -sS -o /dev/null --connect-timeout 1 --max-time 2 "https://127.0.0.1/" 2>&1) || rc=$?
   case "$out" in
-    *"doesn't support this"*|*"is unknown"*)
+    *"doesn't support this"*|*"is unknown"*|*"Fatal glibc error:"*)
       return 1
       ;;
   esac
@@ -295,7 +297,11 @@ curl_bin_supports_http3_only() {
 # 的 Linux curl，校验通过后安装为系统级独立二进制 $CURL_H3_BIN（默认
 # /usr/local/bin/curl-http3，chmod 755，绝不覆盖 apt 管理的 /usr/bin/curl）：
 #   ① 查询官方 API（/releases/latest）拿最新 tag 与资产名
-#      curl-linux-<arch>-glibc-<tag>.tar.xz（x86_64/aarch64，glibc 静态构建）
+#      curl-linux-<arch>-musl-<tag>.tar.xz（x86_64/aarch64，musl 静态构建）
+#      用 musl 而非 glibc：stunnel/static-curl 的 glibc 静态版仍依赖外部 ld.so，
+#      与系统 libc 不匹配时启动即 Fatal glibc error（dl-call-libc-early-init
+#      断言失败）崩溃，SNI 校验会误判（如 tv.apple.com 被误报不支持 H3）；
+#      musl 静态版完全自包含，无 ld.so/libc 匹配问题
 #   ② 官方 sha256 取该资产在 API 中的 digest 字段（GitHub 对每个资产维护的
 #      官方校验值），下载后先比对压缩包 sha256
 #   ③ 解压后再校验包内官方 SHA256SUMS（curl 二进制），双重校验
@@ -303,7 +309,7 @@ curl_bin_supports_http3_only() {
 # 成功返回 0；任一环节失败 yellow/red 提示并返回 1（不静默使用损坏文件，
 # 由调用方回退内置探针）
 install_curl_h3() {
-  local arch="" libc="glibc" api_url="https://api.github.com/repos/stunnel/static-curl/releases/latest"
+  local arch="" libc="musl" api_url="https://api.github.com/repos/stunnel/static-curl/releases/latest"
   local api_json="" tag="" asset="" expected="" actual="" url="" tmpdir=""
   case "$(uname -m)" in
     x86_64|amd64) arch="x86_64" ;;
@@ -321,7 +327,7 @@ install_curl_h3() {
     yellow "警告: 未找到 sha256sum，无法校验 H3 版 curl（SNI 校验将回退内置探针）"
     return 1
   fi
-  yellow "系统 curl 无 HTTP/3 支持，尝试下载静态编译的 H3 版 curl（stunnel/static-curl）..."
+  yellow "系统 curl 无 HTTP/3 支持，尝试下载 musl 静态编译的 H3 版 curl（stunnel/static-curl）..."
   # ① 官方 API：最新版本号 + 目标资产名 + 官方 sha256（资产 digest）
   api_json=$(curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null) || api_json=""
   tag=$(printf '%s' "$api_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1) || tag=""
@@ -390,7 +396,7 @@ install_curl_h3() {
   fi
   rm -rf "$tmpdir"
   CURL_H3="$CURL_H3_BIN"
-  green "已安装 H3 版 curl（静态编译，HTTP/3 支持）: $CURL_H3_BIN"
+  green "已安装 H3 版 curl（musl 静态编译，HTTP/3 支持）: $CURL_H3_BIN"
   yellow "  版本: $("$CURL_H3_BIN" --version 2>/dev/null | head -n1 || true)"
   return 0
 }

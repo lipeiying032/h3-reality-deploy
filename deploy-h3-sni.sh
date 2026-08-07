@@ -6,7 +6,7 @@
 #   1. 交互输入 SNI（直接回车：从 SNI 维护库随机挑选，q/quit 退出）
 #   2. 校验域名格式 + DNS 解析 + H3 探测（validate_sni_h3，与 h3reality 共用）
 #   3. 探针自给自足（二进制 → 源码编译 → Release 下载，ensure_probe）
-#   3.5 H3 版 curl 自给自足（系统 curl 无 H3 时自动下载静态二进制并安装为
+#   3.5 H3 版 curl 自给自足（系统 curl 无 H3 时自动下载 musl 静态二进制并安装为
 #       /usr/local/bin/curl-http3，不覆盖系统 curl、不用 docker；失败回退内置探针）
 #   4. xray-h3 fork 内核自动获取（Release 下载 → core/ 源码编译兜底，detect_xray；
 #      官方 xray 仅视为干扰项，忽略并自动获取 fork 内核，不询问、不降级）
@@ -30,8 +30,9 @@
 #    fetch/random_sni   [lib]            confirm_mode      update_sni_routes [lib]
 #    [lib]              probe_h3 [lib]   download/build    backup_config [lib]
 #                                        [lib]
-#    注: SNI 校验用 curl 时，系统 curl 无 H3 会自动下载安装 /usr/local/bin/curl-http3
-#        （ensure_curl_h3 [lib]），失败回退内置探针，不阻断部署
+#    注: SNI 校验用 curl 时，系统 curl 无 H3 会自动下载安装 musl 静态版
+#        /usr/local/bin/curl-http3（ensure_curl_h3 [lib]；musl 静态版避免 glibc
+#        ld.so/libc 不匹配启动崩溃），失败回退内置探针，不阻断部署
 #   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
 #   │ ⑤ 服务部署    │──►│ ⑥ 部署验证    │──►│ ⑦ 链接输出    │
 #   └─────────────┘   └─────────────┘   └─────────────┘
@@ -647,8 +648,9 @@ else
   confirm_kernel_mode
 fi
 
-# 1.5 H3 版 curl 自给自足（系统 curl 无 H3 → 自动下载安装 /usr/local/bin/curl-http3；
-#      下载失败不阻断部署，yellow 提示后 SNI 校验自动回退内置探针）
+# 1.5 H3 版 curl 自给自足（系统 curl 无 H3 → 自动下载安装 musl 静态版
+#      /usr/local/bin/curl-http3；下载失败不阻断部署，yellow 提示后
+#      SNI 校验自动回退内置探针）
 ensure_curl_h3 || true
 
 # 2. 配置路径 + 端口冲突
