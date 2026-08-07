@@ -270,28 +270,17 @@ QUIC 的 `CRYPTO_ERROR` 码 = `0x100 + TLS alert`（RFC 9000 §20.1 / RFC 8446�
 
 ### 8.0 从 GitHub 快速部署（全新 VPS）
 
-脚本已做成**自包含引导版**：探针、配置、systemd 服务全部自动搞定，使用者只需：
+一键部署/管理脚本已拆分到独立仓库
+[h3-reality-deploy-scripts](https://github.com/lipeiying032/h3-reality-deploy-scripts)
+（本仓库只保留内核源码 `core/`、客户端 `client-tui/` 与原理文档）。全新 VPS 部署：
 
 ```bash
-# 全新 VPS 一键部署（目录已存在会重新下载并覆盖，等价于更新到最新版）
-rm -rf h3-reality-deploy
-mkdir -p h3-reality-deploy
-curl -fsSL -o h3-reality-deploy.tar.gz https://codeload.github.com/lipeiying032/h3-reality-deploy/tar.gz/refs/heads/main || {
-  rm -f h3-reality-deploy.tar.gz
-  echo "错误：仓库下载失败，请检查："
-  echo "  1. GitHub 网络是否可达（可验证：curl -fsSI https://github.com）"
-  echo "  2. 是否被防火墙或代理拦截"
-  exit 1
-}
-tar -xzf h3-reality-deploy.tar.gz --strip-components=1 -C h3-reality-deploy || {
-  rm -f h3-reality-deploy.tar.gz
-  echo "错误：解压失败，请检查磁盘空间或网络下载是否完整"
-  exit 1
-}
-rm -f h3-reality-deploy.tar.gz
-cd h3-reality-deploy
+git clone https://github.com/lipeiying032/h3-reality-deploy-scripts.git
+cd h3-reality-deploy-scripts
 sudo bash deploy-h3-sni.sh
 ```
+
+脚本已做成**自包含引导版**：探针、配置、systemd 服务全部自动搞定。
 
 全新 VPS 上脚本自动完成（详细说明见 12.2）：
 
@@ -598,8 +587,14 @@ WantedBy=multi-user.target
 
 ### 12.2 部署脚本（deploy-h3-sni.sh）与探针
 
+> 部署脚本已迁移到独立仓库
+> [h3-reality-deploy-scripts](https://github.com/lipeiying032/h3-reality-deploy-scripts)，
+> 以下行为摘要对应其中的 `deploy-h3-sni.sh` / `h3reality` / `h3-lib.sh` / `probe-h3-sni`。
+
 ```bash
 # 部署（root 直跑；非 root 自动 sudo 重执行）
+git clone https://github.com/lipeiying032/h3-reality-deploy-scripts.git
+cd h3-reality-deploy-scripts
 sudo bash deploy-h3-sni.sh
 # 交互输入 SNI（默认 ea.com），流程：
 #   格式校验 → DNS 解析 → 探针测 H3 → 支持则改 H3 inbound + 备份 + run -test + 重启 + 验证
