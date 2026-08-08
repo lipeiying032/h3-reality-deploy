@@ -697,7 +697,7 @@ func (km *kernelManager) scanLines(r io.Reader, logFile *os.File) {
 			km.logTail = km.logTail[len(km.logTail)-40:]
 		}
 		km.mu.Unlock()
-		fmt.Printf("  [内核] %s\n", line)
+		fmt.Printf(" [Core] %s\n", line)
 		if logFile != nil {
 			fmt.Fprintln(logFile, line)
 		}
