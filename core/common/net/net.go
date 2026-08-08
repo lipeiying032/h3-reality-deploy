@@ -9,8 +9,8 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-// defines the maximum time an idle TCP session can survive in the tunnel, so
-// it should be consistent across HTTP versions and with other transports.
+// ConnIdleTimeout controls how long generic HTTP clients retain an unused
+// pooled connection. Transport-specific clients may use a narrower default.
 const ConnIdleTimeout = 300 * time.Second
 
 // consistent with quic-go

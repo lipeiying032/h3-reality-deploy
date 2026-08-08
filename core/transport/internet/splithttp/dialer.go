@@ -37,6 +37,12 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// splitHTTPClientIdleTimeout is the default QUIC MaxIdleTimeout for HTTP/3
+// and the unused connection-pool retention time for HTTP/2. HTTP/1 disables
+// keepalives below, so its IdleConnTimeout does not provide dead-connection
+// detection or create a reusable idle pool.
+const splitHTTPClientIdleTimeout = 45 * time.Second
+
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
@@ -184,7 +190,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
 		}
 		if quicParams.MaxIdleTimeout == 0 {
-			quicConfig.MaxIdleTimeout = net.ConnIdleTimeout
+			quicConfig.MaxIdleTimeout = splitHTTPClientIdleTimeout
 		}
 		if quicParams.KeepAlivePeriod == 0 {
 			if keepAlivePeriod == 0 {
@@ -351,7 +357,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 				return dialContext(ctxInner)
 			},
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: splitHTTPClientIdleTimeout,
 			ReadIdleTimeout: keepAlivePeriod,
 		}
 	} else {
@@ -362,7 +368,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		transport = &http.Transport{
 			DialTLSContext:  httpDialContext,
 			DialContext:     httpDialContext,
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: splitHTTPClientIdleTimeout,
 			// chunked transfer download with KeepAlives is buggy with
 			// http.Client and our custom dial context.
 			DisableKeepAlives: true,
