@@ -143,15 +143,11 @@ func TestMakeUtlsClientHelloFingerprint(t *testing.T) {
 	if len(hello.sessionId) != 0 {
 		t.Errorf("session_id length = %d, want 0", len(hello.sessionId))
 	}
-	// GREASE values are randomized per connection; only their shape is
-	// fixed (RFC 8701). The suite/version lists must be GREASE + TLS 1.3.
-	if len(hello.cipherSuites) != 4 || !isGREASEUint16(hello.cipherSuites[0]) ||
-		!slices.Equal(hello.cipherSuites[1:], []uint16{0x1301, 0x1302, 0x1303}) {
-		t.Errorf("cipher_suites = %x, want [GREASE 1301 1302 1303]", hello.cipherSuites)
+	if !slices.Equal(hello.cipherSuites, []uint16{0x1301, 0x1302, 0x1303}) {
+		t.Errorf("cipher_suites = %x, want [1301 1302 1303]", hello.cipherSuites)
 	}
-	if len(hello.supportedVersions) != 2 || !isGREASEUint16(hello.supportedVersions[0]) ||
-		hello.supportedVersions[1] != 0x0304 {
-		t.Errorf("supported_versions = %x, want [GREASE 0304]", hello.supportedVersions)
+	if !slices.Equal(hello.supportedVersions, []uint16{0x0304}) {
+		t.Errorf("supported_versions = %x, want [0304]", hello.supportedVersions)
 	}
 	if !slices.Equal(hello.alpnProtocols, []string{"h3"}) {
 		t.Errorf("ALPN = %v, want [h3]", hello.alpnProtocols)
@@ -195,15 +191,28 @@ func TestMakeUtlsClientHelloFingerprint(t *testing.T) {
 	if tpIdx != ksIdx+1 {
 		t.Errorf("quic_transport_parameters at index %d, want immediately after key_share (%d)", tpIdx, ksIdx)
 	}
-	// groups must contain GREASE + X25519MLKEM768 + X25519 + P-256 + P-384
-	for _, g := range []CurveID{X25519MLKEM768, X25519, CurveP256, CurveP384} {
-		if !slices.Contains(hello.supportedCurves, g) {
-			t.Errorf("supported_groups missing %v", g)
-		}
+	wantGroups := []CurveID{X25519MLKEM768, X25519, CurveP256, CurveP384}
+	if !slices.Equal(hello.supportedCurves, wantGroups) {
+		t.Errorf("supported_groups = %x, want %x", hello.supportedCurves, wantGroups)
 	}
-	// key_share set: GREASE + X25519MLKEM768 + X25519
-	if len(hello.keyShares) != 3 {
-		t.Errorf("key_share count = %d, want 3", len(hello.keyShares))
+	if len(hello.keyShares) != 2 || hello.keyShares[0].group != X25519MLKEM768 ||
+		len(hello.keyShares[0].data) != 1216 || hello.keyShares[1].group != X25519 ||
+		len(hello.keyShares[1].data) != 32 {
+		t.Errorf("key_share = %v, want [X25519MLKEM768(len=1216), X25519(len=32)]", hello.keyShares)
+	}
+	wantSigAlgs := []SignatureScheme{
+		ECDSAWithP256AndSHA256,
+		PSSWithSHA256,
+		PKCS1WithSHA256,
+		ECDSAWithP384AndSHA384,
+		PSSWithSHA384,
+		PKCS1WithSHA384,
+		PSSWithSHA512,
+		PKCS1WithSHA512,
+		PKCS1WithSHA1,
+	}
+	if !slices.Equal(hello.supportedSignatureAlgorithms, wantSigAlgs) {
+		t.Errorf("signature_algorithms = %x, want %x", hello.supportedSignatureAlgorithms, wantSigAlgs)
 	}
 	// the REALITY payload must seal into the random field and be verifiable
 	// server-side with the raw bytes as AD.
