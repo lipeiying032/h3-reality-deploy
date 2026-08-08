@@ -256,6 +256,140 @@ func TestParseQUICInitialRoundTrip(t *testing.T) {
 	}
 }
 
+// TestParseQUICInitialSafety uses a fixed expectation table derived from the
+// QUIC v1 long-header layout in RFC 9000 Section 17.2. It intentionally does
+// not call readVarint or mirror parseQUICInitial in an oracle helper.
+func TestParseQUICInitialSafety(t *testing.T) {
+	headerThroughSCID := []byte{
+		0xc0, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+		0x04, 0x99, 0xaa, 0xbb, 0xcc,
+	}
+
+	var cases []struct {
+		name string
+		data []byte
+	}
+	addNotInitial := func(name string, data []byte) {
+		t.Helper()
+		cases = append(cases, struct {
+			name string
+			data []byte
+		}{name: name, data: data})
+	}
+
+	// Each QUIC varint width is determined solely by its first two bits.
+	// Supply every incomplete byte count for the 2-, 4-, and 8-byte forms at
+	// both Token Length and Length positions.
+	truncatedVarints := []struct {
+		name string
+		data []byte
+	}{
+		{"2-byte/1", []byte{0x40}},
+		{"4-byte/1", []byte{0x80}},
+		{"4-byte/2", []byte{0x80, 0x00}},
+		{"4-byte/3", []byte{0x80, 0x00, 0x00}},
+		{"8-byte/1", []byte{0xc0}},
+		{"8-byte/2", []byte{0xc0, 0x00}},
+		{"8-byte/3", []byte{0xc0, 0x00, 0x00}},
+		{"8-byte/4", []byte{0xc0, 0x00, 0x00, 0x00}},
+		{"8-byte/5", []byte{0xc0, 0x00, 0x00, 0x00, 0x00}},
+		{"8-byte/6", []byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00}},
+		{"8-byte/7", []byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+	}
+	for _, tc := range truncatedVarints {
+		addNotInitial("truncated token length "+tc.name, append(bytes.Clone(headerThroughSCID), tc.data...))
+
+		lengthPrefix := append(bytes.Clone(headerThroughSCID), 0x00) // zero-length token
+		addNotInitial("truncated length "+tc.name, append(lengthPrefix, tc.data...))
+	}
+
+	// These 8-byte values are 2^31. They exercise the shapes that overflowed
+	// int on 32-bit targets before the parser compared in uint64 space.
+	hugeVarint := []byte{0xc0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00}
+	addNotInitial("32-bit token length overflow shape", append(bytes.Clone(headerThroughSCID), hugeVarint...))
+	hugeLength := append(bytes.Clone(headerThroughSCID), 0x00)
+	hugeLength = append(hugeLength, hugeVarint...)
+	hugeLength = append(hugeLength, bytes.Repeat([]byte{0x00}, 20)...)
+	addNotInitial("32-bit packet length overflow shape", hugeLength)
+
+	// Length includes the packet number and protected payload. Zero, values
+	// too small to provide the header-protection sample, and declarations
+	// beyond the remaining datagram are structurally malformed.
+	for _, tc := range []struct {
+		name   string
+		length byte
+		tail   int
+	}{
+		{"zero length", 0x00, 0},
+		{"shorter than PN and AEAD tag", 0x10, 16},
+		{"shorter than header-protection sample", 0x13, 19},
+		{"longer than remaining datagram", 0x20, 31},
+	} {
+		pkt := append(bytes.Clone(headerThroughSCID), 0x00, tc.length)
+		pkt = append(pkt, bytes.Repeat([]byte{0x00}, tc.tail)...)
+		addNotInitial(tc.name, pkt)
+	}
+
+	addNotInitial("short header", []byte{0x40, 0x11, 0x22, 0x33, 0x44, 0x55})
+	for name, firstByte := range map[string]byte{
+		"0-RTT":     0xd0,
+		"Handshake": 0xe0,
+		"Retry":     0xf0,
+	} {
+		pkt := append([]byte{firstByte}, headerThroughSCID[1:]...)
+		addNotInitial(name, pkt)
+	}
+	versionNegotiation := bytes.Clone(headerThroughSCID)
+	binary.BigEndian.PutUint32(versionNegotiation[1:5], 0)
+	addNotInitial("version negotiation", versionNegotiation)
+	addNotInitial("garbage", []byte{0x28, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseQUICInitial(bytes.Clone(tc.data))
+			if !isNotQUICInitial(err) {
+				t.Fatalf("parseQUICInitial error = %v, want errNotQUICInitial", err)
+			}
+		})
+	}
+
+	valid := testInitialPacket(t, []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc})
+	if _, err := parseQUICInitial(bytes.Clone(valid)); err != nil {
+		t.Fatalf("valid Initial rejected: %v", err)
+	}
+
+	corruptTag := bytes.Clone(valid)
+	corruptTag[len(corruptTag)-1] ^= 0xff
+	if _, err := parseQUICInitial(corruptTag); err == nil || isNotQUICInitial(err) {
+		t.Fatalf("complete Initial with bad tag error = %v, want non-classifying decryption error", err)
+	}
+}
+
+func TestParseQUICInitialCoalescedDatagram(t *testing.T) {
+	hello := []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc}
+	initial := testInitialPacket(t, hello)
+	// A syntactically recognizable Handshake packet follows the Initial. The
+	// Initial Length must prevent these bytes from entering AEAD decryption.
+	handshake := []byte{0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x10, 0x11, 0x12, 0x13}
+	datagram := append(bytes.Clone(initial), handshake...)
+
+	parsed, err := parseQUICInitial(datagram)
+	if err != nil {
+		t.Fatalf("parse coalesced Initial: %v", err)
+	}
+	var got []byte
+	for _, frag := range parseCryptoFrames(parsed.Payload) {
+		got = mergeCryptoFrag(got, frag)
+	}
+	if !bytes.Equal(got, hello) {
+		t.Fatalf("coalesced ClientHello = %x, want %x", got, hello)
+	}
+	if !bytes.Equal(datagram[len(initial):], handshake) {
+		t.Fatalf("parser mutated coalesced packet suffix: got %x, want %x", datagram[len(initial):], handshake)
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},
