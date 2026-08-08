@@ -39,6 +39,9 @@ type payload struct {
 	frames       []ackhandler.Frame
 	ack          *wire.AckFrame
 	length       protocol.ByteCount
+
+	preserveFrameOrder bool
+	interleavePadding  bool
 }
 
 type longHeaderPacket struct {
@@ -533,9 +536,12 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	}
 	handler := p.retransmissionQueue.AckHandler(encLevel)
 	hasRetransmission := p.retransmissionQueue.HasData(encLevel)
+	chromeInitial := encLevel == protocol.EncryptionInitial && p.initialStream.chrome
 
 	ack := p.acks.GetAckFrame(encLevel, now, !hasRetransmission && !hasCryptoData())
 	var pl payload
+	pl.preserveFrameOrder = chromeInitial
+	pl.interleavePadding = chromeInitial
 	if !hasCryptoData() && !hasRetransmission && ack == nil {
 		if !addPingIfEmpty {
 			// nothing to send
@@ -572,13 +578,23 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		return hdr, pl
 	} else {
 		for hasCryptoData() {
-			cf := popCryptoFrame(maxPacketSize)
+			frameBudget := maxPacketSize
+			if chromeInitial && frameBudget > 0 {
+				frameBudget-- // reserve one byte for PING
+			}
+			cf := popCryptoFrame(frameBudget)
 			if cf == nil {
 				break
 			}
 			pl.frames = append(pl.frames, ackhandler.Frame{Frame: cf, Handler: handler})
 			pl.length += cf.Length(v)
 			maxPacketSize -= cf.Length(v)
+			if chromeInitial && maxPacketSize > 0 {
+				ping := &wire.PingFrame{}
+				pl.frames = append(pl.frames, ackhandler.Frame{Frame: ping, Handler: emptyHandler{}})
+				pl.length += ping.Length(v)
+				maxPacketSize -= ping.Length(v)
+			}
 		}
 	}
 	return hdr, pl
@@ -983,20 +999,30 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 			return nil, err
 		}
 	}
-	if paddingLen > 0 {
+	if paddingLen > 0 && !pl.interleavePadding {
 		raw = append(raw, make([]byte, paddingLen)...)
 	}
 	// Randomize the order of the control frames.
 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.
-	if len(pl.frames) > 1 {
+	if len(pl.frames) > 1 && !pl.preserveFrameOrder {
 		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
 	}
-	for _, f := range pl.frames {
+	paddingRemaining := paddingLen
+	for i, f := range pl.frames {
+		if pl.interleavePadding && paddingRemaining > 0 {
+			gapsRemaining := protocol.ByteCount(len(pl.frames) - i + 1)
+			n := (paddingRemaining + gapsRemaining - 1) / gapsRemaining
+			raw = append(raw, make([]byte, n)...)
+			paddingRemaining -= n
+		}
 		var err error
 		raw, err = f.Frame.Append(raw, v)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if pl.interleavePadding && paddingRemaining > 0 {
+		raw = append(raw, make([]byte, paddingRemaining)...)
 	}
 	for _, f := range pl.streamFrames {
 		var err error
