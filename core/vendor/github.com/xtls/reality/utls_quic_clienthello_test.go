@@ -160,20 +160,29 @@ func TestMakeUtlsClientHelloFingerprint(t *testing.T) {
 	if slices.Contains(ids, 0x0023) {
 		t.Error("session_ticket extension present in QUIC ClientHello")
 	}
+	wantIDs := []uint16{
+		0x0000, // server_name
+		0x000a, // supported_groups
+		0x000d, // signature_algorithms
+		0x0010, // ALPN
+		0x001b, // compress_certificate
+		0x002b, // supported_versions
+		0x002d, // psk_key_exchange_modes
+		0x0033, // key_share
+		0x0039, // quic_transport_parameters
+		0x44cd, // application_settings
+		0xfe0d, // GREASE-ECH
+	}
+	gotIDs := append([]uint16(nil), ids...)
+	slices.Sort(gotIDs)
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Errorf("extension IDs = %x, want exact Chrome QUIC set %x", gotIDs, wantIDs)
+	}
 	if !slices.Contains(ids, 0x44cd) {
 		t.Errorf("ALPS/application_settings (0x44cd) extension missing from QUIC ClientHello (ids=%x)", ids)
 	}
 	if !slices.Contains(ids, 0x001b) {
 		t.Error("compress_certificate extension missing")
-	}
-	if !slices.Contains(ids, 0x0005) {
-		t.Error("status_request extension missing")
-	}
-	if !slices.Contains(ids, 0x0012) {
-		t.Error("signed_certificate_timestamp extension missing")
-	}
-	if !slices.Contains(ids, 0x0017) {
-		t.Error("extended_master_secret extension missing")
 	}
 	tpIdx := slices.Index(ids, 0x0039)
 	if tpIdx < 0 {
