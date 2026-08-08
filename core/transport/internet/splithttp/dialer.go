@@ -243,6 +243,14 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			if realityConfig.Fingerprint != "" {
 				if id := tls.GetFingerprint(realityConfig.Fingerprint); id != nil {
 					quicFactoryTemplate.UtlsClientHelloID = id
+					quicConfig.ChromeTransportParameters = true
+					quicConfig.InitialStreamReceiveWindow = 6 * 1024 * 1024
+					quicConfig.InitialConnectionReceiveWindow = 15 * 1024 * 1024
+					quicConfig.MaxIdleTimeout = 30 * time.Second
+					quicConfig.MaxIncomingStreams = 100
+					quicConfig.MaxIncomingUniStreams = 103
+					quicConfig.EnableDatagrams = true
+					quicConfig.MaxDatagramFrameSize = 65536
 				}
 			}
 			quicConfig.QUICTLSFactory = tls.NewRealityQUICFactory(quicFactoryTemplate)

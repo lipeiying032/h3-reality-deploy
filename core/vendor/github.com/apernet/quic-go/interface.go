@@ -101,6 +101,9 @@ type Config struct {
 	// QUICTLSFactory overrides the TLS state machine used for QUIC handshakes.
 	// If nil, crypto/tls is used.
 	QUICTLSFactory qtls.Factory
+	// ChromeTransportParameters applies Chrome's QUIC client transport
+	// parameter template. It only affects parameters sent by clients.
+	ChromeTransportParameters bool
 	// The QUIC versions that can be negotiated.
 	// If not set, it uses all versions available.
 	Versions []Version
