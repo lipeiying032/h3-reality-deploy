@@ -11,10 +11,21 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"golang.org/x/crypto/hkdf"
 )
+
+// errNotQUICInitial marks datagrams that cannot be a complete QUIC v1
+// Initial packet. Errors after a complete Initial has been identified (for
+// example, header-protection or AEAD failures) deliberately do not wrap this
+// sentinel so callers can preserve relay semantics for probes.
+var errNotQUICInitial = errors.New("not a QUIC Initial packet")
+
+func isNotQUICInitial(err error) bool {
+	return errors.Is(err, errNotQUICInitial)
+}
 
 // quicInitialSalt is the RFC 9001 Section 5.2 Initial salt for QUIC v1.
 var quicInitialSalt = []byte{
@@ -108,37 +119,37 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	var p initialPkt
 
 	if len(data) < 6 {
-		return nil, fmt.Errorf("packet too short")
+		return nil, fmt.Errorf("%w: packet too short", errNotQUICInitial)
 	}
 
 	// Check long header and Initial type (0xC0 with 1-byte PN)
 	firstByte := data[0]
 	if firstByte&0x80 == 0 {
-		return nil, fmt.Errorf("not a long header")
+		return nil, fmt.Errorf("%w: not a long header", errNotQUICInitial)
 	}
 	pktType := (firstByte >> 4) & 0x03
 	if pktType != 0 {
-		return nil, fmt.Errorf("not an Initial packet (type=%d)", pktType)
+		return nil, fmt.Errorf("%w: not an Initial packet (type=%d)", errNotQUICInitial, pktType)
 	}
 
 	// Version (4 bytes) — only handle QUIC v1
 	if len(data) < 5 {
-		return nil, fmt.Errorf("packet too short for version")
+		return nil, fmt.Errorf("%w: packet too short for version", errNotQUICInitial)
 	}
 	if v := binary.BigEndian.Uint32(data[1:5]); v != 1 {
-		return nil, fmt.Errorf("not QUIC v1 (version=%d)", v)
+		return nil, fmt.Errorf("%w: not QUIC v1 (version=%d)", errNotQUICInitial, v)
 	}
 
 	offset := 5
 
 	// DCID Length and DCID
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at DCID length")
+		return nil, fmt.Errorf("%w: truncated at DCID length", errNotQUICInitial)
 	}
 	dcidLen := int(data[offset])
 	offset++
-	if offset+dcidLen > len(data) {
-		return nil, fmt.Errorf("truncated at DCID")
+	if dcidLen > len(data)-offset {
+		return nil, fmt.Errorf("%w: truncated at DCID", errNotQUICInitial)
 	}
 	p.DCID = make([]byte, dcidLen)
 	copy(p.DCID, data[offset:offset+dcidLen])
@@ -146,12 +157,12 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 
 	// SCID Length and SCID
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at SCID length")
+		return nil, fmt.Errorf("%w: truncated at SCID length", errNotQUICInitial)
 	}
 	scidLen := int(data[offset])
 	offset++
-	if offset+scidLen > len(data) {
-		return nil, fmt.Errorf("truncated at SCID")
+	if scidLen > len(data)-offset {
+		return nil, fmt.Errorf("%w: truncated at SCID", errNotQUICInitial)
 	}
 	p.SCID = make([]byte, scidLen)
 	copy(p.SCID, data[offset:offset+scidLen])
@@ -159,24 +170,42 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 
 	// Token Length (varint) and Token
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at token length")
+		return nil, fmt.Errorf("%w: truncated at token length", errNotQUICInitial)
 	}
 	tokenLen, varintBytes := readVarint(data[offset:])
+	if varintBytes == 0 {
+		return nil, fmt.Errorf("%w: truncated at token length", errNotQUICInitial)
+	}
 	offset += varintBytes
-	if offset+int(tokenLen) > len(data) {
-		return nil, fmt.Errorf("truncated at token")
+	if tokenLen > uint64(len(data)-offset) {
+		return nil, fmt.Errorf("%w: truncated at token", errNotQUICInitial)
 	}
 	offset += int(tokenLen)
 
 	// Length (varint) of remaining packet
 	if offset >= len(data) {
-		return nil, fmt.Errorf("truncated at length")
+		return nil, fmt.Errorf("%w: truncated at length", errNotQUICInitial)
 	}
-	_, varintBytes = readVarint(data[offset:])
+	packetLen, varintBytes := readVarint(data[offset:])
+	if varintBytes == 0 {
+		return nil, fmt.Errorf("%w: truncated at length", errNotQUICInitial)
+	}
 	offset += varintBytes
 
 	// offset now points to start of Packet Number field
 	pnStart := offset
+	// Header protection samples 16 bytes starting four bytes after pnStart,
+	// so a protected packet needs at least four PN/sample-prefix bytes plus
+	// the 16-byte sample (RFC 9001 Section 5.4.2).
+	if packetLen < 4+16 {
+		return nil, fmt.Errorf("%w: invalid packet length %d", errNotQUICInitial, packetLen)
+	}
+	if packetLen > uint64(len(data)-pnStart) {
+		return nil, fmt.Errorf("%w: packet length %d exceeds remaining datagram", errNotQUICInitial, packetLen)
+	}
+	// A UDP datagram can coalesce several QUIC packets. Header protection and
+	// AEAD processing must be limited to the first packet's declared Length.
+	data = data[:pnStart+int(packetLen)]
 
 	// Derive keys
 	key, iv, hp := deriveInitialSecrets(p.DCID)
@@ -184,7 +213,7 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	// The sample for header protection starts at the 4th byte after the start
 	// of the Packet Number field.
 	sampleOffset := pnStart + 4
-	if sampleOffset+16 > len(data) {
+	if sampleOffset > len(data) || 16 > len(data)-sampleOffset {
 		return nil, fmt.Errorf("packet too short for header protection sample")
 	}
 	sample := make([]byte, 16)
@@ -201,8 +230,11 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	pnLen := int(data[0]&0x03) + 1
 
 	// Unprotect packet number bytes
-	if pnStart+pnLen > len(data) {
+	if pnLen > len(data)-pnStart {
 		return nil, fmt.Errorf("packet number extends beyond data")
+	}
+	if packetLen < uint64(pnLen+16) {
+		return nil, fmt.Errorf("%w: packet length %d is shorter than packet number and authentication tag", errNotQUICInitial, packetLen)
 	}
 	for i := 0; i < pnLen; i++ {
 		data[pnStart+i] ^= mask[1+i]
@@ -217,7 +249,7 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	offset = pnStart + pnLen
 
 	// Decrypt payload (offset now points past packet number)
-	if offset+16 >= len(data) {
+	if offset > len(data) || 16 >= len(data)-offset {
 		return nil, fmt.Errorf("payload too short")
 	}
 
@@ -287,7 +319,11 @@ func parseCryptoFrames(payload []byte) []cryptoFrag {
 			offset += n1
 			fragLen, n2 := readVarint(payload[offset:])
 			offset += n2
-			if offset+int(fragLen) > len(payload) {
+			if fragLen > uint64(len(payload)-offset) {
+				return frags
+			}
+			maxInt := uint64(^uint(0) >> 1)
+			if fragOff > maxInt {
 				return frags
 			}
 			frags = append(frags, cryptoFrag{off: int(fragOff), data: payload[offset : offset+int(fragLen)]})
