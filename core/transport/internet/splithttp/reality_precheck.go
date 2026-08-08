@@ -179,6 +179,11 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 		return nil, fmt.Errorf("%w: truncated at token length", errNotQUICInitial)
 	}
 	tokenLen, varintBytes := readVarint(data[offset:])
+	if varintBytes == 0 {
+		// A varint whose encoding claims more bytes than remain (e.g. a 2-byte
+		// encoding truncated to a single byte) leaves the header unparseable.
+		return nil, fmt.Errorf("%w: truncated at token length", errNotQUICInitial)
+	}
 	offset += varintBytes
 	if offset+int(tokenLen) > len(data) {
 		return nil, fmt.Errorf("%w: truncated at token", errNotQUICInitial)
@@ -190,6 +195,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 		return nil, fmt.Errorf("%w: truncated at length", errNotQUICInitial)
 	}
 	_, varintBytes = readVarint(data[offset:])
+	if varintBytes == 0 {
+		return nil, fmt.Errorf("%w: truncated at length", errNotQUICInitial)
+	}
 	offset += varintBytes
 
 	// offset now points to start of Packet Number field

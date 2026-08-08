@@ -8,7 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
+	mrand "math/rand"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -309,6 +312,316 @@ func TestParseQUICInitialClassification(t *testing.T) {
 	corrupt[len(corrupt)-1] ^= 0xff
 	if _, err := parseQUICInitial(corrupt); isNotQUICInitial(err) {
 		t.Fatalf("corrupted Initial: err=%v, want Initial (relay)", err)
+	}
+}
+
+// headerIsCompleteInitial mirrors parseQUICInitial's header-level rule: a
+// datagram is "not a QUIC Initial" iff its long-header / Initial-type /
+// version / DCID / SCID / token-length / length fields cannot be fully
+// parsed. Once the header is complete, any further failure is a decryption /
+// processing failure and the datagram stays an Initial (relay semantics).
+// This is the classification oracle for the robustness stress test.
+func headerIsCompleteInitial(data []byte) bool {
+	if len(data) < 6 {
+		return false
+	}
+	if data[0]&0x80 == 0 {
+		return false
+	}
+	if (data[0]>>4)&0x03 != 0 {
+		return false
+	}
+	if binary.BigEndian.Uint32(data[1:5]) != 1 {
+		return false
+	}
+	off := 5
+	if off >= len(data) {
+		return false
+	}
+	dcidLen := int(data[off])
+	off++
+	if off+dcidLen > len(data) {
+		return false
+	}
+	off += dcidLen
+	if off >= len(data) {
+		return false
+	}
+	scidLen := int(data[off])
+	off++
+	if off+scidLen > len(data) {
+		return false
+	}
+	off += scidLen
+	if off >= len(data) {
+		return false
+	}
+	tokenLen, n := readVarint(data[off:])
+	if n == 0 {
+		return false
+	}
+	off += n
+	if off+int(tokenLen) > len(data) {
+		return false
+	}
+	off += int(tokenLen)
+	if off >= len(data) {
+		return false
+	}
+	_, n = readVarint(data[off:])
+	return n != 0
+}
+
+// randomInitialDatagram builds a structurally complete QUIC v1 Initial long
+// header (Initial type, version 1, random DCID/SCID/token of the requested
+// sizes) followed by a random ciphertext payload, so decryption necessarily
+// fails while the header still parses as an Initial.
+func randomInitialDatagram(rng *mrand.Rand, dcidLen, scidLen, tokenLen, payloadLen int) []byte {
+	dcid := make([]byte, dcidLen)
+	scid := make([]byte, scidLen)
+	token := make([]byte, tokenLen)
+	payload := make([]byte, payloadLen)
+	rng.Read(dcid)
+	rng.Read(scid)
+	rng.Read(token)
+	rng.Read(payload)
+
+	pkt := []byte{0xc0}
+	pkt = binary.BigEndian.AppendUint32(pkt, 1)
+	pkt = append(pkt, byte(dcidLen))
+	pkt = append(pkt, dcid...)
+	pkt = append(pkt, byte(scidLen))
+	pkt = append(pkt, scid...)
+	pkt = appendVarint(pkt, uint64(tokenLen))
+	pkt = append(pkt, token...)
+	pkt = appendVarint(pkt, uint64(1+len(payload)))
+	pkt = append(pkt, 0x00) // 1-byte packet number
+	pkt = append(pkt, payload...)
+	return pkt
+}
+
+// classifyInitialSafe runs parseQUICInitial on a copy of data and reports
+// whether it classifies as a QUIC Initial (relay), recovering from a panic so
+// a crashing input is recorded instead of aborting the whole run.
+func classifyInitialSafe(data []byte) (initial bool, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+		}
+	}()
+	work := make([]byte, len(data))
+	copy(work, data)
+	_, err := parseQUICInitial(work)
+	return err == nil || !isNotQUICInitial(err), false
+}
+
+// TestParseQUICInitialRobustness stress-tests parseQUICInitial with 1145
+// decrypt-failed / corrupt / boundary Initial datagrams (1145 is the χ²
+// statistics sample size). The oracle is headerIsCompleteInitial: a datagram
+// whose Initial header parses completely is an Initial (relay), everything
+// else is dropped. The test asserts no panic and no misclassification, and
+// logs the Initial vs non-Initial distribution plus the total parse time.
+func TestParseQUICInitialRobustness(t *testing.T) {
+	const wantTotal = 1145
+
+	rng := mrand.New(mrand.NewSource(20260808))
+	base := testInitialPacket(t, []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc})
+
+	type tc struct {
+		desc string
+		data []byte
+	}
+	var cases []tc
+	add := func(desc string, data []byte) {
+		cases = append(cases, tc{desc: desc, data: data})
+	}
+
+	// (a) Corrupt Initials derived from the reference corrupt sample: every
+	// auth-tag byte flipped, random byte fills in the payload/tail region,
+	// random trims (1B..full), random padding out to 1200B.
+	for i := 0; i < 16; i++ {
+		p := bytes.Clone(base)
+		p[len(p)-16+i] ^= 0xff
+		add(fmt.Sprintf("auth-tag byte %d flipped", i), p)
+	}
+	for i := 0; i < 304; i++ {
+		p := bytes.Clone(base)
+		switch i % 3 {
+		case 0: // random byte fills past the 21-byte header
+			for j := 0; j < 1+rng.Intn(20); j++ {
+				p[21+rng.Intn(len(p)-21)] ^= byte(rng.Intn(256))
+			}
+		case 1: // random trim 1B..full length
+			p = p[:1+rng.Intn(len(p))]
+		case 2: // random padding appended up to 1200B
+			pad := make([]byte, 1+rng.Intn(1200-len(p)))
+			rng.Read(pad)
+			p = append(p, pad...)
+		}
+		add(fmt.Sprintf("base mutation %d", i), p)
+	}
+
+	// (b) Structurally complete Initial headers (DCID 0/4/8/20/100, SCID
+	// 0/4/8, token 0/1/16/64/128) with random ciphertext payloads.
+	for _, d := range []int{0, 4, 8, 20, 100} {
+		for _, s := range []int{0, 4, 8} {
+			for _, tok := range []int{0, 1, 16, 64} {
+				for _, pl := range []int{16, 100, 500, 1100} {
+					add(fmt.Sprintf("random-payload Initial dcid=%d scid=%d token=%d payload=%d", d, s, tok, pl),
+						randomInitialDatagram(rng, d, s, tok, pl))
+				}
+			}
+		}
+	}
+	for i := 0; i < 160; i++ {
+		d := []int{0, 4, 8, 20, 100}[rng.Intn(5)]
+		s := []int{0, 4, 8}[rng.Intn(3)]
+		tok := []int{0, 1, 16, 64, 128}[rng.Intn(5)]
+		pl := 16 + rng.Intn(1100)
+		add(fmt.Sprintf("random-payload Initial %d dcid=%d scid=%d token=%d payload=%d", i, d, s, tok, pl),
+			randomInitialDatagram(rng, d, s, tok, pl))
+	}
+
+	// (c) Boundary mutations: PN length bits, unsupported versions, abnormal
+	// token/length fields (incl. truncated varints), oversized DCID, length
+	// field off by ±1/±2, deterministic truncations, non-Initial long-header
+	// types, and random garbage / long-header-forced random datagrams.
+	for _, fb := range []byte{0xc1, 0xc2, 0xc3} {
+		p := bytes.Clone(base)
+		p[0] = fb
+		add(fmt.Sprintf("PN length bits 0x%02x", fb), p)
+	}
+	for _, ver := range []uint32{2, 0x0a0a0a0a, 0x1a1a1a1a, 0xaaaaaaaa, 0x00000000} {
+		p := bytes.Clone(base)
+		binary.BigEndian.PutUint32(p[1:5], ver)
+		add(fmt.Sprintf("version 0x%08x", ver), p)
+	}
+	{
+		p := bytes.Clone(base)[:21]
+		p[20] = 0x40 // token length claims a 2-byte varint, packet ends here
+		add("token length varint truncated", p)
+	}
+	{
+		p := bytes.Clone(base)
+		p[20], p[21] = 0x40, 0x00 // 2-byte token length varint, token len 0
+		add("token length varint 0x4000 (token len 0)", p)
+	}
+	{
+		p := []byte{0xc0}
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = append(p, 0x08)
+		p = append(p, bytes.Repeat([]byte{0x11}, 8)...)
+		p = append(p, 0x04)
+		p = append(p, bytes.Repeat([]byte{0x99}, 4)...)
+		p = append(p, 0x64) // token length 100
+		p = append(p, bytes.Repeat([]byte{0xaa}, 10)...)
+		add("token length 100 with 10 token bytes", p)
+	}
+	{
+		p := []byte{0xc0}
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = append(p, 0x08)
+		p = append(p, bytes.Repeat([]byte{0x11}, 8)...)
+		p = append(p, 0x04)
+		p = append(p, bytes.Repeat([]byte{0x99}, 4)...)
+		p = append(p, 0x01) // token length 1
+		p = append(p, 0xaa) // one token byte
+		p = append(p, 0x00, 0x00, 0x00)
+		p = append(p, bytes.Repeat([]byte{0xbb}, 32)...)
+		add("token length 1 with 1 token byte", p)
+	}
+	{
+		p := bytes.Clone(base)[:21]
+		p = append(p, 0x40) // length claims a 2-byte varint, packet ends here
+		add("length varint truncated", p)
+	}
+	{
+		p := bytes.Clone(base)[:21]
+		p = append(p, 0x40, 0x40, 0x00) // 2-byte length varint (64) + PN
+		p = append(p, bytes.Repeat([]byte{0xbb}, 32)...)
+		add("length varint 0x4040 (length 64)", p)
+	}
+	{
+		p := []byte{0xc0}
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = append(p, 200)
+		p = append(p, bytes.Repeat([]byte{0x22}, 200)...)
+		p = append(p, 0x00)
+		p = append(p, 0x00, 0x00) // token len 0, length 0
+		add("DCID length 200 complete", p)
+	}
+	{
+		p := []byte{0xc0}
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = append(p, 200)
+		p = append(p, bytes.Repeat([]byte{0x22}, 100)...)
+		add("DCID length 200 truncated", p)
+	}
+	for _, delta := range []int{-2, -1, 1, 2} {
+		// dcid 8 / scid 4 / token 0: the 1-byte length varint is at index 20.
+		p := randomInitialDatagram(rng, 8, 4, 0, 100)
+		p[20] = byte(101 + delta)
+		add(fmt.Sprintf("length field actual%+d", delta), p)
+	}
+	for _, n := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 20, 21, 22, 24, 30, 47} {
+		add(fmt.Sprintf("base truncated to %d bytes", n), bytes.Clone(base)[:n])
+	}
+	for i := 0; i < 9; i++ {
+		p := make([]byte, 2+i)
+		p[0] = 0xc0
+		rng.Read(p[1:])
+		add(fmt.Sprintf("first-byte Initial + %d random bytes", 1+i), p)
+	}
+	for _, fb := range []byte{0xd0, 0xe0, 0xf0} {
+		p := bytes.Clone(base)
+		p[0] = fb
+		add(fmt.Sprintf("non-Initial long-header type 0x%02x", fb), p)
+	}
+	for i := 0; i < 200; i++ {
+		p := make([]byte, 1+rng.Intn(1200))
+		rng.Read(p)
+		add(fmt.Sprintf("random garbage %d", i), p)
+	}
+	for i := 0; i < 175; i++ {
+		p := make([]byte, 6+rng.Intn(200))
+		p[0] = 0xc0
+		binary.BigEndian.PutUint32(p[1:5], 1)
+		rng.Read(p[5:])
+		add(fmt.Sprintf("long-header v1 random %d", i), p)
+	}
+
+	if len(cases) != wantTotal {
+		t.Fatalf("generated %d cases, want %d", len(cases), wantTotal)
+	}
+
+	start := time.Now()
+	var countInitial, countNonInitial int
+	var bad []string
+	for i, c := range cases {
+		wantInitial := headerIsCompleteInitial(c.data)
+		gotInitial, panicked := classifyInitialSafe(c.data)
+		switch {
+		case panicked:
+			bad = append(bad, fmt.Sprintf("case %d (%s): PANIC input=%x", i, c.desc, c.data))
+		case gotInitial:
+			countInitial++
+			if !wantInitial {
+				bad = append(bad, fmt.Sprintf("case %d (%s): classified Initial, want drop; input=%x", i, c.desc, c.data))
+			}
+		default:
+			countNonInitial++
+			if wantInitial {
+				bad = append(bad, fmt.Sprintf("case %d (%s): classified drop, want Initial; input=%x", i, c.desc, c.data))
+			}
+		}
+	}
+	elapsed := time.Since(start)
+
+	t.Logf("parseQUICInitial robustness: total=%d Initial=%d non-Initial=%d elapsed=%v",
+		len(cases), countInitial, countNonInitial, elapsed)
+	if len(bad) > 0 {
+		t.Fatalf("parseQUICInitial robustness: %d mismatches, first 5:\n%s",
+			len(bad), strings.Join(bad[:min(5, len(bad))], "\n"))
 	}
 }
 
