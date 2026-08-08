@@ -104,6 +104,9 @@ type Config struct {
 	// ChromeTransportParameters applies Chrome's QUIC client transport
 	// parameter template. It only affects parameters sent by clients.
 	ChromeTransportParameters bool
+	// InitialDCIDLength pins the client's first destination connection ID
+	// length. Zero keeps the randomized 8–20 byte default.
+	InitialDCIDLength int
 	// The QUIC versions that can be negotiated.
 	// If not set, it uses all versions available.
 	Versions []Version
