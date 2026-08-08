@@ -9,9 +9,15 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-// defines the maximum time an idle TCP session can survive in the tunnel, so
-// it should be consistent across HTTP versions and with other transports.
-const ConnIdleTimeout = 300 * time.Second
+// ConnIdleTimeout is the maximum time an idle session can survive in the
+// tunnel before it is considered dead. It is the client-side default for both
+// the QUIC MaxIdleTimeout (splithttp dialer) and the HTTP/1.1 / HTTP/2
+// IdleConnTimeout, so the death-detection window stays consistent across HTTP
+// versions and transports. 45s shortens the dead-connection window: after the
+// peer is cut off, keepalives go unanswered and the connection now fails over
+// within seconds instead of lingering up to 5 minutes with a zombie keepalive
+// loop. Active sessions are unaffected — only idle sessions are reaped.
+const ConnIdleTimeout = 45 * time.Second
 
 // consistent with quic-go
 const QuicgoH3KeepAlivePeriod = 10 * time.Second
