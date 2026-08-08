@@ -400,6 +400,7 @@ func applyChromeTransportParameters(params *wire.TransportParameters, version pr
 		0x11:   versionBytes,
 		0x3128: []byte("ORIG"),
 	}
+	params.RandomizeOrder = true
 }
 
 // declare this as a variable, such that we can it mock it in the tests
