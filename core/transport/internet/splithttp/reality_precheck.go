@@ -23,6 +23,8 @@ import (
 // sentinel so callers can preserve relay semantics for probes.
 var errNotQUICInitial = errors.New("not a QUIC Initial packet")
 
+const quicV1MaxConnectionIDLen = 20
+
 func isNotQUICInitial(err error) bool {
 	return errors.Is(err, errNotQUICInitial)
 }
@@ -127,6 +129,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	if firstByte&0x80 == 0 {
 		return nil, fmt.Errorf("%w: not a long header", errNotQUICInitial)
 	}
+	if firstByte&0x40 == 0 {
+		return nil, fmt.Errorf("%w: fixed bit is not set", errNotQUICInitial)
+	}
 	pktType := (firstByte >> 4) & 0x03
 	if pktType != 0 {
 		return nil, fmt.Errorf("%w: not an Initial packet (type=%d)", errNotQUICInitial, pktType)
@@ -148,6 +153,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	}
 	dcidLen := int(data[offset])
 	offset++
+	if dcidLen > quicV1MaxConnectionIDLen {
+		return nil, fmt.Errorf("%w: DCID length %d exceeds QUIC v1 maximum", errNotQUICInitial, dcidLen)
+	}
 	if dcidLen > len(data)-offset {
 		return nil, fmt.Errorf("%w: truncated at DCID", errNotQUICInitial)
 	}
@@ -161,6 +169,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	}
 	scidLen := int(data[offset])
 	offset++
+	if scidLen > quicV1MaxConnectionIDLen {
+		return nil, fmt.Errorf("%w: SCID length %d exceeds QUIC v1 maximum", errNotQUICInitial, scidLen)
+	}
 	if scidLen > len(data)-offset {
 		return nil, fmt.Errorf("%w: truncated at SCID", errNotQUICInitial)
 	}

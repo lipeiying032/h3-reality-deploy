@@ -8,13 +8,19 @@ package splithttp
 //     are buffered until the decision is made so no packet is lost.
 //   - AUTH:    verification passed — all (buffered + subsequent) packets are
 //     handed to quic-go through an internal FIFO queue.
-//   - RELAY:   verification failed or the flow is not parseable QUIC — the
-//     flow is treated as a probe and every packet is relayed verbatim to the
-//     single configured dest (classic REALITY semantics: auth failure is
-//     always forwarded to dest, never routed by SNI; serverNames only gates
-//     auth). Without a configured dest such flows are dropped. The target is
-//     fixed at the first packet's decision; the destination completes the
-//     handshake and the real site rejects a mismatched SNI by itself.
+//   - RELAY:   verification failed or decryption failed for a complete QUIC
+//     Initial. The flow is treated as a probe and every packet is relayed
+//     verbatim to the single configured dest (classic REALITY semantics: auth
+//     failure is always forwarded to dest, never routed by SNI; serverNames
+//     only gates auth). Without a configured dest such flows are dropped. The
+//     target is fixed at the first packet's decision; the destination
+//     completes the handshake and the real site rejects a mismatched SNI by
+//     itself.
+//
+// Datagrams that cannot be a complete QUIC v1 Initial (short headers,
+// 0-RTT/Handshake/Retry, version negotiation, truncated headers and garbage)
+// are dropped while a flow is unknown or PENDING. AUTH and RELAY decisions
+// are sticky, so their subsequent datagrams are never reclassified.
 //
 // The wrapper runs its own read loop on the underlying conn; quic-go's
 // ReadFrom is served from the AUTH queue so it is never blocked by precheck
@@ -22,6 +28,7 @@ package splithttp
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -45,6 +52,9 @@ const (
 	precheckMaxPendingBytes = 128 * 1024
 	// precheckScanPeriod is how often stale states are reaped.
 	precheckScanPeriod = 30 * time.Second
+	// precheckDropLogInterval bounds diagnostic output from high-rate junk
+	// traffic. Drop notices are debug-level and shared across all clients.
+	precheckDropLogInterval = 5 * time.Second
 )
 
 type precheckState int
@@ -92,6 +102,10 @@ type realityPrecheckPacketConn struct {
 	queue     chan queuedPacket
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	dropLogMu         sync.Mutex
+	dropLogNext       time.Time
+	dropLogSuppressed uint64
 }
 
 // newRealityPrecheckPacketConn wraps conn with the QUIC precheck + UDP relay.
@@ -194,8 +208,8 @@ func (c *realityPrecheckPacketConn) relayTimeout() time.Duration {
 	return c.params.FallbackTimeout
 }
 
-// readLoop owns the underlying conn's read side. Every datagram is copied
-// out before the buffer is reused.
+// readLoop owns the underlying conn's read side. handlePacket classifies
+// obvious non-Initial traffic before copying the reusable read buffer.
 func (c *realityPrecheckPacketConn) readLoop() {
 	buf := make([]byte, 65536)
 	for {
@@ -204,21 +218,94 @@ func (c *realityPrecheckPacketConn) readLoop() {
 			c.Close()
 			return
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		c.handlePacket(data, addr)
+		c.handlePacket(buf[:n], addr)
 	}
+}
+
+// obviousNonInitialV1 performs the allocation-free checks that are safe
+// before parsing variable-length fields. It is only used for unknown and
+// PENDING flows; AUTH and RELAY flows have sticky decisions.
+func obviousNonInitialV1(data []byte) bool {
+	if len(data) < 6 {
+		return true
+	}
+	firstByte := data[0]
+	if firstByte&0x80 == 0 || firstByte&0x40 == 0 {
+		return true
+	}
+	if (firstByte>>4)&0x03 != 0 {
+		return true
+	}
+	return binary.BigEndian.Uint32(data[1:5]) != 1
+}
+
+func (c *realityPrecheckPacketConn) forgetEmptyPending(addr net.Addr, st *precheckClientState) {
+	key := addr.String()
+	c.mu.Lock()
+	if c.states[key] == st && st.state == precheckPending && len(st.pending) == 0 && len(st.cryptoBuf) == 0 {
+		delete(c.states, key)
+		if c.perIP[st.ip] <= 1 {
+			delete(c.perIP, st.ip)
+		} else {
+			c.perIP[st.ip]--
+		}
+	}
+	c.mu.Unlock()
+}
+
+func cloneDatagram(data []byte) []byte {
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned
+}
+
+// confirmedNonInitial applies the complete parser to Initial-shaped traffic.
+// The parser mutates its input, so this slow path uses a disposable copy.
+func confirmedNonInitial(data []byte) (bool, error) {
+	_, err := parseQUICInitial(cloneDatagram(data))
+	return isNotQUICInitial(err), err
+}
+
+func (c *realityPrecheckPacketConn) logNonInitialDrop(addr net.Addr, reason error) {
+	now := time.Now()
+	c.dropLogMu.Lock()
+	if now.Before(c.dropLogNext) {
+		c.dropLogSuppressed++
+		c.dropLogMu.Unlock()
+		return
+	}
+	suppressed := c.dropLogSuppressed
+	c.dropLogSuppressed = 0
+	c.dropLogNext = now.Add(precheckDropLogInterval)
+	c.dropLogMu.Unlock()
+
+	if reason == nil {
+		errors.LogDebug(c.ctx, "REALITY: QUIC precheck dropped obvious non-Initial packet from ", addr.String(), " (suppressed since last log: ", suppressed, ")")
+		return
+	}
+	errors.LogDebug(c.ctx, "REALITY: QUIC precheck dropped non-Initial packet from ", addr.String(), ": ", reason, " (suppressed since last log: ", suppressed, ")")
 }
 
 func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 	key := addr.String()
 	c.mu.Lock()
 	st := c.states[key]
+	if st == nil || st.state == precheckPending {
+		if obviousNonInitialV1(data) {
+			c.mu.Unlock()
+			c.logNonInitialDrop(addr, nil)
+			return
+		}
+	}
 	if st == nil {
 		if len(c.states) >= precheckMaxStates || c.perIP[addrIPKey(addr)] >= precheckMaxPerIP {
-			// Limits reached: relay unclassified traffic directly to the
-			// configured dest.
 			c.mu.Unlock()
+			// At capacity, only complete Initials keep the legacy fallback.
+			// Initial-shaped but structurally invalid traffic is still dropped.
+			if nonInitial, err := confirmedNonInitial(data); nonInitial {
+				c.logNonInitialDrop(addr, err)
+				return
+			}
 			c.relay.relayClientToDest(addr, c.relay.dest, data)
 			return
 		}
@@ -230,6 +317,9 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 	state := st.state
 	c.mu.Unlock()
 
+	// The read buffer is reused after handlePacket returns. Obvious drops have
+	// already returned, so retain one owned copy for queues and pending state.
+	data = cloneDatagram(data)
 	switch state {
 	case precheckAuth:
 		c.enqueue(data, addr)
@@ -249,6 +339,13 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 	copy(work, data)
 	pkt, err := parseQUICInitial(work)
 	if err != nil {
+		if isNotQUICInitial(err) {
+			// A first junk packet must not reserve state-table capacity. Keep a
+			// state only when a previous Initial contributed buffered data.
+			c.forgetEmptyPending(addr, st)
+			c.logNonInitialDrop(addr, err)
+			return
+		}
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (unparseable: ", err, ")")
 		c.relayDecision(st, data, addr)
 		return
@@ -350,7 +447,11 @@ func (c *realityPrecheckPacketConn) reapLoop() {
 			for key, st := range c.states {
 				if now.Sub(st.lastSeen) > c.relayTimeout() {
 					delete(c.states, key)
-					c.perIP[st.ip]--
+					if c.perIP[st.ip] <= 1 {
+						delete(c.perIP, st.ip)
+					} else {
+						c.perIP[st.ip]--
+					}
 				}
 			}
 			c.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -332,6 +333,9 @@ func TestParseQUICInitialSafety(t *testing.T) {
 	}
 
 	addNotInitial("short header", []byte{0x40, 0x11, 0x22, 0x33, 0x44, 0x55})
+	fixedBitClear := bytes.Clone(headerThroughSCID)
+	fixedBitClear[0] = 0x80
+	addNotInitial("fixed bit clear", fixedBitClear)
 	for name, firstByte := range map[string]byte{
 		"0-RTT":     0xd0,
 		"Handshake": 0xe0,
@@ -344,6 +348,12 @@ func TestParseQUICInitialSafety(t *testing.T) {
 	binary.BigEndian.PutUint32(versionNegotiation[1:5], 0)
 	addNotInitial("version negotiation", versionNegotiation)
 	addNotInitial("garbage", []byte{0x28, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05})
+	dcidTooLong := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x15}
+	dcidTooLong = append(dcidTooLong, bytes.Repeat([]byte{0x11}, 21)...)
+	addNotInitial("DCID longer than 20 bytes", dcidTooLong)
+	scidTooLong := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x15}
+	scidTooLong = append(scidTooLong, bytes.Repeat([]byte{0x22}, 21)...)
+	addNotInitial("SCID longer than 20 bytes", scidTooLong)
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -658,6 +668,244 @@ func expectNoRelay(t *testing.T, conn *net.UDPConn) {
 	buf := make([]byte, 2048)
 	if n, _, err := conn.ReadFromUDP(buf); err == nil {
 		t.Fatalf("unexpected packet (%d bytes) on %s", n, conn.LocalAddr())
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("ReadFromUDP error = %v, want timeout", err)
+	}
+}
+
+type precheckPolicyFixture struct {
+	wrapped   net.PacketConn
+	precheck  *realityPrecheckPacketConn
+	server    *net.UDPConn
+	dest      *net.UDPConn
+	serverPub []byte
+	shortID   [8]byte
+}
+
+func newPrecheckPolicyFixture(t *testing.T) *precheckPolicyFixture {
+	t.Helper()
+	serverPriv := make([]byte, 32)
+	serverPub, err := curve25519.X25519(serverPriv, curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shortID [8]byte
+	copy(shortID[:], []byte{0xde, 0x08, 0x5a, 0xa9, 0, 0, 0, 0})
+
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	params := &tls.RealityQUICParams{
+		PrivateKey:      serverPriv,
+		ShortIds:        map[[8]byte]bool{shortID: true},
+		ServerNames:     map[string]bool{"www.apple.com": true},
+		Dest:            dest.LocalAddr().String(),
+		FallbackTimeout: 5 * time.Second,
+	}
+	wrapped, err := newRealityPrecheckPacketConn(context.Background(), server, params)
+	if err != nil {
+		server.Close()
+		dest.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		wrapped.Close()
+		dest.Close()
+	})
+	return &precheckPolicyFixture{
+		wrapped:   wrapped,
+		precheck:  wrapped.(*realityPrecheckPacketConn),
+		server:    server,
+		dest:      dest,
+		serverPub: serverPub,
+		shortID:   shortID,
+	}
+}
+
+func newPolicyClient(t *testing.T) *net.UDPConn {
+	t.Helper()
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return client
+}
+
+func sendPolicyPacket(t *testing.T, f *precheckPolicyFixture, client *net.UDPConn, data []byte) {
+	t.Helper()
+	if _, err := client.WriteToUDP(data, f.server.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func expectQueuedPacket(t *testing.T, conn net.PacketConn) []byte {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		n, _, err := conn.ReadFrom(buf)
+		done <- result{data: bytes.Clone(buf[:n]), err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadFrom: %v", got.err)
+		}
+		return got.data
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for AUTH queue")
+		return nil
+	}
+}
+
+func authenticatedPolicyInitial(t *testing.T, f *precheckPolicyFixture) []byte {
+	t.Helper()
+	ephPriv := make([]byte, 32)
+	if _, err := rand.Read(ephPriv); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 16)
+	payload[0], payload[1], payload[2] = 26, 4, 17
+	binary.BigEndian.PutUint32(payload[4:], uint32(time.Now().Unix()))
+	copy(payload[8:], f.shortID[:])
+	return testInitialPacket(t, testClientHelloRandom(t, ephPriv, f.serverPub, payload))
+}
+
+func TestPrecheckNonInitialPolicy(t *testing.T) {
+	f := newPrecheckPolicyFixture(t)
+
+	// Hard-coded category expectations are independent of the production
+	// parser. All of these unknown-flow packets must be silent and stateless.
+	dropClient := newPolicyClient(t)
+	for _, packet := range [][]byte{
+		{0x40, 0x11, 0x22, 0x33, 0x44, 0x55},
+		{0xd0, 0x00, 0x00, 0x00, 0x01, 0x00},
+		{0xe0, 0x00, 0x00, 0x00, 0x01, 0x00},
+		{0xf0, 0x00, 0x00, 0x00, 0x01, 0x00},
+		{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0x80, 0x00, 0x00, 0x00, 0x01, 0x00},
+		{0x28, 0x00, 0x01, 0x02, 0x03, 0x04},
+		{0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x11},
+	} {
+		sendPolicyPacket(t, f, dropClient, packet)
+	}
+	expectNoRelay(t, f.dest)
+	f.precheck.mu.Lock()
+	if len(f.precheck.states) != 0 {
+		t.Fatalf("non-Initial traffic created %d states, want 0", len(f.precheck.states))
+	}
+	f.precheck.mu.Unlock()
+
+	// Reordered 0-RTT and Handshake packets are dropped, but a later Initial
+	// from the same address can still authenticate.
+	authClient := newPolicyClient(t)
+	sendPolicyPacket(t, f, authClient, []byte{0xd0, 0, 0, 0, 1, 0})
+	sendPolicyPacket(t, f, authClient, []byte{0xe0, 0, 0, 0, 1, 0})
+	expectNoRelay(t, f.dest)
+	authInitial := authenticatedPolicyInitial(t, f)
+	sendPolicyPacket(t, f, authClient, authInitial)
+	if got := expectQueuedPacket(t, f.wrapped); !bytes.Equal(got, authInitial) {
+		t.Fatalf("AUTH Initial mismatch: got %d bytes, want %d", len(got), len(authInitial))
+	}
+	if !f.precheck.IsAuthenticated(authClient.LocalAddr()) {
+		t.Fatal("client was not marked AUTH after reordered non-Initial packets")
+	}
+
+	// AUTH is sticky: a later short-header packet is sent to quic-go.
+	shortHeader := []byte{0x40, 0xaa, 0xbb, 0xcc, 0xdd, 0xee}
+	sendPolicyPacket(t, f, authClient, shortHeader)
+	if got := expectQueuedPacket(t, f.wrapped); !bytes.Equal(got, shortHeader) {
+		t.Fatalf("AUTH short-header mismatch: got %x, want %x", got, shortHeader)
+	}
+
+	// A coalesced Initial is classified from its declared Length while the raw
+	// datagram, including its Handshake suffix, reaches quic-go intact.
+	coalescedClient := newPolicyClient(t)
+	coalesced := append(authenticatedPolicyInitial(t, f), []byte{0xe0, 0, 0, 0, 1, 0}...)
+	sendPolicyPacket(t, f, coalescedClient, coalesced)
+	if got := expectQueuedPacket(t, f.wrapped); !bytes.Equal(got, coalesced) {
+		t.Fatalf("coalesced AUTH mismatch: got %d bytes, want %d", len(got), len(coalesced))
+	}
+
+	// Structurally complete Initials with a bad authentication tag retain
+	// relay semantics, and RELAY remains sticky for later short headers.
+	relayClient := newPolicyClient(t)
+	corrupt := authenticatedPolicyInitial(t, f)
+	corrupt[len(corrupt)-1] ^= 0xff
+	sendPolicyPacket(t, f, relayClient, corrupt)
+	if got := expectRelay(t, f.dest); !bytes.Equal(got, corrupt) {
+		t.Fatalf("corrupt Initial relay mismatch: got %d bytes, want %d", len(got), len(corrupt))
+	}
+	sendPolicyPacket(t, f, relayClient, shortHeader)
+	if got := expectRelay(t, f.dest); !bytes.Equal(got, shortHeader) {
+		t.Fatalf("sticky RELAY mismatch: got %x, want %x", got, shortHeader)
+	}
+}
+
+func TestObviousNonInitialV1NoAllocation(t *testing.T) {
+	packet := []byte{0x40, 0x11, 0x22, 0x33, 0x44, 0x55}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if !obviousNonInitialV1(packet) {
+			t.Fatal("short header was not classified as obvious non-Initial")
+		}
+	}); allocations != 0 {
+		t.Fatalf("obviousNonInitialV1 allocated %.2f objects per call, want 0", allocations)
+	}
+}
+
+func TestPrecheckCapacityStillDropsNonInitial(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fill func(*realityPrecheckPacketConn, net.Addr)
+	}{
+		{
+			name: "global limit",
+			fill: func(w *realityPrecheckPacketConn, _ net.Addr) {
+				for i := 0; i < precheckMaxStates; i++ {
+					w.states[strconv.Itoa(i)] = &precheckClientState{state: precheckPending, ip: "192.0.2.1"}
+				}
+			},
+		},
+		{
+			name: "per-IP limit",
+			fill: func(w *realityPrecheckPacketConn, addr net.Addr) {
+				w.perIP[addrIPKey(addr)] = precheckMaxPerIP
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPrecheckPolicyFixture(t)
+			addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 9), Port: 23456}
+			f.precheck.mu.Lock()
+			tc.fill(f.precheck, addr)
+			f.precheck.mu.Unlock()
+
+			// One obvious non-Initial and one Initial-shaped truncated packet
+			// both remain silent even though no state slot is available.
+			f.precheck.handlePacket([]byte{0x40, 1, 2, 3, 4, 5}, addr)
+			f.precheck.handlePacket([]byte{0xc0, 0, 0, 0, 1, 8, 0x11}, addr)
+			expectNoRelay(t, f.dest)
+
+			// A complete Initial whose AEAD tag is invalid still uses the
+			// capacity fallback and is relayed to dest.
+			corrupt := authenticatedPolicyInitial(t, f)
+			corrupt[len(corrupt)-1] ^= 0xff
+			f.precheck.handlePacket(corrupt, addr)
+			if got := expectRelay(t, f.dest); !bytes.Equal(got, corrupt) {
+				t.Fatalf("capacity relay mismatch: got %d bytes, want %d", len(got), len(corrupt))
+			}
+		})
 	}
 }
 
