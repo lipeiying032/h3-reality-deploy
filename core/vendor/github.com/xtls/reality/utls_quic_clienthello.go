@@ -96,6 +96,8 @@ func (c *Conn) makeUtlsClientHello() (*clientHelloMsg, *keySharePrivateKeys, err
 //     only negotiates TLS 1.3);
 //   - supported_versions is trimmed to GREASE + TLS 1.3;
 //   - the session-ticket extension is removed (fresh connection);
+//   - TCP compatibility extensions and the two explicit GREASE extensions are
+//     removed, matching Chrome's smaller QUIC-specific extension set;
 //   - ALPS/application_settings is kept (Chrome QUIC ClientHellos carry it)
 //     with supported_protocols set to the configured h3 ALPN, matching the
 //     real Chrome wire shape (the uTLS spec hardcodes "h2" for TCP);
@@ -104,9 +106,8 @@ func (c *Conn) makeUtlsClientHello() (*clientHelloMsg, *keySharePrivateKeys, err
 //     key_share, a position this function controls (the fingerprint factory
 //     has already shuffled the list).
 //
-// Everything else in the fingerprint — GREASE, compress_cert(brotli),
-// status_request, SCT, EMS, reneg, supported_groups, the key_share set — is
-// preserved.
+// Everything else in the fingerprint — compress_cert(brotli), GREASE-ECH,
+// supported_groups and the key_share set — is preserved.
 func quicifySpec(spec *utls.ClientHelloSpec, nextProtos []string, tp []byte) {
 	cipherSuites := make([]uint16, 0, 4)
 	for _, id := range spec.CipherSuites {
@@ -127,6 +128,15 @@ func quicifySpec(spec *utls.ClientHelloSpec, nextProtos []string, tp []byte) {
 		switch e := ext.(type) {
 		case *utls.SessionTicketExtension:
 			// Fresh QUIC connections send no session ticket.
+			continue
+		case *utls.ExtendedMasterSecretExtension,
+			*utls.RenegotiationInfoExtension,
+			*utls.StatusRequestExtension,
+			*utls.SupportedPointsExtension,
+			*utls.SCTExtension,
+			*utls.UtlsGREASEExtension:
+			// Chrome's QUIC ClientHello omits the legacy TCP compatibility
+			// extensions and doesn't send standalone GREASE extensions.
 			continue
 		case *utls.ApplicationSettingsExtension:
 			// Chrome sends ALPS over QUIC too, advertising the negotiated
