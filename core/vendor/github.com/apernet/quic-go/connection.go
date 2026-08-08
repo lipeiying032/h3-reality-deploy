@@ -3,6 +3,7 @@ package quic
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -390,12 +391,24 @@ func applyChromeTransportParameters(params *wire.TransportParameters, version pr
 	params.MaxBidiStreamNum = 100
 	params.MaxUniStreamNum = 103
 	params.MaxAckDelay = protocol.DefaultMaxAckDelay
+	params.AckDelayExponent = protocol.DefaultAckDelayExponent
 	params.ActiveConnectionIDLimit = protocol.DefaultActiveConnectionIDLimit
 	params.MaxDatagramFrameSize = 65536
 
-	versionBytes := make([]byte, 0, 8)
+	versionBytes := make([]byte, 0, 12)
 	versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
-	versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	var greaseVersion [4]byte
+	_, _ = cryptorand.Read(greaseVersion[:])
+	for i := range greaseVersion {
+		greaseVersion[i] = greaseVersion[i]&0xf0 | 0x0a
+	}
+	if greaseVersion[0]&0x10 == 0 {
+		versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+		versionBytes = append(versionBytes, greaseVersion[:]...)
+	} else {
+		versionBytes = append(versionBytes, greaseVersion[:]...)
+		versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	}
 	params.Additional = map[uint64][]byte{
 		0x11:   versionBytes,
 		0x3128: []byte("ORIG"),
