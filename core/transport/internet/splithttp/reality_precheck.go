@@ -342,7 +342,7 @@ func parseCryptoFrames(payload []byte) []cryptoFrag {
 		case 0x01: // PING
 			// no payload
 		case 0x02, 0x03: // ACK
-			n := skipAckFrame(payload[offset:])
+			n := skipAckFrame(payload[offset:], frameType == 0x03)
 			if n < 0 {
 				return frags
 			}
@@ -366,7 +366,7 @@ func parseCryptoFrames(payload []byte) []cryptoFrag {
 
 // skipAckFrame returns the number of bytes an ACK frame (frame type 0x02/0x03,
 // RFC 9000 Section 19.3) occupies, or -1 when the payload is truncated.
-func skipAckFrame(data []byte) int {
+func skipAckFrame(data []byte, hasECN bool) int {
 	offset := 0
 	read := func() (uint64, bool) {
 		value, n := readVarint(data[offset:])
@@ -400,6 +400,14 @@ func skipAckFrame(data []byte) int {
 		}
 		if _, ok := read(); !ok {
 			return -1
+		}
+	}
+	if hasECN {
+		// ECT(0), ECT(1), and ECN-CE counts.
+		for i := 0; i < 3; i++ {
+			if _, ok := read(); !ok {
+				return -1
+			}
 		}
 	}
 	return offset
