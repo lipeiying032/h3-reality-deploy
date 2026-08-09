@@ -580,6 +580,9 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		pl.length = ack.Length(v)
 		maxPacketSize -= pl.length
 	}
+	if shapeChromeFlight {
+		p.initialStream.prepareChromeChunks(maxPacketSize)
+	}
 	if hasRetransmission {
 		for {
 			frame := p.retransmissionQueue.GetFrame(encLevel, maxPacketSize, v)
@@ -616,6 +619,7 @@ func (p *packetPacker) maybeGetCryptoPacket(
 			cryptoFrames++
 		}
 		if shapeChromeFlight && cryptoFrames > 0 {
+			pl.frames, pl.length = p.splitChromeInitialCryptoFrames(pl.frames, pl.length, v)
 			hasMore := hasCryptoData()
 			pingCount := p.takeChromeInitialPings(hasMore)
 			pl.frames = p.interleaveChromeInitialPings(pl.frames, pingCount)
@@ -634,6 +638,32 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		}
 	}
 	return hdr, pl
+}
+
+func (p *packetPacker) splitChromeInitialCryptoFrames(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount) {
+	// Chrome independently attempts 2..10 random CRYPTO splits per Initial.
+	numFrames := chromeMinAddedCryptoFrames + p.rand.IntN(chromeMaxAddedCryptoFrames-chromeMinAddedCryptoFrames+1)
+	for range numFrames {
+		index := p.rand.IntN(len(frames))
+		frame, ok := frames[index].Frame.(*wire.CryptoFrame)
+		if !ok || len(frame.Data) <= 1 {
+			continue
+		}
+		oldLength := frame.Length(v)
+		firstLength := 1 + p.rand.IntN(len(frame.Data)-1)
+		second := &wire.CryptoFrame{
+			Offset: frame.Offset + protocol.ByteCount(firstLength),
+			Data:   frame.Data[firstLength:],
+		}
+		frame.Data = frame.Data[:firstLength]
+		frames = append(frames, ackhandler.Frame{Frame: second, Handler: frames[index].Handler})
+		length += frame.Length(v) + second.Length(v) - oldLength
+	}
+	return frames, length
 }
 
 func (p *packetPacker) takeChromeInitialPings(hasMore bool) int {
