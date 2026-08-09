@@ -260,11 +260,18 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
 		tlsConf,
 		conf,
-		0,
+		clientInitialPacketNumber(conf),
 		false,
 		use0RTT,
 		conf.Versions[0],
 	)
+}
+
+func clientInitialPacketNumber(conf *Config) protocol.PacketNumber {
+	if conf.ChromeTransportParameters {
+		return 1
+	}
+	return 0
 }
 
 func (t *Transport) doDial(

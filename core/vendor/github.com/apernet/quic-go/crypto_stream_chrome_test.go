@@ -10,6 +10,7 @@ import (
 	"github.com/apernet/quic-go/internal/handshake"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
+	"github.com/apernet/quic-go/internal/utils"
 	"github.com/apernet/quic-go/internal/wire"
 	"github.com/apernet/quic-go/quicvarint"
 )
@@ -233,6 +234,43 @@ func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 	}
 	if len(layouts) < 10 {
 		t.Errorf("only %d/20 PADDING length layouts were distinct", len(layouts))
+	}
+}
+
+func TestChromeInitialPacketNumberStartsAtOne(t *testing.T) {
+	initialPN := clientInitialPacketNumber(&Config{ChromeTransportParameters: true})
+	if initialPN != 1 {
+		t.Fatalf("Chrome Initial packet number = %d, want 1", initialPN)
+	}
+	if pn := clientInitialPacketNumber(&Config{}); pn != 0 {
+		t.Fatalf("default Initial packet number = %d, want 0", pn)
+	}
+
+	handler := ackhandler.NewSentPacketHandler(
+		initialPN,
+		1250,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		false,
+		false,
+		func(protocol.PacketNumber) {},
+		protocol.PerspectiveClient,
+		nil,
+		utils.DefaultLogger,
+	)
+	for want := protocol.PacketNumber(1); want <= 3; want++ {
+		peeked, _ := handler.PeekPacketNumber(protocol.EncryptionInitial)
+		if peeked != want {
+			t.Fatalf("peeked Initial packet number = %d, want %d", peeked, want)
+		}
+		if popped := handler.PopPacketNumber(protocol.EncryptionInitial); popped != want {
+			t.Fatalf("popped Initial packet number = %d, want %d", popped, want)
+		}
+	}
+	for _, level := range []protocol.EncryptionLevel{protocol.EncryptionHandshake, protocol.Encryption1RTT} {
+		if pn, _ := handler.PeekPacketNumber(level); pn != 0 {
+			t.Errorf("%s packet number = %d, want 0", level, pn)
+		}
 	}
 }
 
