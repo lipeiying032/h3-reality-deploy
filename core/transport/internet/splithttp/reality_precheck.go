@@ -367,28 +367,40 @@ func parseCryptoFrames(payload []byte) []cryptoFrag {
 // skipAckFrame returns the number of bytes an ACK frame (frame type 0x02/0x03,
 // RFC 9000 Section 19.3) occupies, or -1 when the payload is truncated.
 func skipAckFrame(data []byte) int {
-	if len(data) < 1 {
+	offset := 0
+	read := func() (uint64, bool) {
+		value, n := readVarint(data[offset:])
+		if n == 0 {
+			return 0, false
+		}
+		offset += n
+		return value, true
+	}
+	// Largest Acknowledged (varint)
+	if _, ok := read(); !ok {
 		return -1
 	}
-	offset := 0
-	// Largest Acknowledged (varint)
-	_, n := readVarint(data[offset:])
-	offset += n
 	// ACK Delay (varint)
-	_, n = readVarint(data[offset:])
-	offset += n
+	if _, ok := read(); !ok {
+		return -1
+	}
 	// ACK Range Count (varint)
-	count, n := readVarint(data[offset:])
-	offset += n
+	count, ok := read()
+	if !ok {
+		return -1
+	}
 	// First ACK Range (varint)
-	_, n = readVarint(data[offset:])
-	offset += n
+	if _, ok := read(); !ok {
+		return -1
+	}
 	// Additional ACK Ranges: each has gap + ack_range
 	for i := uint64(0); i < count; i++ {
-		_, n = readVarint(data[offset:])
-		offset += n
-		_, n = readVarint(data[offset:])
-		offset += n
+		if _, ok := read(); !ok {
+			return -1
+		}
+		if _, ok := read(); !ok {
+			return -1
+		}
 	}
 	return offset
 }

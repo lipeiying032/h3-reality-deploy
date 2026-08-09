@@ -320,6 +320,28 @@ func TestSkipAckFrameRangeCount(t *testing.T) {
 	}
 }
 
+func TestSkipAckFrameRejectsTruncation(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty"},
+		{name: "largest acknowledged", data: []byte{0x40}},
+		{name: "ACK delay", data: []byte{0}},
+		{name: "range count", data: []byte{0, 0}},
+		{name: "first range", data: []byte{0, 0, 0}},
+		{name: "additional gap", data: []byte{0, 0, 1, 0}},
+		{name: "additional range", data: []byte{0, 0, 1, 0, 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := skipAckFrame(test.data); got != -1 {
+				t.Fatalf("skipAckFrame() = %d, want -1", got)
+			}
+		})
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},
