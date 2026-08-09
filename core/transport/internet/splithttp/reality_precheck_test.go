@@ -439,6 +439,57 @@ func TestPrecheckReadBatchPreservesMetadata(t *testing.T) {
 	}
 }
 
+type scriptedBatchReader struct {
+	packets []queuedPacket
+	calls   int
+}
+
+func (r *scriptedBatchReader) ReadBatch(messages []ipv4.Message, _ int) (int, error) {
+	r.calls++
+	n := len(r.packets)
+	if n > len(messages) {
+		n = len(messages)
+	}
+	for i := 0; i < n; i++ {
+		fillBatchMessage(&messages[i], r.packets[i])
+	}
+	return n, nil
+}
+
+func TestPrecheckReadsUnderlyingPacketsInBatch(t *testing.T) {
+	packets := []queuedPacket{
+		cloneQueuedPacket([]byte("first"), []byte{1}, 2, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001}),
+		cloneQueuedPacket([]byte("second"), []byte{3}, 4, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002}),
+	}
+	reader := &scriptedBatchReader{packets: packets}
+	core := &realityPrecheckPacketConn{
+		batchConn: reader,
+		queue:     make(chan queuedPacket, len(packets)),
+		closed:    make(chan struct{}),
+		states:    make(map[string]*precheckClientState),
+		perIP:     make(map[string]int),
+	}
+	for _, packet := range packets {
+		core.states[packet.addr.String()] = &precheckClientState{state: precheckAuth}
+	}
+	messages := newPrecheckReadMessages()
+	n, err := core.readBatchOnce(messages)
+	if err != nil || n != len(packets) || reader.calls != 1 {
+		t.Fatalf("readBatchOnce() = (%d, %v), calls=%d", n, err, reader.calls)
+	}
+	for i, want := range packets {
+		messages[i].Buffers[0][0] = 0
+		messages[i].OOB[0] = 0
+		got, err := core.dequeue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.data, want.data) || !bytes.Equal(got.oob, want.oob) || got.flags != want.flags || got.addr.String() != want.addr.String() {
+			t.Fatalf("packet %d changed after batch buffer reuse: got %+v, want %+v", i, got, want)
+		}
+	}
+}
+
 type packetConnOnly struct {
 	net.PacketConn
 }
@@ -480,6 +531,9 @@ func TestPrecheckPreservesUDPCapabilitiesConditionally(t *testing.T) {
 	if _, ok := wrapped.(batchPacketConn); !ok {
 		t.Fatalf("*net.UDPConn wrapper lost batch capability: %T", wrapped)
 	}
+	if precheckCore(t, wrapped).batchConn == nil {
+		t.Fatal("concrete UDPConn did not enable kernel receive batching")
+	}
 	if raw, err := oob.SyscallConn(); err != nil || raw == nil {
 		t.Fatalf("SyscallConn() = (%v, %v)", raw, err)
 	}
@@ -512,6 +566,9 @@ func TestPrecheckPreservesUDPCapabilitiesConditionally(t *testing.T) {
 	defer basicWrapped.Close()
 	if _, ok := basicWrapped.(oobPacketConn); ok {
 		t.Fatalf("generic PacketConn incorrectly advertised OOB capabilities: %T", basicWrapped)
+	}
+	if precheckCore(t, basicWrapped).batchConn != nil {
+		t.Fatal("generic PacketConn incorrectly enabled raw-socket batching")
 	}
 }
 
