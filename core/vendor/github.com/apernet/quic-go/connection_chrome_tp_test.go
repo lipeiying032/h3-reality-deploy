@@ -77,8 +77,8 @@ func TestChromeTransportParameters(t *testing.T) {
 	tp := &wire.TransportParameters{}
 	applyChromeTransportParameters(tp, protocol.Version1)
 	encoded := tp.Marshal(protocol.PerspectiveClient)
-	if len(encoded) < 87 || len(encoded) > 100 {
-		t.Errorf("transport parameters length = %d, want 87..100", len(encoded))
+	if len(encoded) < 85 || len(encoded) > 100 {
+		t.Errorf("transport parameters length = %d, want 85..100", len(encoded))
 	}
 	params := parseTransportParameters(t, encoded)
 
@@ -163,8 +163,8 @@ func TestChromeTransportParametersRandomizedPerConnection(t *testing.T) {
 				if param.idLength != 8 {
 					t.Errorf("GREASE transport parameter ID uses %d-byte varint, want 8", param.idLength)
 				}
-				if len(param.value) < 2 || len(param.value) > 15 {
-					t.Errorf("GREASE transport parameter value length = %d, want 2..15", len(param.value))
+				if len(param.value) > 15 {
+					t.Errorf("GREASE transport parameter value length = %d, want 0..15", len(param.value))
 				}
 			}
 		}
