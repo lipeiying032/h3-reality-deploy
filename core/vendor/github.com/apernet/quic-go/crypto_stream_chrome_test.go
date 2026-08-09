@@ -168,6 +168,19 @@ func parseChromeTestPayload(payload []byte) (int, []int, error) {
 	return pings, paddingRuns, nil
 }
 
+func TestChromeInitialAppendsPingFrames(t *testing.T) {
+	cryptoFrame := ackhandler.Frame{Frame: &wire.CryptoFrame{Data: []byte{1}}}
+	frames := appendChromeInitialPings([]ackhandler.Frame{cryptoFrame}, 3)
+	if len(frames) != 4 || frames[0].Frame != cryptoFrame.Frame {
+		t.Fatalf("frame list = %#v, want CRYPTO followed by three PINGs", frames)
+	}
+	for i, frame := range frames[1:] {
+		if _, ok := frame.Frame.(*wire.PingFrame); !ok {
+			t.Errorf("appended frame %d = %T, want PING", i, frame.Frame)
+		}
+	}
+}
+
 func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 	crypto1 := &wire.CryptoFrame{Offset: 929, Data: []byte{2, 3}}
 	crypto2 := &wire.CryptoFrame{Offset: 1534, Data: []byte{4, 5}}
@@ -352,8 +365,10 @@ func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
 		if cryptoFrames < 3 || cryptoFrames > 3+2*chromeMaxAddedCryptoFrames {
 			t.Errorf("CRYPTO frame count = %d, want 3..%d", cryptoFrames, 3+2*chromeMaxAddedCryptoFrames)
 		}
-		if totalPings < chromeMinInitialPings || totalPings > chromeMaxInitialPings {
-			t.Errorf("PING total = %d, want %d..%d", totalPings, chromeMinInitialPings, chromeMaxInitialPings)
+		for packet, pings := range pingsPerPacket {
+			if pings < chromeMinInitialPingsPerPacket || pings > chromeMaxInitialPingsPerPacket {
+				t.Errorf("Initial packet %d PING count = %d, want %d..%d", packet, pings, chromeMinInitialPingsPerPacket, chromeMaxInitialPingsPerPacket)
+			}
 		}
 		if totalPaddingRuns < chromeMinInitialPaddingRuns || totalPaddingRuns > chromeMaxInitialPaddingRuns {
 			t.Errorf("PADDING run total = %d, want %d..%d", totalPaddingRuns, chromeMinInitialPaddingRuns, chromeMaxInitialPaddingRuns)
