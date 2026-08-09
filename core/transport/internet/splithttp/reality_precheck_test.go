@@ -246,13 +246,59 @@ func TestParseQUICInitialRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseQUICInitial: %v", err)
 	}
-	var buf []byte
+	var crypto cryptoReassembler
 	for _, frag := range parseCryptoFrames(parsed.Payload) {
-		buf = mergeCryptoFrag(buf, frag)
+		crypto.add(frag)
 	}
-	ch := extractClientHello(buf)
+	ch := extractClientHello(crypto.contiguous())
 	if ch == nil || string(ch) != string(hello) {
 		t.Fatalf("extractClientHello = %x, want %x", ch, hello)
+	}
+}
+
+func TestCryptoReassemblerWaitsForOutOfOrderGaps(t *testing.T) {
+	const fragmentCount = 12
+	hello := make([]byte, 196)
+	hello[0] = 0x01
+	hello[1] = byte((len(hello) - 4) >> 16)
+	hello[2] = byte((len(hello) - 4) >> 8)
+	hello[3] = byte(len(hello) - 4)
+	for i := 4; i < len(hello); i++ {
+		hello[i] = byte(i)
+	}
+
+	frags := make([]cryptoFrag, 0, fragmentCount)
+	for i := 0; i < fragmentCount; i++ {
+		start := i * len(hello) / fragmentCount
+		end := (i + 1) * len(hello) / fragmentCount
+		frags = append(frags, cryptoFrag{off: start, data: hello[start:end]})
+	}
+
+	// Put a tail fragment first and the middle gap last. Once fragment 0
+	// arrives, a length-only implementation sees a full-size zero-filled slice
+	// and incorrectly treats it as a complete ClientHello.
+	order := []int{11, 0, 8, 3, 10, 2, 9, 1, 4, 7, 5, 6}
+	var crypto cryptoReassembler
+	for i, index := range order {
+		crypto.add(frags[index])
+		got := extractClientHello(crypto.contiguous())
+		if i != len(order)-1 && got != nil {
+			t.Fatalf("ClientHello completed with fragment %d still missing", order[len(order)-1])
+		}
+		if i == len(order)-1 && !bytes.Equal(got, hello) {
+			t.Fatalf("reassembled ClientHello = %x, want %x", got, hello)
+		}
+	}
+}
+
+func TestCryptoReassemblerMergesOverlapAndDuplicates(t *testing.T) {
+	data := []byte("0123456789abcdef")
+	var crypto cryptoReassembler
+	crypto.add(cryptoFrag{off: 8, data: data[8:]})
+	crypto.add(cryptoFrag{off: 0, data: data[:10]})
+	crypto.add(cryptoFrag{off: 8, data: data[8:]})
+	if got := crypto.contiguous(); !bytes.Equal(got, data) {
+		t.Fatalf("contiguous CRYPTO data = %q, want %q", got, data)
 	}
 }
 
