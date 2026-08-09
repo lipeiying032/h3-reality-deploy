@@ -365,6 +365,45 @@ func TestParseCryptoFramesAfterACKECN(t *testing.T) {
 	}
 }
 
+func TestCloneQueuedPacketOwnsBuffers(t *testing.T) {
+	data := []byte{1, 2, 3}
+	oob := []byte{4, 5, 6}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+	packet := cloneQueuedPacket(data, oob, 7, addr)
+
+	data[0], oob[0], addr.Port = 9, 9, 8443
+	if !bytes.Equal(packet.data, []byte{1, 2, 3}) || !bytes.Equal(packet.oob, []byte{4, 5, 6}) {
+		t.Fatalf("queued packet aliases reusable read buffers: data=%v oob=%v", packet.data, packet.oob)
+	}
+	if packet.flags != 7 || packet.addr.String() != "127.0.0.1:443" {
+		t.Fatalf("queued packet metadata changed: flags=%d addr=%v", packet.flags, packet.addr)
+	}
+}
+
+func TestFlushPendingPreservesPacketMetadata(t *testing.T) {
+	c := &realityPrecheckPacketConn{
+		queue:  make(chan queuedPacket, 2),
+		closed: make(chan struct{}),
+	}
+	first := cloneQueuedPacket([]byte("first"), []byte{1}, 2, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001})
+	second := cloneQueuedPacket([]byte("second"), []byte{3}, 4, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002})
+	state := &precheckClientState{pending: []queuedPacket{first}, pendingBytes: len(first.data)}
+	c.flushPending(state, second, false)
+
+	for i, want := range []queuedPacket{first, second} {
+		got, err := c.dequeue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.data, want.data) || !bytes.Equal(got.oob, want.oob) || got.flags != want.flags || got.addr.String() != want.addr.String() {
+			t.Fatalf("packet %d metadata changed: got %+v, want %+v", i, got, want)
+		}
+	}
+	if state.pending != nil || state.pendingBytes != 0 {
+		t.Fatalf("pending state not released: packets=%d bytes=%d", len(state.pending), state.pendingBytes)
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},
