@@ -650,7 +650,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 					Conn.Close()
 					return nil, errors.New("failed to wrap QUIC precheck").Base(err)
 				}
-				if pc, ok := Conn.(*realityPrecheckPacketConn); ok {
+				if pc, ok := Conn.(interface{ IsAuthenticated(net.Addr) bool }); ok {
 					handler.handshakeAuthed = pc.IsAuthenticated
 				}
 			}

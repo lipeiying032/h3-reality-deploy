@@ -24,11 +24,13 @@ import (
 	"context"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -80,6 +82,20 @@ type queuedPacket struct {
 	addr  net.Addr
 }
 
+// oobPacketConn is the complete UDP surface quic-go needs for DF, ECN, GSO,
+// socket-buffer tuning, and batched reads. Only wrappers whose underlying
+// PacketConn satisfies this interface expose those capabilities.
+type oobPacketConn interface {
+	net.PacketConn
+	SyscallConn() (syscall.RawConn, error)
+	SetReadBuffer(int) error
+	SetWriteBuffer(int) error
+	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+}
+
+var _ oobPacketConn = (*net.UDPConn)(nil)
+
 func cloneQueuedPacket(data, oob []byte, flags int, addr net.Addr) queuedPacket {
 	return queuedPacket{
 		data:  append([]byte(nil), data...),
@@ -103,7 +119,24 @@ type realityPrecheckPacketConn struct {
 	queue     chan queuedPacket
 	closed    chan struct{}
 	closeOnce sync.Once
+	oobConn   oobPacketConn
 }
+
+// realityPrecheckOOBPacketConn conditionally restores the optimized UDP
+// method set without making generic PacketConn wrappers claim capabilities
+// they don't have. Its reads are still served exclusively from the AUTH
+// queue, so quic-go can never bypass the REALITY classifier.
+type realityPrecheckOOBPacketConn struct {
+	*realityPrecheckPacketConn
+}
+
+var _ oobPacketConn = (*realityPrecheckOOBPacketConn)(nil)
+
+type batchPacketConn interface {
+	ReadBatch([]ipv4.Message, int) (int, error)
+}
+
+var _ batchPacketConn = (*realityPrecheckOOBPacketConn)(nil)
 
 // newRealityPrecheckPacketConn wraps conn with the QUIC precheck + UDP relay.
 // It is a no-op (returns conn) when no Dest is configured. The returned conn
@@ -138,9 +171,14 @@ func newRealityPrecheckPacketConn(ctx context.Context, conn net.PacketConn, para
 		queue:      make(chan queuedPacket, precheckQueueSize),
 		closed:     make(chan struct{}),
 	}
+	var wrapped net.PacketConn = c
+	if oobConn, ok := conn.(oobPacketConn); ok {
+		c.oobConn = oobConn
+		wrapped = &realityPrecheckOOBPacketConn{realityPrecheckPacketConn: c}
+	}
 	go c.readLoop()
 	go c.reapLoop()
-	return c, nil
+	return wrapped, nil
 }
 
 // ReadFrom serves quic-go from the AUTH packet queue.
@@ -160,6 +198,81 @@ func (c *realityPrecheckPacketConn) dequeue() (queuedPacket, error) {
 	case <-c.closed:
 		return queuedPacket{}, net.ErrClosed
 	}
+}
+
+func (c *realityPrecheckOOBPacketConn) SyscallConn() (syscall.RawConn, error) {
+	return c.oobConn.SyscallConn()
+}
+
+func (c *realityPrecheckOOBPacketConn) SetReadBuffer(bytes int) error {
+	return c.oobConn.SetReadBuffer(bytes)
+}
+
+func (c *realityPrecheckOOBPacketConn) SetWriteBuffer(bytes int) error {
+	return c.oobConn.SetWriteBuffer(bytes)
+}
+
+// WriteMsgUDP forwards QUIC payload and ancillary data unchanged. In
+// particular, the UDP_SEGMENT control message is what enables Linux GSO.
+func (c *realityPrecheckOOBPacketConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
+	return c.oobConn.WriteMsgUDP(b, oob, addr)
+}
+
+// ReadMsgUDP serves only packets admitted by the REALITY precheck while
+// preserving ECN and packet-info ancillary data captured by the read loop.
+func (c *realityPrecheckOOBPacketConn) ReadMsgUDP(b, oob []byte) (int, int, int, *net.UDPAddr, error) {
+	packet, err := c.dequeue()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	addr, ok := packet.addr.(*net.UDPAddr)
+	if !ok {
+		return 0, 0, 0, nil, errors.New("REALITY precheck queued a non-UDP address")
+	}
+	return copy(b, packet.data), copy(oob, packet.oob), packet.flags, addr, nil
+}
+
+// ReadBatch blocks for one admitted packet, then drains the AUTH queue without
+// waiting. Implementing this method is essential: otherwise quic-go's
+// ipv4.PacketConn fallback unwraps SyscallConn and reads the raw socket,
+// bypassing the precheck entirely.
+func (c *realityPrecheckOOBPacketConn) ReadBatch(messages []ipv4.Message, _ int) (int, error) {
+	if len(messages) == 0 {
+		return 0, nil
+	}
+	first, err := c.dequeue()
+	if err != nil {
+		return 0, err
+	}
+	fillBatchMessage(&messages[0], first)
+	n := 1
+	for n < len(messages) {
+		select {
+		case packet := <-c.queue:
+			fillBatchMessage(&messages[n], packet)
+			n++
+		default:
+			return n, nil
+		}
+	}
+	return n, nil
+}
+
+func fillBatchMessage(message *ipv4.Message, packet queuedPacket) {
+	remaining := packet.data
+	written := 0
+	for _, buffer := range message.Buffers {
+		n := copy(buffer, remaining)
+		written += n
+		remaining = remaining[n:]
+		if len(remaining) == 0 {
+			break
+		}
+	}
+	message.N = written
+	message.NN = copy(message.OOB, packet.oob)
+	message.Flags = packet.flags
+	message.Addr = packet.addr
 }
 
 // WriteTo passes writes (quic-go replies to AUTH clients) straight through to
@@ -216,6 +329,10 @@ func (c *realityPrecheckPacketConn) relayTimeout() time.Duration {
 // readLoop owns the underlying conn's read side. Every datagram is copied
 // out before the buffer is reused.
 func (c *realityPrecheckPacketConn) readLoop() {
+	if c.oobConn != nil {
+		c.readLoopOOB()
+		return
+	}
 	buf := make([]byte, 65536)
 	for {
 		n, addr, err := c.PacketConn.ReadFrom(buf)
@@ -224,6 +341,19 @@ func (c *realityPrecheckPacketConn) readLoop() {
 			return
 		}
 		c.handlePacket(cloneQueuedPacket(buf[:n], nil, 0, addr))
+	}
+}
+
+func (c *realityPrecheckPacketConn) readLoopOOB() {
+	buf := make([]byte, 65536)
+	oob := make([]byte, 128)
+	for {
+		n, oobn, flags, addr, err := c.oobConn.ReadMsgUDP(buf, oob)
+		if err != nil {
+			c.Close()
+			return
+		}
+		c.handlePacket(cloneQueuedPacket(buf[:n], oob[:oobn], flags, addr))
 	}
 }
 

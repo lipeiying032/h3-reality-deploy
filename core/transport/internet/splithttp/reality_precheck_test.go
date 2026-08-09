@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/net/ipv4"
 )
 
 // buildTestClientHelloBody assembles a raw TLS 1.3 ClientHello handshake
@@ -404,6 +405,116 @@ func TestFlushPendingPreservesPacketMetadata(t *testing.T) {
 	}
 }
 
+func TestPrecheckReadBatchPreservesMetadata(t *testing.T) {
+	core := &realityPrecheckPacketConn{
+		queue:  make(chan queuedPacket, 2),
+		closed: make(chan struct{}),
+	}
+	wrapper := &realityPrecheckOOBPacketConn{realityPrecheckPacketConn: core}
+	wants := []queuedPacket{
+		cloneQueuedPacket([]byte("first"), []byte{1, 2}, 3, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001}),
+		cloneQueuedPacket([]byte("second"), []byte{4, 5}, 6, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002}),
+	}
+	for _, packet := range wants {
+		core.enqueue(packet)
+	}
+	messages := []ipv4.Message{
+		{Buffers: [][]byte{make([]byte, 2), make([]byte, 8)}, OOB: make([]byte, 8)},
+		{Buffers: [][]byte{make([]byte, 8)}, OOB: make([]byte, 8)},
+	}
+	n, err := wrapper.ReadBatch(messages, 0)
+	if err != nil || n != len(wants) {
+		t.Fatalf("ReadBatch() = (%d, %v), want (%d, nil)", n, err, len(wants))
+	}
+	for i, want := range wants {
+		var gotData []byte
+		for _, buffer := range messages[i].Buffers {
+			gotData = append(gotData, buffer...)
+		}
+		gotData = gotData[:messages[i].N]
+		if !bytes.Equal(gotData, want.data) || !bytes.Equal(messages[i].OOB[:messages[i].NN], want.oob) ||
+			messages[i].Flags != want.flags || messages[i].Addr.String() != want.addr.String() {
+			t.Fatalf("message %d metadata changed: %+v", i, messages[i])
+		}
+	}
+}
+
+type packetConnOnly struct {
+	net.PacketConn
+}
+
+func precheckCore(t *testing.T, conn net.PacketConn) *realityPrecheckPacketConn {
+	t.Helper()
+	switch conn := conn.(type) {
+	case *realityPrecheckPacketConn:
+		return conn
+	case *realityPrecheckOOBPacketConn:
+		return conn.realityPrecheckPacketConn
+	default:
+		t.Fatalf("unexpected precheck conn type %T", conn)
+		return nil
+	}
+}
+
+func TestPrecheckPreservesUDPCapabilitiesConditionally(t *testing.T) {
+	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destConn.Close()
+	params := &tls.RealityQUICParams{Dest: destConn.LocalAddr().String(), FallbackTimeout: time.Second}
+
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrapped.Close()
+	oob, ok := wrapped.(oobPacketConn)
+	if !ok {
+		t.Fatalf("*net.UDPConn wrapper lost OOB capabilities: %T", wrapped)
+	}
+	if _, ok := wrapped.(batchPacketConn); !ok {
+		t.Fatalf("*net.UDPConn wrapper lost batch capability: %T", wrapped)
+	}
+	if raw, err := oob.SyscallConn(); err != nil || raw == nil {
+		t.Fatalf("SyscallConn() = (%v, %v)", raw, err)
+	}
+	if err := oob.SetReadBuffer(256 * 1024); err != nil {
+		t.Fatalf("SetReadBuffer: %v", err)
+	}
+	if err := oob.SetWriteBuffer(256 * 1024); err != nil {
+		t.Fatalf("SetWriteBuffer: %v", err)
+	}
+	payload := []byte("forwarded through WriteMsgUDP")
+	if n, _, err := oob.WriteMsgUDP(payload, nil, destConn.LocalAddr().(*net.UDPAddr)); err != nil || n != len(payload) {
+		t.Fatalf("WriteMsgUDP() = (%d, %v), want (%d, nil)", n, err, len(payload))
+	}
+	buf := make([]byte, 64)
+	if err := destConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := destConn.ReadFromUDP(buf); err != nil || !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("forwarded WriteMsgUDP payload = %q, err=%v", buf[:n], err)
+	}
+
+	basicConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	basicWrapped, err := newRealityPrecheckPacketConn(context.Background(), &packetConnOnly{PacketConn: basicConn}, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer basicWrapped.Close()
+	if _, ok := basicWrapped.(oobPacketConn); ok {
+		t.Fatalf("generic PacketConn incorrectly advertised OOB capabilities: %T", basicWrapped)
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},
@@ -536,7 +647,11 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wrapped.Close()
-	w := wrapped.(*realityPrecheckPacketConn)
+	w := precheckCore(t, wrapped)
+	oobWrapped, ok := wrapped.(oobPacketConn)
+	if !ok {
+		t.Fatalf("UDP precheck wrapper has type %T, want OOB-capable wrapper", wrapped)
+	}
 
 	mkClient := func() (*net.UDPConn, net.Addr) {
 		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -624,7 +739,7 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 	ch2 := make(chan readResult, 1)
 	go func() {
 		rbuf := make([]byte, 2048)
-		n, _, err := wrapped.ReadFrom(rbuf)
+		n, _, _, _, err := oobWrapped.ReadMsgUDP(rbuf, nil)
 		data := make([]byte, n)
 		copy(data, rbuf[:n])
 		ch2 <- readResult{n, data, err}
@@ -710,7 +825,7 @@ func TestPrecheckSingleDestRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wrapped.Close()
-	w := wrapped.(*realityPrecheckPacketConn)
+	w := precheckCore(t, wrapped)
 
 	mkClient := func() (*net.UDPConn, net.Addr) {
 		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
