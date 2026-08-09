@@ -302,6 +302,24 @@ func TestCryptoReassemblerMergesOverlapAndDuplicates(t *testing.T) {
 	}
 }
 
+func TestSkipAckFrameRangeCount(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "no additional ranges", data: []byte{3, 0, 0, 3}},
+		{name: "one additional range", data: []byte{3, 0, 1, 1, 0, 0}},
+		{name: "two additional ranges", data: []byte{5, 0, 2, 1, 0, 0, 0, 0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := skipAckFrame(test.data); got != len(test.data) {
+				t.Fatalf("skipAckFrame() = %d, want %d", got, len(test.data))
+			}
+		})
+	}
+}
+
 func newTestVerifier(serverPriv []byte, shortIDs map[[8]byte]bool) *goreality.ClientHelloVerifier {
 	return &goreality.ClientHelloVerifier{Cfg: &goreality.Config{
 		ServerNames:  map[string]bool{"www.apple.com": true},

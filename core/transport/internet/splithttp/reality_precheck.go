@@ -384,7 +384,7 @@ func skipAckFrame(data []byte) int {
 	_, n = readVarint(data[offset:])
 	offset += n
 	// Additional ACK Ranges: each has gap + ack_range
-	for i := uint64(0); i < count-1; i++ {
+	for i := uint64(0); i < count; i++ {
 		_, n = readVarint(data[offset:])
 		offset += n
 		_, n = readVarint(data[offset:])
