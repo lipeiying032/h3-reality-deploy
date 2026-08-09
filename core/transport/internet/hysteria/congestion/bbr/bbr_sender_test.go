@@ -1,6 +1,7 @@
 package bbr
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/apernet/quic-go/congestion"
@@ -42,6 +43,17 @@ func TestSetMaxDatagramSizeClampsCongestionWindow(t *testing.T) {
 
 	require.Equal(t, b.minCongestionWindow, b.congestionWindow)
 	require.Equal(t, b.minCongestionWindow, b.recoveryWindow)
+}
+
+func TestSetMaxDatagramSizeDecrease(t *testing.T) {
+	const oldMaxDatagramSize = congestion.ByteCount(1280)
+	const newMaxDatagramSize = congestion.ByteCount(1250)
+
+	b := NewBbrSender(DefaultClock{}, oldMaxDatagramSize, ProfileStandard)
+
+	require.NotPanics(t, func() { b.SetMaxDatagramSize(newMaxDatagramSize) })
+	require.Equal(t, newMaxDatagramSize, b.maxDatagramSize)
+	require.Equal(t, int64(newMaxDatagramSize), reflect.ValueOf(b.pacer).Elem().FieldByName("maxDatagramSize").Int())
 }
 
 func TestNewBbrSenderAppliesProfiles(t *testing.T) {

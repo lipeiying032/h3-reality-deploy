@@ -490,9 +490,6 @@ func (b *bbrSender) SetMaxDatagramSize(s congestion.ByteCount) {
 	if b.debug {
 		b.debugPrint("Max Datagram Size: %d", s)
 	}
-	if s < b.maxDatagramSize {
-		panic(fmt.Sprintf("congestion BUG: decreased max datagram size from %d to %d", b.maxDatagramSize, s))
-	}
 	oldMinCongestionWindow := b.minCongestionWindow
 	oldInitialCongestionWindow := b.initialCongestionWindow
 	b.rescalePacketSizedWindows(s)
