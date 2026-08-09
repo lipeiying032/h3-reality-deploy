@@ -77,8 +77,8 @@ func TestChromeTransportParameters(t *testing.T) {
 	tp := &wire.TransportParameters{}
 	applyChromeTransportParameters(tp, protocol.Version1)
 	encoded := tp.Marshal(protocol.PerspectiveClient)
-	if len(encoded) < 85 || len(encoded) > 98 {
-		t.Errorf("transport parameters length = %d, want 85..98", len(encoded))
+	if len(encoded) < 87 || len(encoded) > 100 {
+		t.Errorf("transport parameters length = %d, want 87..100", len(encoded))
 	}
 	params := parseTransportParameters(t, encoded)
 
@@ -127,8 +127,12 @@ func TestChromeTransportParameters(t *testing.T) {
 	} else {
 		t.Errorf("available versions = [%#x %#x], v1 missing", available1, available2)
 	}
-	if !bytes.Equal(params[0x3128], []byte("ORIG")) {
-		t.Errorf("google_connection_options = %q, want ORIG", params[0x3128])
+	googleVersion := params[0x4752]
+	if len(googleVersion) != 4 || binary.BigEndian.Uint32(googleVersion) != uint32(protocol.Version1) {
+		t.Errorf("google_quic_version = %x, want 00000001", googleVersion)
+	}
+	if _, ok := params[0x3128]; ok {
+		t.Error("google_connection_options 0x3128 must be omitted")
 	}
 	if tp.MaxIdleTimeout != 30*time.Second {
 		t.Errorf("MaxIdleTimeout = %s, want 30s", tp.MaxIdleTimeout)
