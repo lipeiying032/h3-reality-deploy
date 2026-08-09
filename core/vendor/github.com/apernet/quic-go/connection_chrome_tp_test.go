@@ -77,8 +77,8 @@ func TestChromeTransportParameters(t *testing.T) {
 	tp := &wire.TransportParameters{}
 	applyChromeTransportParameters(tp, protocol.Version1)
 	encoded := tp.Marshal(protocol.PerspectiveClient)
-	if len(encoded) < 82 || len(encoded) > 95 {
-		t.Errorf("transport parameters length = %d, want 82..95", len(encoded))
+	if len(encoded) < 85 || len(encoded) > 98 {
+		t.Errorf("transport parameters length = %d, want 85..98", len(encoded))
 	}
 	params := parseTransportParameters(t, encoded)
 
@@ -104,9 +104,12 @@ func TestChromeTransportParameters(t *testing.T) {
 	if _, ok := params[0xe]; ok {
 		t.Error("active_connection_id_limit (0xe) must be omitted")
 	}
-	versionInfo := params[0x11]
+	versionInfo := params[0xff73db]
 	if len(versionInfo) != 12 {
 		t.Fatalf("version_information length = %d, want 12", len(versionInfo))
+	}
+	if _, ok := params[0x11]; ok {
+		t.Error("final version_information codepoint 0x11 must be omitted")
 	}
 	if chosen := binary.BigEndian.Uint32(versionInfo[:4]); chosen != uint32(protocol.Version1) {
 		t.Errorf("chosen version = %#x, want v1", chosen)
