@@ -259,9 +259,16 @@ func TestChromeInitialPacketNumberStartsAtOne(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	for want := protocol.PacketNumber(1); want <= 3; want++ {
-		peeked, _ := handler.PeekPacketNumber(protocol.EncryptionInitial)
+		peeked, pnLen := handler.PeekPacketNumber(protocol.EncryptionInitial)
 		if peeked != want {
 			t.Fatalf("peeked Initial packet number = %d, want %d", peeked, want)
+		}
+		wantLen := protocol.PacketNumberLen2
+		if want == 1 {
+			wantLen = protocol.PacketNumberLen1
+		}
+		if pnLen != wantLen {
+			t.Errorf("Initial packet number %d uses %d bytes, want %d", want, pnLen, wantLen)
 		}
 		if popped := handler.PopPacketNumber(protocol.EncryptionInitial); popped != want {
 			t.Fatalf("popped Initial packet number = %d, want %d", popped, want)
