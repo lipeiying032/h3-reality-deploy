@@ -244,6 +244,65 @@ func TestChromeInitialSpreadsPaddingAndShufflesFrames(t *testing.T) {
 	}
 }
 
+func TestChromeInitialCryptoSplitStopsAtPaddingBudget(t *testing.T) {
+	frame := &wire.CryptoFrame{Data: make([]byte, 100)}
+	frames := []ackhandler.Frame{{Frame: frame}}
+	length := frame.Length(protocol.Version1)
+	packer := &packetPacker{rand: *rand.New(rand.NewPCG(1, 2))}
+	gotFrames, gotLength, remaining := packer.splitChromeInitialCryptoFrames(frames, length, 4, protocol.Version1)
+	if len(gotFrames) != 1 || gotLength != length || remaining != 4 {
+		t.Fatalf("4-byte budget produced %d frames, length %d, remaining %d", len(gotFrames), gotLength, remaining)
+	}
+}
+
+func TestChromeInitialChaosFitsNearFullPacket(t *testing.T) {
+	clientHello := newChromeTestClientHello(1204)
+	stream := newInitialCryptoStream(true, true)
+	if _, err := stream.Write(clientHello); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := protocol.GenerateConnectionID(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packer := newPacketPacker(
+		protocol.ConnectionID{},
+		func() protocol.ConnectionID { return dest },
+		stream,
+		newCryptoStream(),
+		&chromeTestPacketNumberManager{},
+		newRetransmissionQueue(),
+		chromeTestSealingManager{},
+		nil,
+		chromeTestAckSource{},
+		nil,
+		protocol.PerspectiveClient,
+	)
+	packet, err := packer.PackCoalescedPacket(false, 1250, monotime.Now(), protocol.Version1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet == nil {
+		t.Fatal("near-full ClientHello produced no Initial")
+	}
+	defer packet.buffer.Release()
+	if len(packet.buffer.Data) != 1250 {
+		t.Fatalf("Initial UDP payload = %d, want 1250", len(packet.buffer.Data))
+	}
+	reconstructed := make([]byte, len(clientHello))
+	for _, frame := range packet.longHdrPackets[0].frames {
+		if cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame); ok {
+			copy(reconstructed[cryptoFrame.Offset:], cryptoFrame.Data)
+		}
+	}
+	if !bytes.Equal(reconstructed, clientHello) {
+		t.Fatal("near-full ClientHello did not reassemble")
+	}
+	if stream.HasData() {
+		t.Fatal("near-full ClientHello unexpectedly required another Initial")
+	}
+}
+
 func TestChromeInitialPacketNumberStartsAtOne(t *testing.T) {
 	initialPN := clientInitialPacketNumber(&Config{ChromeTransportParameters: true})
 	if initialPN != 1 {
