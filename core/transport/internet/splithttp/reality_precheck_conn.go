@@ -69,13 +69,24 @@ type precheckClientState struct {
 	// dropped (no dest configured).
 	relayDest    []*net.UDPAddr
 	crypto       cryptoReassembler
-	pending      [][]byte // raw datagrams held until the decision is made
+	pending      []queuedPacket // raw datagrams held until the decision is made
 	pendingBytes int
 }
 
 type queuedPacket struct {
-	data []byte
-	addr net.Addr
+	data  []byte
+	oob   []byte
+	flags int
+	addr  net.Addr
+}
+
+func cloneQueuedPacket(data, oob []byte, flags int, addr net.Addr) queuedPacket {
+	return queuedPacket{
+		data:  append([]byte(nil), data...),
+		oob:   append([]byte(nil), oob...),
+		flags: flags,
+		addr:  cloneAddr(addr),
+	}
 }
 
 type realityPrecheckPacketConn struct {
@@ -134,12 +145,20 @@ func newRealityPrecheckPacketConn(ctx context.Context, conn net.PacketConn, para
 
 // ReadFrom serves quic-go from the AUTH packet queue.
 func (c *realityPrecheckPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	qp, err := c.dequeue()
+	if err != nil {
+		return 0, nil, err
+	}
+	n := copy(p, qp.data)
+	return n, qp.addr, nil
+}
+
+func (c *realityPrecheckPacketConn) dequeue() (queuedPacket, error) {
 	select {
 	case qp := <-c.queue:
-		n := copy(p, qp.data)
-		return n, qp.addr, nil
+		return qp, nil
 	case <-c.closed:
-		return 0, nil, net.ErrClosed
+		return queuedPacket{}, net.ErrClosed
 	}
 }
 
@@ -204,13 +223,12 @@ func (c *realityPrecheckPacketConn) readLoop() {
 			c.Close()
 			return
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		c.handlePacket(data, addr)
+		c.handlePacket(cloneQueuedPacket(buf[:n], nil, 0, addr))
 	}
 }
 
-func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) handlePacket(packet queuedPacket) {
+	data, addr := packet.data, packet.addr
 	key := addr.String()
 	c.mu.Lock()
 	st := c.states[key]
@@ -232,11 +250,11 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 
 	switch state {
 	case precheckAuth:
-		c.enqueue(data, addr)
+		c.enqueue(packet)
 	case precheckRelay:
 		c.relay.relayClientToDest(addr, st.relayDest, data)
 	default:
-		c.decidePending(st, data, addr)
+		c.decidePending(st, packet)
 	}
 }
 
@@ -244,13 +262,14 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 // reassembled, then either keeps waiting (buffering the datagram), marks the
 // client AUTH (flushing everything to the quic-go queue) or marks it RELAY
 // (flushing everything to the dest).
-func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, packet queuedPacket) {
+	data, addr := packet.data, packet.addr
 	work := make([]byte, len(data))
 	copy(work, data)
 	pkt, err := parseQUICInitial(work)
 	if err != nil {
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (unparseable: ", err, ")")
-		c.relayDecision(st, data, addr)
+		c.relayDecision(st, packet)
 		return
 	}
 	for _, frag := range parseCryptoFrames(pkt.Payload) {
@@ -262,30 +281,31 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 		if len(st.pending) >= precheckMaxPendingPkts || st.pendingBytes >= precheckMaxPendingBytes ||
 			time.Since(st.firstSeen) > c.relayTimeout() {
 			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello incomplete)")
-			c.relayDecision(st, data, addr)
+			c.relayDecision(st, packet)
 			return
 		}
-		st.pending = append(st.pending, data)
+		st.pending = append(st.pending, packet)
 		st.pendingBytes += len(data)
 		return
 	}
 	if c.verifier == nil || c.verifier.Verify(hello) != nil {
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String())
-		c.relayDecision(st, data, addr)
+		c.relayDecision(st, packet)
 		return
 	}
 	errors.LogInfo(c.ctx, "REALITY: QUIC precheck AUTH for ", addr.String())
 	c.mu.Lock()
 	st.state = precheckAuth
 	c.mu.Unlock()
-	c.flushPending(st, data, addr, false)
+	c.flushPending(st, packet, false)
 }
 
 // relayDecision marks the client RELAY, pins the flow's destination (the
 // single configured dest, nil = drop) and forwards all buffered datagrams
 // plus the current one to that destination (no packet is dropped for a
 // configured destination).
-func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, packet queuedPacket) {
+	addr := packet.addr
 	target := c.relay.dest
 	c.mu.Lock()
 	st.state = precheckRelay
@@ -297,35 +317,34 @@ func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, data 
 		st.pendingBytes = 0
 		return
 	}
-	c.flushPending(st, data, addr, true)
+	c.flushPending(st, packet, true)
 }
 
 // flushPending delivers the buffered datagrams (in arrival order) plus the
 // current one either to the quic-go queue (toRelay=false) or to the relay
 // (toRelay=true).
-func (c *realityPrecheckPacketConn) flushPending(st *precheckClientState, data []byte, addr net.Addr, toRelay bool) {
+func (c *realityPrecheckPacketConn) flushPending(st *precheckClientState, packet queuedPacket, toRelay bool) {
 	for _, p := range st.pending {
 		if toRelay {
-			c.relay.relayClientToDest(addr, st.relayDest, p)
+			c.relay.relayClientToDest(p.addr, st.relayDest, p.data)
 		} else {
-			c.enqueue(p, addr)
+			c.enqueue(p)
 		}
 	}
 	st.pending = nil
 	st.pendingBytes = 0
 	if toRelay {
-		c.relay.relayClientToDest(addr, st.relayDest, data)
+		c.relay.relayClientToDest(packet.addr, st.relayDest, packet.data)
 	} else {
-		c.enqueue(data, addr)
+		c.enqueue(packet)
 	}
 }
 
 // enqueue hands one AUTH datagram to quic-go. When the queue is full the
 // datagram is dropped rather than blocking the read loop.
-func (c *realityPrecheckPacketConn) enqueue(data []byte, addr net.Addr) {
-	qp := queuedPacket{data: data, addr: cloneAddr(addr)}
+func (c *realityPrecheckPacketConn) enqueue(packet queuedPacket) {
 	select {
-	case c.queue <- qp:
+	case c.queue <- packet:
 	case <-c.closed:
 	default:
 	}
