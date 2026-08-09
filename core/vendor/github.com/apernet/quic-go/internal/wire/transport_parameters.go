@@ -507,10 +507,12 @@ func appendGREASETransportParameter(b []byte, chromeStyle bool) []byte {
 	const maxMultiplier = ((uint64(1) << 62) - 1 - 27) / 31
 	multiplier := minMultiplier + binary.BigEndian.Uint64(random[:8])%(maxMultiplier-minMultiplier+1)
 	b = quicvarint.Append(b, 27+31*multiplier)
-	length := 2 + random[8]%14
+	length := chromeGREASEValueLength(random[8])
 	b = quicvarint.Append(b, uint64(length))
 	return append(b, random[9:9+length]...)
 }
+
+func chromeGREASEValueLength(randomByte byte) byte { return randomByte % 16 }
 
 func shuffleTransportParameters(b []byte) []byte {
 	remaining := b
