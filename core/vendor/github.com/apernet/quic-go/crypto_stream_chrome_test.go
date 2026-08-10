@@ -130,6 +130,38 @@ func TestChromeInitialCryptoBaseLayoutRandomizesAndReassembles(t *testing.T) {
 	}
 }
 
+func TestChromeInitialCryptoContiguousForPrecheck(t *testing.T) {
+	clientHello := newChromeTestClientHello(1793)
+	stream := newInitialCryptoStream(true, true)
+	stream.chromeContiguous = true
+	if _, err := stream.Write(clientHello); err != nil {
+		t.Fatal(err)
+	}
+	stream.prepareChromeChunks(1215)
+
+	if len(stream.chromeChunks) != 2 {
+		t.Fatalf("base CRYPTO chunk count = %d, want 2", len(stream.chromeChunks))
+	}
+	if stream.chromeChunks[0].start != 0 || stream.chromeChunks[0].end >= protocol.ByteCount(len(clientHello)) {
+		t.Fatalf("first CRYPTO chunk = [%d,%d), want a proper prefix", stream.chromeChunks[0].start, stream.chromeChunks[0].end)
+	}
+	if stream.chromeChunks[1].start != stream.chromeChunks[0].end || stream.chromeChunks[1].end != protocol.ByteCount(len(clientHello)) {
+		t.Fatalf("second CRYPTO chunk = [%d,%d), want [%d,%d)", stream.chromeChunks[1].start, stream.chromeChunks[1].end, stream.chromeChunks[0].end, len(clientHello))
+	}
+
+	reconstructed := make([]byte, len(clientHello))
+	for stream.HasData() {
+		frame := stream.PopCryptoFrame(2000)
+		if frame == nil {
+			t.Fatal("prepared CRYPTO frame did not fit")
+		}
+		copy(reconstructed[frame.Offset:], frame.Data)
+	}
+	if !bytes.Equal(reconstructed, clientHello) {
+		t.Fatal("contiguous base CRYPTO chunks did not reconstruct the ClientHello")
+	}
+}
+
 func parseChromeTestPayload(payload []byte) (int, []int, error) {
 	var pings int
 	var paddingRuns []int

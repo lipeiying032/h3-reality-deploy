@@ -113,14 +113,15 @@ type clientHelloCut struct {
 type initialCryptoStream struct {
 	baseCryptoStream
 
-	scramble        bool
-	chrome          bool
-	chromeDone      bool
-	chromeChunks    []clientHelloCut
-	chromeChunkNext int
-	chromeRand      *rand.Rand
-	end             protocol.ByteCount
-	cuts            [2]clientHelloCut
+	scramble         bool
+	chrome           bool
+	chromeContiguous bool
+	chromeDone       bool
+	chromeChunks     []clientHelloCut
+	chromeChunkNext  int
+	chromeRand       *rand.Rand
+	end              protocol.ByteCount
+	cuts             [2]clientHelloCut
 }
 
 func newInitialCryptoStream(isClient, chrome bool) *initialCryptoStream {
@@ -333,6 +334,23 @@ func (s *initialCryptoStream) prepareChromeChunks(bytesFree protocol.ByteCount) 
 	numPackets := (s.end + firstPacketOccupiedSpace + maxDataOtherPackets - 1) / maxDataOtherPackets
 	dataInOtherPackets := (s.end + firstPacketOccupiedSpace + numPackets - 1) / numPackets
 	dataInFirstPacket := dataInOtherPackets - firstPacketOccupiedSpace
+	if s.chromeContiguous {
+		// Some REALITY servers precheck the ClientHello before handing the
+		// datagrams to QUIC, and older prechecks grow their buffer to the largest
+		// CRYPTO offset without recording holes. Sending Chrome's usual head +
+		// tail first would make that buffer look complete too early. Keep each
+		// base chunk contiguous so those peers wait for the remaining Initial,
+		// while the packet packer still applies Chrome's per-packet split, PING,
+		// padding and shuffle behavior.
+		firstEnd := min(dataInFirstPacket, s.end)
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: firstEnd})
+		for start := firstEnd; start < s.end; {
+			end := min(start+dataInOtherPackets, s.end)
+			s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: start, end: end})
+			start = end
+		}
+		return
+	}
 
 	// Put the beginning and tail in the first Initial and the intervening bytes
 	// in later Initials. Chrome randomizes the first cut over [55, 86].

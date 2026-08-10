@@ -244,6 +244,11 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if id := tls.GetFingerprint(realityConfig.Fingerprint); id != nil {
 					quicFactoryTemplate.UtlsClientHelloID = id
 					quicConfig.ChromeTransportParameters = true
+					// The deployed REALITY precheck must see a contiguous CRYPTO
+					// prefix before it authenticates the ClientHello. Keep Chrome's
+					// per-Initial chaos shaping, but don't put the ClientHello tail
+					// ahead of an unseen middle range.
+					quicConfig.ChromeInitialCryptoContiguous = true
 					quicConfig.InitialDCIDLength = 8
 					quicConfig.InitialStreamReceiveWindow = 6 * 1024 * 1024
 					quicConfig.InitialConnectionReceiveWindow = 15 * 1024 * 1024

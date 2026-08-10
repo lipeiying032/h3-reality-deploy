@@ -104,6 +104,11 @@ type Config struct {
 	// ChromeTransportParameters applies Chrome's QUIC client transport
 	// parameter template. It only affects parameters sent by clients.
 	ChromeTransportParameters bool
+	// ChromeInitialCryptoContiguous keeps the base ClientHello CRYPTO ranges
+	// contiguous across Initial packets. This is required when a peer performs
+	// a pre-handshake ClientHello check without tracking gaps between ranges.
+	// It only affects Chrome-shaped client Initial packets.
+	ChromeInitialCryptoContiguous bool
 	// InitialDCIDLength pins the client's first destination connection ID
 	// length. Zero keeps the randomized 8–20 byte default.
 	InitialDCIDLength int
