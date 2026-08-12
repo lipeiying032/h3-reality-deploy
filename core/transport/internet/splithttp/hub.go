@@ -681,6 +681,16 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			MaxIncomingStreams:             quicParams.MaxIncomingStreams,
 			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
 		}
+		if r := reality.ConfigFromStreamSettings(streamSettings); r != nil {
+			wireProfile, profileErr := parseH3WireProfile(r.GetRealityQUICParams())
+			if profileErr != nil {
+				Conn.Close()
+				return nil, errors.New("invalid REALITY HTTP/3 wire profile").Base(profileErr)
+			}
+			if wireProfile.initialPacketSize != 0 {
+				quicConfig.InitialPacketSize = wireProfile.initialPacketSize
+			}
+		}
 
 		// C-gamma REALITY over QUIC: the handshake carries no REALITY payload.
 		// The TLS state machine is the standard crypto/tls (stock ClientHello:
