@@ -247,122 +247,141 @@ func TestParseQUICInitialRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseQUICInitial: %v", err)
 	}
-	var crypto cryptoReassembler
-	for _, frag := range parseCryptoFrames(parsed.Payload) {
-		crypto.add(frag)
+	frags, err := parseCryptoFrames(parsed.Payload)
+	if err != nil {
+		t.Fatalf("parseCryptoFrames: %v", err)
 	}
-	ch := extractClientHello(crypto.contiguous())
+	var reassembler cryptoReassembler
+	for _, frag := range frags {
+		if err := reassembler.add(frag); err != nil {
+			t.Fatalf("add CRYPTO fragment: %v", err)
+		}
+	}
+	ch, err := reassembler.clientHello()
+	if err != nil {
+		t.Fatalf("clientHello: %v", err)
+	}
 	if ch == nil || string(ch) != string(hello) {
-		t.Fatalf("extractClientHello = %x, want %x", ch, hello)
+		t.Fatalf("clientHello = %x, want %x", ch, hello)
 	}
 }
 
-func TestCryptoReassemblerWaitsForOutOfOrderGaps(t *testing.T) {
-	const fragmentCount = 12
-	hello := make([]byte, 196)
+func TestParseQUICInitialHonorsDeclaredLength(t *testing.T) {
+	hello := []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc}
+	pkt := append(testInitialPacket(t, hello), []byte{0xde, 0xad, 0xbe, 0xef}...)
+	if _, err := parseQUICInitial(pkt); err != nil {
+		t.Fatalf("coalesced/trailing bytes changed Initial AEAD input: %v", err)
+	}
+
+	truncated := testInitialPacket(t, hello)
+	truncated = truncated[:len(truncated)-1]
+	if _, err := parseQUICInitial(truncated); err == nil {
+		t.Fatal("truncated declared Initial length unexpectedly parsed")
+	}
+}
+
+func TestCryptoReassemblerHeadTailThenMiddle(t *testing.T) {
+	hello := make([]byte, 180)
 	hello[0] = 0x01
-	hello[1] = byte((len(hello) - 4) >> 16)
-	hello[2] = byte((len(hello) - 4) >> 8)
-	hello[3] = byte(len(hello) - 4)
+	hello[1], hello[2], hello[3] = 0, 0, byte(len(hello)-4)
 	for i := 4; i < len(hello); i++ {
 		hello[i] = byte(i)
 	}
 
-	frags := make([]cryptoFrag, 0, fragmentCount)
-	for i := 0; i < fragmentCount; i++ {
-		start := i * len(hello) / fragmentCount
-		end := (i + 1) * len(hello) / fragmentCount
-		frags = append(frags, cryptoFrag{off: start, data: hello[start:end]})
+	var r cryptoReassembler
+	for _, frag := range []cryptoFrag{
+		{off: 0, data: hello[:60]},
+		{off: 120, data: hello[120:]},
+	} {
+		if err := r.add(frag); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	// Put a tail fragment first and the middle gap last. Once fragment 0
-	// arrives, a length-only implementation sees a full-size zero-filled slice
-	// and incorrectly treats it as a complete ClientHello.
-	order := []int{11, 0, 8, 3, 10, 2, 9, 1, 4, 7, 5, 6}
-	var crypto cryptoReassembler
-	for i, index := range order {
-		crypto.add(frags[index])
-		got := extractClientHello(crypto.contiguous())
-		if i != len(order)-1 && got != nil {
-			t.Fatalf("ClientHello completed with fragment %d still missing", order[len(order)-1])
-		}
-		if i == len(order)-1 && !bytes.Equal(got, hello) {
-			t.Fatalf("reassembled ClientHello = %x, want %x", got, hello)
-		}
+	if got, err := r.clientHello(); err != nil || got != nil {
+		t.Fatalf("sparse head+tail = %x, %v; want incomplete", got, err)
+	}
+	if len(r.ranges) != 2 || len(r.ranges[0].data) != 60 || len(r.ranges[1].data) != 60 {
+		t.Fatalf("ranges = %#v; sparse tail must not zero-fill the middle", r.ranges)
+	}
+	if err := r.add(cryptoFrag{off: 60, data: hello[60:120]}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.clientHello()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, hello) {
+		t.Fatalf("reassembled ClientHello differs: got %x want %x", got, hello)
+	}
+	if len(r.ranges) != 1 || r.ranges[0].off != 0 {
+		t.Fatalf("ranges were not coalesced: %#v", r.ranges)
 	}
 }
 
-func TestCryptoReassemblerMergesOverlapAndDuplicates(t *testing.T) {
-	data := []byte("0123456789abcdef")
-	var crypto cryptoReassembler
-	crypto.add(cryptoFrag{off: 8, data: data[8:]})
-	crypto.add(cryptoFrag{off: 0, data: data[:10]})
-	crypto.add(cryptoFrag{off: 8, data: data[8:]})
-	if got := crypto.contiguous(); !bytes.Equal(got, data) {
-		t.Fatalf("contiguous CRYPTO data = %q, want %q", got, data)
+func TestCryptoReassemblerOverlapAndLimits(t *testing.T) {
+	var r cryptoReassembler
+	if err := r.add(cryptoFrag{off: 10, data: []byte{1, 2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.add(cryptoFrag{off: 11, data: []byte{2, 3}}); err != nil {
+		t.Fatalf("identical overlap rejected: %v", err)
+	}
+	if err := r.add(cryptoFrag{off: 12, data: []byte{9}}); err == nil {
+		t.Fatal("conflicting overlap accepted")
+	}
+
+	var sparse cryptoReassembler
+	if err := sparse.add(cryptoFrag{off: precheckMaxCryptoBytes - 3, data: []byte{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sparse.ranges) != 1 || len(sparse.ranges[0].data) != 3 {
+		t.Fatalf("sparse range allocated unexpected data: %#v", sparse.ranges)
+	}
+	if err := sparse.add(cryptoFrag{off: precheckMaxCryptoBytes, data: []byte{1}}); err == nil {
+		t.Fatal("out-of-range CRYPTO fragment accepted")
 	}
 }
 
-func TestSkipAckFrameRangeCount(t *testing.T) {
+func TestSkipAckFrame(t *testing.T) {
 	tests := []struct {
-		name string
-		data []byte
+		name   string
+		data   []byte
+		hasECN bool
+		want   int
 	}{
-		{name: "no additional ranges", data: []byte{3, 0, 0, 3}},
-		{name: "one additional range", data: []byte{3, 0, 1, 1, 0, 0}},
-		{name: "two additional ranges", data: []byte{5, 0, 2, 1, 0, 0, 0, 0}},
+		{name: "no ranges", data: []byte{0, 0, 0, 0}, want: 4},
+		{name: "one extra range", data: []byte{3, 0, 1, 0, 0, 0}, want: 6},
+		{name: "ecn", data: []byte{3, 0, 0, 0, 1, 2, 3}, hasECN: true, want: 7},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := skipAckFrame(test.data, false); got != len(test.data) {
-				t.Fatalf("skipAckFrame() = %d, want %d", got, len(test.data))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := skipAckFrame(tc.data, tc.hasECN)
+			if err != nil || got != tc.want {
+				t.Fatalf("skipAckFrame = %d, %v; want %d", got, err, tc.want)
 			}
 		})
 	}
-}
-
-func TestSkipAckFrameRejectsTruncation(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-	}{
-		{name: "empty"},
-		{name: "largest acknowledged", data: []byte{0x40}},
-		{name: "ACK delay", data: []byte{0}},
-		{name: "range count", data: []byte{0, 0}},
-		{name: "first range", data: []byte{0, 0, 0}},
-		{name: "additional gap", data: []byte{0, 0, 1, 0}},
-		{name: "additional range", data: []byte{0, 0, 1, 0, 0}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := skipAckFrame(test.data, false); got != -1 {
-				t.Fatalf("skipAckFrame() = %d, want -1", got)
-			}
-		})
-	}
-}
-
-func TestSkipAckFrameECNCounts(t *testing.T) {
-	ackECN := []byte{3, 0, 0, 3, 10, 11, 12}
-	if got := skipAckFrame(ackECN, true); got != len(ackECN) {
-		t.Fatalf("skipAckFrame(ACK_ECN) = %d, want %d", got, len(ackECN))
-	}
-	for length := len(ackECN) - 3; length < len(ackECN); length++ {
-		if got := skipAckFrame(ackECN[:length], true); got != -1 {
-			t.Fatalf("skipAckFrame(truncated ACK_ECN length %d) = %d, want -1", length, got)
+	for _, data := range [][]byte{{}, {0, 0, 0}, {0, 0, 1, 0, 0}} {
+		if _, err := skipAckFrame(data, false); err == nil {
+			t.Fatalf("truncated ACK accepted: %x", data)
 		}
 	}
+	if _, err := skipAckFrame([]byte{0, 0, 63, 0}, false); err == nil {
+		t.Fatal("impossible ACK range count accepted")
+	}
 }
 
-func TestParseCryptoFramesAfterACKECN(t *testing.T) {
-	payload := []byte{
-		0x03, 3, 0, 0, 3, 10, 11, 12, // ACK_ECN with no additional ranges
-		0x06, 0, 3, 'a', 'b', 'c', // CRYPTO at offset 0
-	}
-	frags := parseCryptoFrames(payload)
-	if len(frags) != 1 || frags[0].off != 0 || !bytes.Equal(frags[0].data, []byte("abc")) {
-		t.Fatalf("parseCryptoFrames() = %+v, want one CRYPTO fragment", frags)
+func TestParseCryptoFramesRejectsMalformed(t *testing.T) {
+	for _, payload := range [][]byte{
+		{0x06},
+		{0x06, 0x40},
+		{0x06, 0, 5, 1},
+		{0x02, 0, 0, 0},
+		{0xff},
+	} {
+		if _, err := parseCryptoFrames(payload); err == nil {
+			t.Fatalf("malformed Initial frames accepted: %x", payload)
+		}
 	}
 }
 
