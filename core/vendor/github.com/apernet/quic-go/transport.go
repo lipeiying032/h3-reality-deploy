@@ -324,6 +324,9 @@ func (t *Transport) doDial(
 		logger,
 		version,
 	)
+	if config.ChromeTransportParameters {
+		enableChromePTO(conn)
+	}
 	t.handlers[srcConnID] = conn
 	t.mutex.Unlock()
 
