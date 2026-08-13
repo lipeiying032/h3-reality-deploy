@@ -81,6 +81,10 @@ const (
 	EventRestoredTransportParameters
 	// EventHandshakeComplete signals that the TLS handshake was completed.
 	EventHandshakeComplete
+	// EventClientFinalFlightPending signals that the final client TLS flight is
+	// held by an explicitly enabled timing profile. The connection must release
+	// it later through CryptoSetup.ReleaseClientFinalFlight.
+	EventClientFinalFlightPending
 )
 
 func (k EventKind) String() string {
@@ -101,6 +105,8 @@ func (k EventKind) String() string {
 		return "EventRestoredTransportParameters"
 	case EventHandshakeComplete:
 		return "EventHandshakeComplete"
+	case EventClientFinalFlightPending:
+		return "EventClientFinalFlightPending"
 	default:
 		return "Unknown EventKind"
 	}
@@ -122,6 +128,7 @@ type CryptoSetup interface {
 
 	HandleMessage([]byte, protocol.EncryptionLevel) error
 	NextEvent() Event
+	ReleaseClientFinalFlight() error
 
 	SetLargest1RTTAcked(protocol.PacketNumber) error
 	DiscardInitialKeys()

@@ -44,6 +44,7 @@ type cryptoStreamHandler interface {
 	NextEvent() handshake.Event
 	DiscardInitialKeys()
 	HandleMessage([]byte, protocol.EncryptionLevel) error
+	ReleaseClientFinalFlight() error
 	io.Closer
 	ConnectionState() handshake.ConnectionState
 }
@@ -200,6 +201,12 @@ type Conn struct {
 	receivedRetry       bool
 	versionNegotiated   bool
 	receivedFirstPacket bool
+	// firstPeerPacketTime anchors the target total delay for the optional
+	// Chrome 133 client timing profile. It is set only after a valid peer packet
+	// reaches the connection, never at socket receive time.
+	firstPeerPacketTime     monotime.Time
+	handshakePacingDeadline monotime.Time
+	initial1RTTDelaySampler initial1RTTDelaySampler
 
 	blocked blockMode
 
@@ -447,6 +454,12 @@ var newClientConnection = func(
 		versionNegotiated:   hasNegotiatedVersion,
 		version:             v,
 	}
+	if conf.ChromeInitial1RTTPacing {
+		s.initial1RTTDelaySampler = conf.initial1RTTDelaySampler
+		if s.initial1RTTDelaySampler == nil {
+			s.initial1RTTDelaySampler = newChrome133Initial1RTTDelaySampler()
+		}
+	}
 	if qlogTrace != nil {
 		s.qlogger = qlogTrace.AddProducer()
 	}
@@ -535,6 +548,7 @@ var newClientConnection = func(
 		tlsConf,
 		conf.QUICTLSFactory,
 		enable0RTT,
+		s.initial1RTTDelaySampler != nil,
 		s.rttStats,
 		s.qlogger,
 		logger,
@@ -725,6 +739,15 @@ runLoop:
 		// Check for loss detection timeout.
 		// This could cause packets to be declared lost, and retransmissions to be enqueued.
 		now := monotime.Now()
+		if becameComplete, err := c.releaseClientFinalFlight(now); err != nil {
+			c.setCloseError(&closeError{err: err})
+			break runLoop
+		} else if becameComplete {
+			if err := c.handleHandshakeComplete(now); err != nil {
+				c.setCloseError(&closeError{err: err})
+				break runLoop
+			}
+		}
 		if timeout := c.sentPacketHandler.GetLossDetectionTimeout(); !timeout.IsZero() && !timeout.After(now) {
 			if err := c.sentPacketHandler.OnLossDetectionTimeout(now); err != nil {
 				c.setCloseError(&closeError{err: err})
@@ -937,6 +960,9 @@ func (c *Conn) maybeResetTimer() {
 				deadline = c.nextIdleTimeoutTime()
 			}
 		}
+	}
+	if t := c.handshakePacingDeadline; !t.IsZero() && t.Before(deadline) {
+		deadline = t
 	}
 	// If the connection is hard-blocked, we can't even send acknowledgments,
 	// nor can we send PTO probe packets.
@@ -1712,6 +1738,9 @@ func (c *Conn) handleUnpackedLongHeaderPacket(
 ) error {
 	if !c.receivedFirstPacket {
 		c.receivedFirstPacket = true
+		if c.perspective == protocol.PerspectiveClient {
+			c.firstPeerPacketTime = rcvTime
+		}
 		if !c.versionNegotiated && c.qlogger != nil {
 			var clientVersions, serverVersions []Version
 			switch c.perspective {
@@ -2085,6 +2114,8 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 			// Don't call handleHandshakeComplete yet.
 			// It's advantageous to process ACK frames that might be serialized after the CRYPTO frame first.
 			c.handshakeComplete = true
+		case handshake.EventClientFinalFlightPending:
+			c.armClientFinalFlightPacing(now)
 		case handshake.EventReceivedTransportParameters:
 			err = c.handleTransportParameters(ev.TransportParameters)
 		case handshake.EventRestoredTransportParameters:
@@ -2105,6 +2136,52 @@ func (c *Conn) handleHandshakeEvents(now monotime.Time) error {
 			return err
 		}
 	}
+}
+
+func (c *Conn) armClientFinalFlightPacing(now monotime.Time) {
+	if !c.handshakePacingDeadline.IsZero() {
+		return
+	}
+	origin := c.firstPeerPacketTime
+	if origin.IsZero() {
+		origin = now
+	}
+	var target time.Duration
+	if c.initial1RTTDelaySampler != nil {
+		target = c.initial1RTTDelaySampler()
+	}
+	deadline := origin.Add(target)
+	if hardCap := origin.Add(chromeInitial1RTTDelayHardCap); deadline.After(hardCap) {
+		deadline = hardCap
+	}
+	if c.config != nil && c.config.HandshakeIdleTimeout > 0 && !c.creationTime.IsZero() {
+		if timeoutCap := c.creationTime.Add(c.config.HandshakeIdleTimeout / 2); deadline.After(timeoutCap) {
+			deadline = timeoutCap
+		}
+	}
+	if deadline.Before(now) {
+		deadline = now
+	}
+	c.handshakePacingDeadline = deadline
+}
+
+// releaseClientFinalFlight runs on the connection loop after its existing
+// timer fires. It intentionally does not block packet processing while the
+// profile is pending. The caller handles the returned completion transition,
+// because this path does not pass through the packet-parser completion hook.
+func (c *Conn) releaseClientFinalFlight(now monotime.Time) (bool, error) {
+	if c.handshakePacingDeadline.IsZero() || now.Before(c.handshakePacingDeadline) {
+		return false, nil
+	}
+	c.handshakePacingDeadline = 0
+	wasComplete := c.handshakeComplete
+	if err := c.cryptoStreamHandler.ReleaseClientFinalFlight(); err != nil {
+		return false, err
+	}
+	if err := c.handleHandshakeEvents(now); err != nil {
+		return false, err
+	}
+	return !wasComplete && c.handshakeComplete, nil
 }
 
 func (c *Conn) handlePathChallengeFrame(f *wire.PathChallengeFrame) {

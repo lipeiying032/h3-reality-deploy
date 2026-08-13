@@ -50,6 +50,12 @@ message Config {
   // Optional target-specific HTTP/3 server connection ID length. Zero keeps
   // the quic-go default (4 bytes).
   uint32 h3_connection_id_length = 36;
+
+  // Opt-in client timing profile for a Chrome 133-shaped REALITY QUIC
+  // handshake. It is intentionally disabled by default. When enabled with a
+  // Chrome 133 fingerprint, the client defers its final TLS flight using a
+  // bounded randomized target delay before it can emit 1-RTT packets.
+  bool h3_client_timing_chrome133 = 37;
 }
 
 message LimitFallback {

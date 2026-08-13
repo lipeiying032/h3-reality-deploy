@@ -112,6 +112,8 @@ func populateConfig(config *Config) *Config {
 		GetConfigForClient:               config.GetConfigForClient,
 		QUICTLSFactory:                   config.QUICTLSFactory,
 		ChromeTransportParameters:        config.ChromeTransportParameters,
+		ChromeInitial1RTTPacing:          config.ChromeInitial1RTTPacing,
+		initial1RTTDelaySampler:          config.initial1RTTDelaySampler,
 		InitialDCIDLength:                config.InitialDCIDLength,
 		Versions:                         versions,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,

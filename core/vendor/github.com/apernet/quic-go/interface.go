@@ -104,6 +104,16 @@ type Config struct {
 	// ChromeTransportParameters applies Chrome's QUIC client transport
 	// parameter template. It only affects parameters sent by clients.
 	ChromeTransportParameters bool
+	// ChromeInitial1RTTPacing defers the final client TLS flight until a
+	// connection-local timing target expires. This keeps the Application write
+	// key unavailable while the client continues to process Initial and
+	// Handshake packets. It only affects explicitly opted-in Chrome-shaped
+	// clients, and is disabled by default.
+	ChromeInitial1RTTPacing bool
+	// initial1RTTDelaySampler is test-only injection for the opt-in timing
+	// profile. Production callers cannot set it; enabled client connections use
+	// their own entropy-seeded sampler.
+	initial1RTTDelaySampler initial1RTTDelaySampler
 	// InitialDCIDLength pins the client's first destination connection ID
 	// length. Zero keeps the randomized 8–20 byte default.
 	InitialDCIDLength int

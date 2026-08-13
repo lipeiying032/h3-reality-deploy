@@ -60,6 +60,13 @@ type cryptoSetup struct {
 
 	used0RTT atomic.Bool
 
+	// paceClientFinalFlight is an opt-in client-only profile. It holds the
+	// QUIC/TLS event batch that writes Client Finished and installs the
+	// Application keys, without blocking the TLS goroutine or packet loop.
+	paceClientFinalFlight    bool
+	pendingClientFinalFlight []qtls.Event
+	clientFinalFlightPending atomic.Bool
+
 	aead          *updatableAEAD
 	has1RTTSealer bool
 	has1RTTOpener bool
@@ -103,6 +110,7 @@ func NewCryptoSetupClient(
 	tlsConf *tls.Config,
 	qtlsFactory qtls.Factory,
 	enable0RTT bool,
+	paceClientFinalFlight bool,
 	rttStats *utils.RTTStats,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
@@ -122,6 +130,7 @@ func NewCryptoSetupClient(
 	tlsConf.MinVersion = tls.VersionTLS13
 	cs.tlsConf = tlsConf
 	cs.allow0RTT = enable0RTT
+	cs.paceClientFinalFlight = paceClientFinalFlight
 
 	if qtlsFactory != nil {
 		cs.conn = qtlsFactory.Client(&tls.QUICConfig{TLSConfig: tlsConf})
@@ -256,6 +265,11 @@ func (h *cryptoSetup) StartHandshake(ctx context.Context) error {
 // Close closes the crypto setup.
 // It aborts the handshake, if it is still running.
 func (h *cryptoSetup) Close() error {
+	for i := range h.pendingClientFinalFlight {
+		h.pendingClientFinalFlight[i].Data = nil
+	}
+	h.pendingClientFinalFlight = nil
+	h.clientFinalFlightPending.Store(false)
 	return h.conn.Close()
 }
 
@@ -274,6 +288,33 @@ func (h *cryptoSetup) handleMessage(data []byte, encLevel protocol.EncryptionLev
 	}
 	for {
 		ev := h.conn.NextEvent()
+		if h.shouldHoldClientFinalFlight(ev) {
+			pending := []qtls.Event{cloneQTLSEvent(ev)}
+			for {
+				next := h.conn.NextEvent()
+				if next.Kind == tls.QUICNoEvent {
+					break
+				}
+				pending = append(pending, cloneQTLSEvent(next))
+			}
+			if isClientFinalFlight(pending) {
+				h.pendingClientFinalFlight = pending[:4]
+				h.clientFinalFlightPending.Store(true)
+				h.events = append(h.events, Event{Kind: EventClientFinalFlightPending})
+				for _, trailing := range pending[4:] {
+					if err := h.handleEvent(trailing); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			for _, pendingEvent := range pending {
+				if err := h.handleEvent(pendingEvent); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		if err := h.handleEvent(ev); err != nil {
 			return err
 		}
@@ -281,6 +322,51 @@ func (h *cryptoSetup) handleMessage(data []byte, encLevel protocol.EncryptionLev
 			return nil
 		}
 	}
+}
+
+func (h *cryptoSetup) shouldHoldClientFinalFlight(ev qtls.Event) bool {
+	return h.paceClientFinalFlight &&
+		h.perspective == protocol.PerspectiveClient &&
+		!h.clientFinalFlightPending.Load() &&
+		!h.used0RTT.Load() &&
+		h.zeroRTTSealer == nil &&
+		ev.Kind == tls.QUICWriteData &&
+		ev.Level == tls.QUICEncryptionLevelHandshake
+}
+
+func isClientFinalFlight(events []qtls.Event) bool {
+	if len(events) < 4 {
+		return false
+	}
+	return events[0].Kind == tls.QUICWriteData && events[0].Level == tls.QUICEncryptionLevelHandshake &&
+		events[1].Kind == tls.QUICSetWriteSecret && events[1].Level == tls.QUICEncryptionLevelApplication &&
+		events[2].Kind == tls.QUICHandshakeDone &&
+		events[3].Kind == tls.QUICSetReadSecret && events[3].Level == tls.QUICEncryptionLevelApplication
+}
+
+func cloneQTLSEvent(ev qtls.Event) qtls.Event {
+	cloned := ev
+	cloned.Data = append([]byte(nil), ev.Data...)
+	return cloned
+}
+
+// ReleaseClientFinalFlight replays the held Client Finished / Application-key
+// event batch in the original order. It is called by the connection timer and
+// is a no-op when the timing profile is not holding a flight.
+func (h *cryptoSetup) ReleaseClientFinalFlight() error {
+	if !h.clientFinalFlightPending.Load() {
+		return nil
+	}
+	pending := h.pendingClientFinalFlight
+	h.pendingClientFinalFlight = nil
+	h.clientFinalFlightPending.Store(false)
+	for i := range pending {
+		if err := h.handleEvent(pending[i]); err != nil {
+			return err
+		}
+		pending[i].Data = nil
+	}
+	return nil
 }
 
 func (h *cryptoSetup) handleEvent(ev qtls.Event) (err error) {
@@ -733,8 +819,12 @@ func (h *cryptoSetup) Get1RTTOpener() (ShortHeaderOpener, error) {
 }
 
 func (h *cryptoSetup) ConnectionState() ConnectionState {
+	state := h.conn.ConnectionState()
+	if h.clientFinalFlightPending.Load() {
+		state.HandshakeComplete = false
+	}
 	return ConnectionState{
-		ConnectionState: h.conn.ConnectionState(),
+		ConnectionState: state,
 		Used0RTT:        h.used0RTT.Load(),
 	}
 }

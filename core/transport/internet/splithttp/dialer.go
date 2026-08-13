@@ -18,6 +18,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
+	utls "github.com/refraction-networking/utls"
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -97,6 +98,10 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 		return "2"
 	}
 	return "1.1"
+}
+
+func shouldEnableH3ClientTimingChrome133(config *reality.Config, id *utls.ClientHelloID) bool {
+	return config != nil && config.H3ClientTimingChrome133 && id != nil && id.Client == "Chrome" && id.Version == "133"
 }
 
 func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
@@ -252,7 +257,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					quicConfig.MaxIncomingUniStreams = 103
 					quicConfig.EnableDatagrams = true
 					quicConfig.MaxDatagramFrameSize = 65536
+					if shouldEnableH3ClientTimingChrome133(realityConfig, id) {
+						quicConfig.ChromeInitial1RTTPacing = true
+					}
 				}
+			}
+			if realityConfig.H3ClientTimingChrome133 && !quicConfig.ChromeInitial1RTTPacing {
+				errors.LogWarning(context.Background(), "h3_client_timing_chrome133 requires an explicit Chrome 133 fingerprint; timing profile remains disabled")
 			}
 			quicConfig.QUICTLSFactory = tls.NewRealityQUICFactory(quicFactoryTemplate)
 		}
