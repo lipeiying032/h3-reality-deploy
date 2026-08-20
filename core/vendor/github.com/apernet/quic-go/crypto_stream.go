@@ -1,9 +1,11 @@
 package quic
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"slices"
 	"strconv"
@@ -14,6 +16,11 @@ import (
 )
 
 const disableClientHelloScramblingEnv = "QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING"
+
+const (
+	chromeMinCryptoChunks = 9
+	chromeMaxCryptoChunks = 19
+)
 
 // The baseCryptoStream is used by the cryptoStream and the initialCryptoStream.
 // This allows us to implement different logic for PopCryptoFrame for the two streams.
@@ -111,20 +118,27 @@ type initialCryptoStream struct {
 	chromeDone      bool
 	chromeChunks    []clientHelloCut
 	chromeChunkNext int
+	chromeRand      *rand.Rand
 	end             protocol.ByteCount
 	cuts            [2]clientHelloCut
 }
 
 func newInitialCryptoStream(isClient, chrome bool) *initialCryptoStream {
 	var scramble bool
+	var chromeRand *rand.Rand
 	if isClient && !chrome {
 		disabled, err := strconv.ParseBool(os.Getenv(disableClientHelloScramblingEnv))
 		scramble = err != nil || !disabled
+	} else if isClient && chrome {
+		var seed [32]byte
+		_, _ = crand.Read(seed[:])
+		chromeRand = rand.New(rand.NewChaCha8(seed))
 	}
 	s := &initialCryptoStream{
 		baseCryptoStream: baseCryptoStream{queue: *newFrameSorter()},
 		scramble:         scramble,
 		chrome:           isClient && chrome,
+		chromeRand:       chromeRand,
 		end:              protocol.InvalidByteCount,
 	}
 	for i := range len(s.cuts) {
@@ -299,24 +313,40 @@ func (s *initialCryptoStream) finishChromeChunks() {
 }
 
 func (s *initialCryptoStream) prepareChromeChunks() {
-	order := []protocol.ByteCount{929, 1534, 75, 1527, 1054, 0, 1335}
-	boundaries := append([]protocol.ByteCount(nil), order...)
-	boundaries = slices.DeleteFunc(boundaries, func(offset protocol.ByteCount) bool { return offset >= s.end })
-	if !slices.Contains(boundaries, protocol.ByteCount(0)) {
-		boundaries = append(boundaries, 0)
+	numChunks := chromeMinCryptoChunks + s.chromeRand.IntN(chromeMaxCryptoChunks-chromeMinCryptoChunks+1)
+	// A real ClientHello is much larger than the observed chunk count. Keep the
+	// fallback well-defined for synthetic or malformed tiny handshakes as well.
+	if end := int(s.end); numChunks > end {
+		numChunks = end
 	}
-	slices.Sort(boundaries)
-	for _, start := range order {
-		if start >= s.end {
-			continue
+
+	// Allocate the contiguous ClientHello ranges using bounded random weights.
+	// Bounding the weights keeps every range small enough that the first flight
+	// normally occupies two Initial packets, without producing equal-sized cuts.
+	weights := make([]int, numChunks)
+	var totalWeight int
+	for i := range weights {
+		weights[i] = 50 + s.chromeRand.IntN(101)
+		totalWeight += weights[i]
+	}
+
+	remaining := int(s.end)
+	remainingWeight := totalWeight
+	start := protocol.ByteCount(0)
+	for i, weight := range weights {
+		chunksAfter := numChunks - i - 1
+		chunkLen := remaining
+		if chunksAfter > 0 {
+			chunkLen = remaining * weight / remainingWeight
+			chunkLen = max(1, min(chunkLen, remaining-chunksAfter))
 		}
-		end := s.end
-		for _, boundary := range boundaries {
-			if boundary > start {
-				end = boundary
-				break
-			}
-		}
+		end := start + protocol.ByteCount(chunkLen)
 		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: start, end: end})
+		start = end
+		remaining -= chunkLen
+		remainingWeight -= weight
 	}
+	s.chromeRand.Shuffle(len(s.chromeChunks), func(i, j int) {
+		s.chromeChunks[i], s.chromeChunks[j] = s.chromeChunks[j], s.chromeChunks[i]
+	})
 }
