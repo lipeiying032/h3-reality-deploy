@@ -92,9 +92,11 @@ func (c *Conn) makeUtlsClientHello() (*clientHelloMsg, *keySharePrivateKeys, err
 // quicifySpec adapts a uTLS ClientHelloSpec to the QUIC transport (RFC 9001,
 // Sections 4 and 8):
 //
-//   - cipher suites are trimmed to GREASE + the three TLS 1.3 suites (QUIC
-//     only negotiates TLS 1.3);
-//   - supported_versions is trimmed to GREASE + TLS 1.3;
+//   - cipher suites are trimmed to the three TLS 1.3 suites (QUIC only
+//     negotiates TLS 1.3), without GREASE;
+//   - GREASE is removed from supported_groups, supported_versions and
+//     key_share, while preserving Chrome's hybrid and X25519 shares;
+//   - rsa_pkcs1_sha1 is appended to signature_algorithms;
 //   - the session-ticket extension is removed (fresh connection);
 //   - TCP compatibility extensions and the two explicit GREASE extensions are
 //     removed, matching Chrome's smaller QUIC-specific extension set;
@@ -106,18 +108,14 @@ func (c *Conn) makeUtlsClientHello() (*clientHelloMsg, *keySharePrivateKeys, err
 //     key_share, a position this function controls (the fingerprint factory
 //     has already shuffled the list).
 //
-// Everything else in the fingerprint — compress_cert(brotli), GREASE-ECH,
-// supported_groups and the key_share set — is preserved.
+// Everything else in the fingerprint — compress_cert(brotli), GREASE-ECH and
+// extension ordering — is preserved.
 func quicifySpec(spec *utls.ClientHelloSpec, nextProtos []string, tp []byte) {
-	cipherSuites := make([]uint16, 0, 4)
+	cipherSuites := make([]uint16, 0, 3)
 	for _, id := range spec.CipherSuites {
 		switch id {
 		case utls.TLS_AES_128_GCM_SHA256, utls.TLS_AES_256_GCM_SHA384, utls.TLS_CHACHA20_POLY1305_SHA256:
 			cipherSuites = append(cipherSuites, id)
-		default:
-			if isGREASEUint16(id) {
-				cipherSuites = append(cipherSuites, id)
-			}
 		}
 	}
 	spec.CipherSuites = cipherSuites
@@ -144,17 +142,22 @@ func quicifySpec(spec *utls.ClientHelloSpec, nextProtos []string, tp []byte) {
 			e.SupportedProtocols = []string{"h3"}
 		case *utls.ApplicationSettingsExtensionNew:
 			e.SupportedProtocols = []string{"h3"}
-		case *utls.SupportedVersionsExtension:
-			versions := make([]uint16, 0, 2)
-			for _, v := range e.Versions {
-				if isGREASEUint16(v) || v == utls.VersionTLS13 {
-					versions = append(versions, v)
-				}
+		case *utls.SupportedCurvesExtension:
+			e.Curves = slices.DeleteFunc(e.Curves, func(curve utls.CurveID) bool {
+				return isGREASEUint16(uint16(curve))
+			})
+		case *utls.SignatureAlgorithmsExtension:
+			if !slices.Contains(e.SupportedSignatureAlgorithms, utls.PKCS1WithSHA1) {
+				e.SupportedSignatureAlgorithms = append(e.SupportedSignatureAlgorithms, utls.PKCS1WithSHA1)
 			}
-			e.Versions = versions
+		case *utls.SupportedVersionsExtension:
+			e.Versions = []uint16{utls.VersionTLS13}
 		case *utls.ALPNExtension:
 			e.AlpnProtocols = append([]string(nil), nextProtos...)
 		case *utls.KeyShareExtension:
+			e.KeyShares = slices.DeleteFunc(e.KeyShares, func(share utls.KeyShare) bool {
+				return isGREASEUint16(uint16(share.Group))
+			})
 			keyShareIdx = len(exts)
 		}
 		exts = append(exts, ext)
