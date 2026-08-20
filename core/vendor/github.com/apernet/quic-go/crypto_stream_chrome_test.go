@@ -3,6 +3,7 @@ package quic
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/apernet/quic-go/internal/ackhandler"
@@ -10,6 +11,7 @@ import (
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/wire"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 type chromeTestSealer struct{}
@@ -141,99 +143,212 @@ func TestChromeInitialCryptoFramesRandomizeAndReassemble(t *testing.T) {
 	}
 }
 
+func parseChromeTestPayload(payload []byte) (int, []int, error) {
+	var pings int
+	var paddingRuns []int
+	for len(payload) > 0 {
+		switch payload[0] {
+		case 0: // PADDING
+			var run int
+			for run < len(payload) && payload[run] == 0 {
+				run++
+			}
+			paddingRuns = append(paddingRuns, run)
+			payload = payload[run:]
+		case 1: // PING
+			pings++
+			payload = payload[1:]
+		case 6: // CRYPTO
+			payload = payload[1:]
+			_, n, err := quicvarint.Parse(payload)
+			if err != nil {
+				return 0, nil, err
+			}
+			payload = payload[n:]
+			dataLen, n, err := quicvarint.Parse(payload)
+			if err != nil {
+				return 0, nil, err
+			}
+			payload = payload[n:]
+			if dataLen > uint64(len(payload)) {
+				return 0, nil, fmt.Errorf("CRYPTO length %d exceeds %d-byte payload", dataLen, len(payload))
+			}
+			payload = payload[dataLen:]
+		default:
+			return 0, nil, fmt.Errorf("unexpected frame type %#x", payload[0])
+		}
+	}
+	return pings, paddingRuns, nil
+}
+
 func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
-	crypto1 := &wire.CryptoFrame{Offset: 929, Data: []byte{1, 2}}
-	crypto2 := &wire.CryptoFrame{Offset: 1534, Data: []byte{3, 4}}
-	ping := &wire.PingFrame{}
+	crypto1 := &wire.CryptoFrame{Offset: 929, Data: []byte{2, 3}}
+	crypto2 := &wire.CryptoFrame{Offset: 1534, Data: []byte{4, 5}}
 	pl := payload{
 		frames: []ackhandler.Frame{
 			{Frame: crypto1},
-			{Frame: ping},
+			{Frame: &wire.PingFrame{}},
+			{Frame: &wire.PingFrame{}},
 			{Frame: crypto2},
+			{Frame: &wire.PingFrame{}},
 		},
-		length:             crypto1.Length(protocol.Version1) + ping.Length(protocol.Version1) + crypto2.Length(protocol.Version1),
+		length:             crypto1.Length(protocol.Version1) + crypto2.Length(protocol.Version1) + 3,
 		preserveFrameOrder: true,
-		interleavePadding:  true,
+		paddingRuns:        5,
 	}
-	packer := &packetPacker{}
-	raw, err := packer.appendPacketPayload(nil, pl, 8, protocol.Version1)
-	if err != nil {
-		t.Fatal(err)
+	packer := &packetPacker{rand: *rand.New(rand.NewPCG(1, 2))}
+	layouts := make(map[string]struct{})
+	for range 20 {
+		raw, err := packer.appendPacketPayload(nil, pl, 97, protocol.Version1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) != int(pl.length)+97 {
+			t.Fatalf("payload length = %d, want %d", len(raw), int(pl.length)+97)
+		}
+		pings, runs, err := parseChromeTestPayload(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pings != 3 {
+			t.Fatalf("PING count = %d, want 3", pings)
+		}
+		if len(runs) != 5 {
+			t.Fatalf("PADDING run count = %d, want 5", len(runs))
+		}
+		var total, minRun, maxRun int
+		minRun = runs[0]
+		for _, run := range runs {
+			total += run
+			minRun = min(minRun, run)
+			maxRun = max(maxRun, run)
+		}
+		if total != 97 {
+			t.Fatalf("PADDING total = %d, want 97", total)
+		}
+		if maxRun-minRun < 10 {
+			t.Errorf("PADDING lengths are too uniform: %v", runs)
+		}
+		layouts[fmt.Sprint(runs)] = struct{}{}
 	}
-	if len(raw) != int(pl.length)+8 {
-		t.Fatalf("payload length = %d, want %d", len(raw), int(pl.length)+8)
-	}
-	// Eight PADDING bytes are split across the four gaps around three frames.
-	if !bytes.Equal(raw[:2], []byte{0, 0}) {
-		t.Errorf("leading PADDING = %x, want 0000", raw[:2])
-	}
-	firstLen := int(crypto1.Length(protocol.Version1))
-	if !bytes.Equal(raw[2+firstLen:2+firstLen+2], []byte{0, 0}) {
-		t.Error("PADDING was not inserted between the first CRYPTO and PING frames")
+	if len(layouts) < 10 {
+		t.Errorf("only %d/20 PADDING length layouts were distinct", len(layouts))
 	}
 }
 
 func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
+	const connections = 100
 	clientHello := newChromeTestClientHello(1700)
-	stream := newInitialCryptoStream(true, true)
-	if _, err := stream.Write(clientHello); err != nil {
-		t.Fatal(err)
-	}
-	dest, err := protocol.GenerateConnectionID(8)
-	if err != nil {
-		t.Fatal(err)
-	}
-	packer := newPacketPacker(
-		protocol.ConnectionID{},
-		func() protocol.ConnectionID { return dest },
-		stream,
-		newCryptoStream(),
-		&chromeTestPacketNumberManager{},
-		newRetransmissionQueue(),
-		chromeTestSealingManager{},
-		nil,
-		chromeTestAckSource{},
-		nil,
-		protocol.PerspectiveClient,
-	)
-	reconstructed := make([]byte, len(clientHello))
-	var packets, cryptoFrames int
-	for stream.HasData() {
-		packet, err := packer.PackCoalescedPacket(false, 1250, monotime.Now(), protocol.Version1)
+	pingTotals := make(map[int]struct{})
+	paddingRunTotals := make(map[int]struct{})
+	layouts := make(map[string]struct{})
+
+	for conn := range connections {
+		packetSize := protocol.ByteCount(1250)
+		if conn%2 == 1 {
+			packetSize = 1230
+		}
+		stream := newInitialCryptoStream(true, true)
+		if _, err := stream.Write(clientHello); err != nil {
+			t.Fatal(err)
+		}
+		dest, err := protocol.GenerateConnectionID(8)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if packet == nil {
-			t.Fatal("no Initial packet packed")
-		}
-		if len(packet.buffer.Data) != 1250 {
-			t.Errorf("IPv4 Initial UDP payload = %d, want 1250", len(packet.buffer.Data))
-		}
-		if len(packet.longHdrPackets) != 1 {
-			t.Fatalf("long header packet count = %d, want 1", len(packet.longHdrPackets))
-		}
-		for i, frame := range packet.longHdrPackets[0].frames {
-			if i%2 == 0 {
-				cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame)
-				if !ok {
-					t.Fatalf("frame %d = %T, want CRYPTO", i, frame.Frame)
-				}
-				copy(reconstructed[cryptoFrame.Offset:], cryptoFrame.Data)
-				cryptoFrames++
-			} else if _, ok := frame.Frame.(*wire.PingFrame); !ok {
-				t.Fatalf("frame %d = %T, want PING", i, frame.Frame)
+		packer := newPacketPacker(
+			protocol.ConnectionID{},
+			func() protocol.ConnectionID { return dest },
+			stream,
+			newCryptoStream(),
+			&chromeTestPacketNumberManager{},
+			newRetransmissionQueue(),
+			chromeTestSealingManager{},
+			nil,
+			chromeTestAckSource{},
+			nil,
+			protocol.PerspectiveClient,
+		)
+		reconstructed := make([]byte, len(clientHello))
+		var packets, cryptoFrames, totalPings, totalPaddingRuns int
+		var pingsPerPacket, runsPerPacket []int
+		var runLengths []int
+		for stream.HasData() {
+			packet, err := packer.PackCoalescedPacket(false, packetSize, monotime.Now(), protocol.Version1)
+			if err != nil {
+				t.Fatal(err)
 			}
+			if packet == nil {
+				t.Fatal("no Initial packet packed")
+			}
+			if len(packet.buffer.Data) != int(packetSize) {
+				t.Errorf("Initial UDP payload = %d, want %d", len(packet.buffer.Data), packetSize)
+			}
+			if len(packet.longHdrPackets) != 1 {
+				t.Fatalf("long header packet count = %d, want 1", len(packet.longHdrPackets))
+			}
+			longPacket := packet.longHdrPackets[0]
+			for _, frame := range longPacket.frames {
+				if cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame); ok {
+					copy(reconstructed[cryptoFrame.Offset:], cryptoFrame.Data)
+					cryptoFrames++
+				}
+			}
+
+			headerLen := int(longPacket.header.GetLength(protocol.Version1))
+			payload := packet.buffer.Data[headerLen : len(packet.buffer.Data)-chromeTestSealer{}.Overhead()]
+			pings, runs, err := parseChromeTestPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pings == 0 {
+				t.Error("Initial packet contains no PING")
+			}
+			if len(runs) == 0 {
+				t.Error("Initial packet contains no PADDING run")
+			}
+			totalPings += pings
+			totalPaddingRuns += len(runs)
+			pingsPerPacket = append(pingsPerPacket, pings)
+			runsPerPacket = append(runsPerPacket, len(runs))
+			runLengths = append(runLengths, runs...)
+			packet.buffer.Release()
+			packets++
 		}
-		packet.buffer.Release()
-		packets++
+		if packets < 2 || packets > 3 {
+			t.Errorf("Initial packet count = %d, want 2 or 3", packets)
+		}
+		if cryptoFrames < chromeMinCryptoChunks || cryptoFrames > chromeMaxCryptoChunks {
+			t.Errorf("CRYPTO frame count = %d, want %d..%d", cryptoFrames, chromeMinCryptoChunks, chromeMaxCryptoChunks)
+		}
+		if totalPings < chromeMinInitialPings || totalPings > chromeMaxInitialPings {
+			t.Errorf("PING total = %d, want %d..%d", totalPings, chromeMinInitialPings, chromeMaxInitialPings)
+		}
+		if totalPaddingRuns < chromeMinInitialPaddingRuns || totalPaddingRuns > chromeMaxInitialPaddingRuns {
+			t.Errorf("PADDING run total = %d, want %d..%d", totalPaddingRuns, chromeMinInitialPaddingRuns, chromeMaxInitialPaddingRuns)
+		}
+		if !bytes.Equal(reconstructed, clientHello) {
+			t.Error("packed CRYPTO frames did not reconstruct the ClientHello")
+		}
+		minRun, maxRun := runLengths[0], runLengths[0]
+		for _, run := range runLengths[1:] {
+			minRun = min(minRun, run)
+			maxRun = max(maxRun, run)
+		}
+		if maxRun-minRun < 10 {
+			t.Errorf("PADDING runs are too uniform: %v", runLengths)
+		}
+		pingTotals[totalPings] = struct{}{}
+		paddingRunTotals[totalPaddingRuns] = struct{}{}
+		layouts[fmt.Sprintf("%v/%v/%v", pingsPerPacket, runsPerPacket, runLengths)] = struct{}{}
 	}
-	if packets < 2 || packets > 3 {
-		t.Errorf("Initial packet count = %d, want 2 or 3", packets)
+	if len(pingTotals) < 6 {
+		t.Errorf("only %d PING totals observed across %d connections", len(pingTotals), connections)
 	}
-	if cryptoFrames < chromeMinCryptoChunks || cryptoFrames > chromeMaxCryptoChunks {
-		t.Errorf("CRYPTO frame count = %d, want %d..%d", cryptoFrames, chromeMinCryptoChunks, chromeMaxCryptoChunks)
+	if len(paddingRunTotals) < 4 {
+		t.Errorf("only %d PADDING run totals observed across %d connections", len(paddingRunTotals), connections)
 	}
-	if !bytes.Equal(reconstructed, clientHello) {
-		t.Error("packed CRYPTO frames did not reconstruct the ClientHello")
+	if len(layouts) < connections/2 {
+		t.Errorf("only %d/%d PING/PADDING layouts were distinct", len(layouts), connections)
 	}
 }
