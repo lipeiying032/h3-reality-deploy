@@ -44,6 +44,14 @@ func TestSetMaxDatagramSizeClampsCongestionWindow(t *testing.T) {
 	require.Equal(t, b.minCongestionWindow, b.recoveryWindow)
 }
 
+func TestSetMaxDatagramSizeRejectsDecrease(t *testing.T) {
+	b := NewBbrSender(DefaultClock{}, 1280, ProfileStandard)
+	require.PanicsWithValue(t,
+		"congestion BUG: decreased max datagram size from 1280 to 1250",
+		func() { b.SetMaxDatagramSize(1250) },
+	)
+}
+
 func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 	testCases := []struct {
 		name                                string
