@@ -257,6 +257,71 @@ type cryptoFrag struct {
 	data []byte
 }
 
+type cryptoRange struct {
+	start int
+	end   int
+}
+
+// cryptoReassembler tracks both CRYPTO stream bytes and the ranges that have
+// actually arrived. The backing slice can contain zero-filled gaps after an
+// out-of-order fragment, so its length alone must never be used as evidence
+// that a ClientHello is complete.
+type cryptoReassembler struct {
+	data    []byte
+	covered []cryptoRange
+}
+
+func (r *cryptoReassembler) add(frag cryptoFrag) {
+	if frag.off < 0 || len(frag.data) == 0 {
+		return
+	}
+	end := frag.off + len(frag.data)
+	if end < frag.off { // integer overflow
+		return
+	}
+	if end > len(r.data) {
+		grown := make([]byte, end)
+		copy(grown, r.data)
+		r.data = grown
+	}
+	copy(r.data[frag.off:end], frag.data)
+
+	next := cryptoRange{start: frag.off, end: end}
+	merged := make([]cryptoRange, 0, len(r.covered)+1)
+	inserted := false
+	for _, current := range r.covered {
+		switch {
+		case current.end < next.start:
+			merged = append(merged, current)
+		case next.end < current.start:
+			if !inserted {
+				merged = append(merged, next)
+				inserted = true
+			}
+			merged = append(merged, current)
+		default:
+			if current.start < next.start {
+				next.start = current.start
+			}
+			if current.end > next.end {
+				next.end = current.end
+			}
+		}
+	}
+	if !inserted {
+		merged = append(merged, next)
+	}
+	r.covered = merged
+}
+
+// contiguous returns only the received prefix starting at CRYPTO offset 0.
+func (r *cryptoReassembler) contiguous() []byte {
+	if len(r.covered) == 0 || r.covered[0].start != 0 {
+		return nil
+	}
+	return r.data[:r.covered[0].end]
+}
+
 // parseCryptoFrames extracts all CRYPTO frames (frame type 0x06) from a
 // decrypted QUIC payload. CRYPTO frames carry the TLS handshake stream (RFC
 // 9001 Section 4.1) and may be fragmented across packets and offset
@@ -326,20 +391,6 @@ func skipAckFrame(data []byte) int {
 		offset += n
 	}
 	return offset
-}
-
-// mergeCryptoFrag merges one CRYPTO fragment into the reassembly buffer,
-// growing it as needed. The buffer is indexed by CRYPTO stream offset; the
-// TLS ClientHello always starts at offset 0.
-func mergeCryptoFrag(buf []byte, frag cryptoFrag) []byte {
-	end := frag.off + len(frag.data)
-	if end > len(buf) {
-		grown := make([]byte, end)
-		copy(grown, buf)
-		buf = grown
-	}
-	copy(buf[frag.off:end], frag.data)
-	return buf
 }
 
 // extractClientHello returns the complete TLS ClientHello handshake message

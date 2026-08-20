@@ -68,7 +68,7 @@ type precheckClientState struct {
 	// touched by the read loop, alongside state. nil means the flow is
 	// dropped (no dest configured).
 	relayDest    []*net.UDPAddr
-	cryptoBuf    []byte
+	crypto       cryptoReassembler
 	pending      [][]byte // raw datagrams held until the decision is made
 	pendingBytes int
 }
@@ -254,9 +254,9 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 		return
 	}
 	for _, frag := range parseCryptoFrames(pkt.Payload) {
-		st.cryptoBuf = mergeCryptoFrag(st.cryptoBuf, frag)
+		st.crypto.add(frag)
 	}
-	hello := extractClientHello(st.cryptoBuf)
+	hello := extractClientHello(st.crypto.contiguous())
 	if hello == nil {
 		// ClientHello incomplete: hold the datagram and wait for more Initials.
 		if len(st.pending) >= precheckMaxPendingPkts || st.pendingBytes >= precheckMaxPendingBytes ||
