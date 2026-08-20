@@ -90,6 +90,10 @@ type TransportParameters struct {
 	MaxDatagramFrameSize protocol.ByteCount // RFC 9221
 	EnableResetStreamAt  bool               // https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
 	MinAckDelay          *time.Duration
+
+	// Additional contains client-only parameters whose values are already
+	// encoded. Unknown parameters are ignored by peers as required by QUIC.
+	Additional map[uint64][]byte
 }
 
 // Unmarshal the transport parameters
@@ -457,6 +461,13 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 	}
 	if p.MinAckDelay != nil {
 		b = p.marshalVarintParam(b, minAckDelayParameterID, uint64(*p.MinAckDelay/time.Microsecond))
+	}
+	if pers == protocol.PerspectiveClient {
+		for id, value := range p.Additional {
+			b = quicvarint.Append(b, id)
+			b = quicvarint.Append(b, uint64(len(value)))
+			b = append(b, value...)
+		}
 	}
 
 	if pers == protocol.PerspectiveClient && len(AdditionalTransportParametersClient) > 0 {

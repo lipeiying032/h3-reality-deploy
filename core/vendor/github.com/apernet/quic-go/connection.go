@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -379,6 +380,28 @@ var newConnection = func(
 	return &wrappedConn{Conn: s}
 }
 
+func applyChromeTransportParameters(params *wire.TransportParameters, version protocol.Version) {
+	params.InitialMaxStreamDataBidiLocal = 6 * 1024 * 1024
+	params.InitialMaxStreamDataBidiRemote = 6 * 1024 * 1024
+	params.InitialMaxStreamDataUni = 6 * 1024 * 1024
+	params.InitialMaxData = 15 * 1024 * 1024
+	params.MaxIdleTimeout = 30 * time.Second
+	params.MaxUDPPayloadSize = 1472
+	params.MaxBidiStreamNum = 100
+	params.MaxUniStreamNum = 103
+	params.MaxAckDelay = protocol.DefaultMaxAckDelay
+	params.ActiveConnectionIDLimit = protocol.DefaultActiveConnectionIDLimit
+	params.MaxDatagramFrameSize = 65536
+
+	versionBytes := make([]byte, 0, 8)
+	versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	params.Additional = map[uint64][]byte{
+		0x11:   versionBytes,
+		0x3128: []byte("ORIG"),
+	}
+}
+
 // declare this as a variable, such that we can it mock it in the tests
 var newClientConnection = func(
 	ctx context.Context,
@@ -485,6 +508,9 @@ var newClientConnection = func(
 		}
 	} else {
 		params.MaxDatagramFrameSize = protocol.InvalidByteCount
+	}
+	if s.config.ChromeTransportParameters {
+		applyChromeTransportParameters(params, s.version)
 	}
 	if s.qlogger != nil {
 		s.qlogTransportParameters(params, protocol.PerspectiveClient, false)
