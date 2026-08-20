@@ -45,6 +45,9 @@ func validateConfig(config *Config) error {
 	if config.InitialPacketSize > protocol.MaxPacketBufferSize {
 		config.InitialPacketSize = protocol.MaxPacketBufferSize
 	}
+	if l := config.InitialDCIDLength; l != 0 && (l < protocol.MinConnectionIDLenInitial || l > protocol.MaxConnIDLen) {
+		return fmt.Errorf("invalid initial destination connection ID length: %d", l)
+	}
 	// check that all QUIC versions are actually supported
 	for _, v := range config.Versions {
 		if !protocol.IsValidVersion(v) {
@@ -109,6 +112,7 @@ func populateConfig(config *Config) *Config {
 		GetConfigForClient:               config.GetConfigForClient,
 		QUICTLSFactory:                   config.QUICTLSFactory,
 		ChromeTransportParameters:        config.ChromeTransportParameters,
+		InitialDCIDLength:                config.InitialDCIDLength,
 		Versions:                         versions,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
 		MaxIdleTimeout:                   idleTimeout,

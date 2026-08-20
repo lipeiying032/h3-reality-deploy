@@ -244,6 +244,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if id := tls.GetFingerprint(realityConfig.Fingerprint); id != nil {
 					quicFactoryTemplate.UtlsClientHelloID = id
 					quicConfig.ChromeTransportParameters = true
+					quicConfig.InitialDCIDLength = 8
 					quicConfig.InitialStreamReceiveWindow = 6 * 1024 * 1024
 					quicConfig.InitialConnectionReceiveWindow = 15 * 1024 * 1024
 					quicConfig.MaxIdleTimeout = 30 * time.Second
@@ -318,14 +319,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					pktConn = newConn
 				}
 
-				// C-gamma handshake fidelity: dial through an explicit
-				// quic.Transport pinned to the 4-byte source connection ID
-				// that the stock quic-go http3.Transport client uses. The
-				// quic.DialEarly helper would create a single-use transport
-				// with a zero-length source connection ID, which changes both
-				// the Initial header and the initial_source_connection_id
-				// transport parameter (0x0f) compared to that baseline.
+				// Use Chrome's zero-length Initial SCID for the explicit
+				// fingerprint path. Other splitHTTP clients keep quic-go's
+				// 4-byte source connection ID.
 				quicTransport := &quic.Transport{Conn: pktConn, ConnectionIDLength: 4}
+				if cfg.ChromeTransportParameters {
+					quicTransport.UseZeroLengthConnectionIDs = true
+				}
 				conn, err := quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 				if err != nil {
 					return nil, err
