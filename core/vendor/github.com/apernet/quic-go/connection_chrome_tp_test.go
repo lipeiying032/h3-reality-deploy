@@ -76,7 +76,11 @@ func transportParameterVarint(t *testing.T, params map[uint64][]byte, id uint64)
 func TestChromeTransportParameters(t *testing.T) {
 	tp := &wire.TransportParameters{}
 	applyChromeTransportParameters(tp, protocol.Version1)
-	params := parseTransportParameters(t, tp.Marshal(protocol.PerspectiveClient))
+	encoded := tp.Marshal(protocol.PerspectiveClient)
+	if len(encoded) < 82 || len(encoded) > 95 {
+		t.Errorf("transport parameters length = %d, want 82..95", len(encoded))
+	}
+	params := parseTransportParameters(t, encoded)
 
 	wantVarints := map[uint64]uint64{
 		0x1:  30000,
@@ -100,11 +104,25 @@ func TestChromeTransportParameters(t *testing.T) {
 	if _, ok := params[0xe]; ok {
 		t.Error("active_connection_id_limit (0xe) must be omitted")
 	}
-	wantVersionInfo := make([]byte, 0, 8)
-	wantVersionInfo = binary.BigEndian.AppendUint32(wantVersionInfo, uint32(protocol.Version1))
-	wantVersionInfo = binary.BigEndian.AppendUint32(wantVersionInfo, uint32(protocol.Version1))
-	if !bytes.Equal(params[0x11], wantVersionInfo) {
-		t.Errorf("version_information = %x, want %x", params[0x11], wantVersionInfo)
+	versionInfo := params[0x11]
+	if len(versionInfo) != 12 {
+		t.Fatalf("version_information length = %d, want 12", len(versionInfo))
+	}
+	if chosen := binary.BigEndian.Uint32(versionInfo[:4]); chosen != uint32(protocol.Version1) {
+		t.Errorf("chosen version = %#x, want v1", chosen)
+	}
+	available1 := binary.BigEndian.Uint32(versionInfo[4:8])
+	available2 := binary.BigEndian.Uint32(versionInfo[8:12])
+	if available1 == uint32(protocol.Version1) {
+		if !isChromeGREASEVersion(available2) {
+			t.Errorf("available versions = [%#x %#x], want v1 + GREASE", available1, available2)
+		}
+	} else if available2 == uint32(protocol.Version1) {
+		if !isChromeGREASEVersion(available1) {
+			t.Errorf("available versions = [%#x %#x], want GREASE + v1", available1, available2)
+		}
+	} else {
+		t.Errorf("available versions = [%#x %#x], v1 missing", available1, available2)
 	}
 	if !bytes.Equal(params[0x3128], []byte("ORIG")) {
 		t.Errorf("google_connection_options = %q, want ORIG", params[0x3128])
@@ -112,6 +130,10 @@ func TestChromeTransportParameters(t *testing.T) {
 	if tp.MaxIdleTimeout != 30*time.Second {
 		t.Errorf("MaxIdleTimeout = %s, want 30s", tp.MaxIdleTimeout)
 	}
+}
+
+func isChromeGREASEVersion(version uint32) bool {
+	return version&0x0f0f0f0f == 0x0a0a0a0a
 }
 
 func TestChromeTransportParametersRandomizedPerConnection(t *testing.T) {
