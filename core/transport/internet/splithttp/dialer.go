@@ -326,7 +326,12 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				if cfg.ChromeTransportParameters {
 					quicTransport.UseZeroLengthConnectionIDs = true
 				}
-				conn, err := quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+				dialConfig := cfg
+				if cfg.ChromeTransportParameters {
+					dialConfig = cfg.Clone()
+					dialConfig.InitialPacketSize = chromeInitialPacketSize(udpAddr.IP)
+				}
+				conn, err := quicTransport.DialEarly(ctx, udpAddr, tlsCfg, dialConfig)
 				if err != nil {
 					return nil, err
 				}
@@ -388,6 +393,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 	}
 
 	return client
+}
+
+func chromeInitialPacketSize(ip net.IP) uint16 {
+	if ip.To4() != nil {
+		return 1250
+	}
+	return 1230
 }
 
 func init() {
