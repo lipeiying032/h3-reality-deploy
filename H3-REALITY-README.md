@@ -512,8 +512,8 @@ WantedBy=multi-user.target
 - **TP GREASE**：quic-go 自动在 transport parameters 列表首项插入 GREASE 参数
   （ID = `27 + 31*random[0]`、长度 0–15B、随机内容）——这是 QUIC 客户端正常特征，别去掉；
   uTLS 路径把 TP 扩展固定插在 key_share 之后，保证位置与 Chrome 一致。
-- **Alt-Svc 剥离**：`forwardToDest` 反向代理转发 dest 的 H1.1 响应时，必须剥离 `Alt-Svc`
-  和 hop-by-hop 头——H3 响应里出现"H1.1 才有的 Alt-Svc 广告 dest H3 端点"会暴露代理。
+- **Alt-Svc 剥离**：`forwardToDest` 反向代理通过 HTTP/3 转发 dest 响应时，必须剥离 `Alt-Svc`
+  和 hop-by-hop 头——本端点就是这个 H3 服务地址，重复广告会暴露代理。
 - **apple H3 真相**：apple.com QUIC 超时、www.apple.com 稳定 0x150——apple 没有公网 H3
   端点，**不能**当 SNI 或 dest；GFW 最爱探测 apple SNI，但路由表里保留 apple 条目恰好让探测者
   看到"真实 apple 的拒绝行为"（relay 到 apple 后由 apple 自己拒绝）。
