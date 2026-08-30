@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"slices"
 
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/handshake"
@@ -14,15 +13,14 @@ import (
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/qerr"
 	"github.com/apernet/quic-go/internal/wire"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 var errNothingToPack = errors.New("nothing to pack")
 
 const (
-	chromeMinInitialPings       = 8
-	chromeMaxInitialPings       = 19
-	chromeMinInitialPaddingRuns = 5
-	chromeMaxInitialPaddingRuns = 9
+	chromeMinInitialPingsPerPacket = 2
+	chromeMaxInitialPingsPerPacket = 10
 )
 
 type packer interface {
@@ -48,8 +46,7 @@ type payload struct {
 	ack          *wire.AckFrame
 	length       protocol.ByteCount
 
-	preserveFrameOrder bool
-	paddingRuns        int
+	chromeChaos bool
 }
 
 type longHeaderPacket struct {
@@ -149,11 +146,7 @@ type packetPacker struct {
 
 	peekTimes int
 
-	chromeInitialPlanReady      bool
-	chromeInitialFlightDone     bool
-	chromeInitialPacketsPacked  int
-	chromeInitialPingsRemaining int
-	chromePaddingRunsRemaining  int
+	chromeInitialFlightDone bool
 }
 
 const DatagramFrameMaxPeekTimes = 10
@@ -552,15 +545,9 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	hasRetransmission := p.retransmissionQueue.HasData(encLevel)
 	chromeInitial := encLevel == protocol.EncryptionInitial && p.initialStream.chrome
 	shapeChromeFlight := chromeInitial && !p.chromeInitialFlightDone && !hasRetransmission && hasCryptoData()
-	if shapeChromeFlight && !p.chromeInitialPlanReady {
-		p.chromeInitialPingsRemaining = chromeMinInitialPings + p.rand.IntN(chromeMaxInitialPings-chromeMinInitialPings+1)
-		p.chromePaddingRunsRemaining = chromeMinInitialPaddingRuns + p.rand.IntN(chromeMaxInitialPaddingRuns-chromeMinInitialPaddingRuns+1)
-		p.chromeInitialPlanReady = true
-	}
 
 	ack := p.acks.GetAckFrame(encLevel, now, !hasRetransmission && !hasCryptoData())
 	var pl payload
-	pl.preserveFrameOrder = chromeInitial
 	if !hasCryptoData() && !hasRetransmission && ack == nil {
 		if !addPingIfEmpty {
 			// nothing to send
@@ -580,6 +567,9 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		pl.length = ack.Length(v)
 		maxPacketSize -= pl.length
 	}
+	if shapeChromeFlight {
+		p.initialStream.prepareChromeChunks(maxPacketSize)
+	}
 	if hasRetransmission {
 		for {
 			frame := p.retransmissionQueue.GetFrame(encLevel, maxPacketSize, v)
@@ -598,15 +588,7 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	} else {
 		var cryptoFrames int
 		for hasCryptoData() {
-			frameBudget := maxPacketSize
-			if shapeChromeFlight {
-				// Reserve the entire remaining frame plan. The unused part turns
-				// into PADDING, and keeps the randomized metadata from forcing an
-				// otherwise two-packet ClientHello into a third Initial.
-				reserved := protocol.ByteCount(p.chromeInitialPingsRemaining + p.chromePaddingRunsRemaining)
-				frameBudget = max(0, frameBudget-reserved)
-			}
-			cf := popCryptoFrame(frameBudget)
+			cf := popCryptoFrame(maxPacketSize)
 			if cf == nil {
 				break
 			}
@@ -616,18 +598,14 @@ func (p *packetPacker) maybeGetCryptoPacket(
 			cryptoFrames++
 		}
 		if shapeChromeFlight && cryptoFrames > 0 {
+			var paddingBudget protocol.ByteCount
+			pl.frames, pl.length, paddingBudget = p.splitChromeInitialCryptoFrames(pl.frames, pl.length, maxPacketSize, v)
 			hasMore := hasCryptoData()
-			pingCount := p.takeChromeInitialPings(hasMore)
-			pl.frames = p.interleaveChromeInitialPings(pl.frames, pingCount)
+			pingCount := chromeMinInitialPingsPerPacket + p.rand.IntN(chromeMaxInitialPingsPerPacket-chromeMinInitialPingsPerPacket+1)
+			pingCount = min(pingCount, int(paddingBudget))
+			pl.frames = appendChromeInitialPings(pl.frames, pingCount)
 			pl.length += protocol.ByteCount(pingCount)
-
-			futureCryptoFrames := len(p.initialStream.chromeChunks) - p.initialStream.chromeChunkNext
-			pl.paddingRuns = p.takeChromeInitialPaddingRuns(
-				len(pl.frames),
-				futureCryptoFrames+p.chromeInitialPingsRemaining,
-				hasMore,
-			)
-			p.chromeInitialPacketsPacked++
+			pl.chromeChaos = true
 			if !hasMore {
 				p.chromeInitialFlightDone = true
 			}
@@ -636,61 +614,64 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	return hdr, pl
 }
 
-func (p *packetPacker) takeChromeInitialPings(hasMore bool) int {
-	if !hasMore {
-		count := p.chromeInitialPingsRemaining
-		p.chromeInitialPingsRemaining = 0
-		return count
+func (p *packetPacker) splitChromeInitialCryptoFrames(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	paddingBudget protocol.ByteCount,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount, protocol.ByteCount) {
+	// Chrome independently attempts 2..10 random CRYPTO splits per Initial.
+	numFrames := chromeMinAddedCryptoFrames + p.rand.IntN(chromeMaxAddedCryptoFrames-chromeMinAddedCryptoFrames+1)
+	maxOverhead := chromeInitialMaxCryptoFrameOverhead(frames)
+	for range numFrames {
+		if paddingBudget < maxOverhead {
+			break
+		}
+		index := p.rand.IntN(len(frames))
+		frame, ok := frames[index].Frame.(*wire.CryptoFrame)
+		if !ok || len(frame.Data) <= 1 {
+			continue
+		}
+		oldLength := frame.Length(v)
+		firstLength := 1 + p.rand.IntN(len(frame.Data)-1)
+		second := &wire.CryptoFrame{
+			Offset: frame.Offset + protocol.ByteCount(firstLength),
+			Data:   frame.Data[firstLength:],
+		}
+		frame.Data = frame.Data[:firstLength]
+		frames = append(frames, ackhandler.Frame{Frame: second, Handler: frames[index].Handler})
+		extraOverhead := frame.Length(v) + second.Length(v) - oldLength
+		length += extraOverhead
+		paddingBudget -= extraOverhead
 	}
-	reserve := 1
-	if p.chromeInitialPacketsPacked == 0 {
-		reserve = 2 // keep one PING for each of up to two remaining Initials
-	}
-	maxCurrent := p.chromeInitialPingsRemaining - reserve
-	if maxCurrent <= 0 {
-		return 0
-	}
-	count := 1 + p.rand.IntN(maxCurrent)
-	p.chromeInitialPingsRemaining -= count
-	return count
+	return frames, length, paddingBudget
 }
 
-func (p *packetPacker) interleaveChromeInitialPings(frames []ackhandler.Frame, count int) []ackhandler.Frame {
-	pingsAtGap := make([]int, len(frames)+1)
+func chromeInitialMaxCryptoFrameOverhead(frames []ackhandler.Frame) protocol.ByteCount {
+	minOffset := protocol.InvalidByteCount
+	var maxOffset protocol.ByteCount
+	for _, frame := range frames {
+		cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame)
+		if !ok {
+			continue
+		}
+		if minOffset == protocol.InvalidByteCount || cryptoFrame.Offset < minOffset {
+			minOffset = cryptoFrame.Offset
+		}
+		maxOffset = max(maxOffset, cryptoFrame.Offset+protocol.ByteCount(len(cryptoFrame.Data)))
+	}
+	if minOffset == protocol.InvalidByteCount {
+		return 0
+	}
+	dataLength := maxOffset - minOffset
+	return protocol.ByteCount(1 + quicvarint.Len(uint64(maxOffset)) + quicvarint.Len(uint64(dataLength)))
+}
+
+func appendChromeInitialPings(frames []ackhandler.Frame, count int) []ackhandler.Frame {
 	for range count {
-		pingsAtGap[p.rand.IntN(len(pingsAtGap))]++
+		frames = append(frames, ackhandler.Frame{Frame: &wire.PingFrame{}, Handler: emptyHandler{}})
 	}
-	interleaved := make([]ackhandler.Frame, 0, len(frames)+count)
-	for gap, pings := range pingsAtGap {
-		for range pings {
-			interleaved = append(interleaved, ackhandler.Frame{Frame: &wire.PingFrame{}, Handler: emptyHandler{}})
-		}
-		if gap < len(frames) {
-			interleaved = append(interleaved, frames[gap])
-		}
-	}
-	return interleaved
-}
-
-func (p *packetPacker) takeChromeInitialPaddingRuns(currentFrames, futureFrames int, hasMore bool) int {
-	if !hasMore {
-		count := p.chromePaddingRunsRemaining
-		p.chromePaddingRunsRemaining = 0
-		return count
-	}
-	reserve := 1
-	if p.chromeInitialPacketsPacked == 0 {
-		reserve = 2 // keep one run for each of up to two remaining Initials
-	}
-	minCurrent := max(1, p.chromePaddingRunsRemaining-(futureFrames+1))
-	maxCurrent := min(currentFrames+1, p.chromePaddingRunsRemaining-reserve)
-	if maxCurrent <= 0 {
-		return 0
-	}
-	minCurrent = min(minCurrent, maxCurrent)
-	count := minCurrent + p.rand.IntN(maxCurrent-minCurrent+1)
-	p.chromePaddingRunsRemaining -= count
-	return count
+	return frames
 }
 
 func (p *packetPacker) maybeGetAppDataPacketFor0RTT(sealer sealer, maxSize protocol.ByteCount, now monotime.Time, v protocol.Version) (*wire.ExtendedHeader, payload) {
@@ -1092,29 +1073,28 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 			return nil, err
 		}
 	}
-	var paddingByGap []protocol.ByteCount
-	if paddingLen > 0 && pl.paddingRuns > 0 {
-		paddingByGap = p.randomChromePaddingByGap(len(pl.frames), pl.paddingRuns, paddingLen)
+	if pl.chromeChaos {
+		var err error
+		raw, err = p.appendChromeInitialPayload(raw, pl.frames, paddingLen, v)
+		if err != nil {
+			return nil, err
+		}
 	} else if paddingLen > 0 {
 		raw = append(raw, make([]byte, paddingLen)...)
 	}
 	// Randomize the order of the control frames.
 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.
-	if len(pl.frames) > 1 && !pl.preserveFrameOrder {
+	if len(pl.frames) > 1 && !pl.chromeChaos {
 		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
 	}
-	for i, f := range pl.frames {
-		if len(paddingByGap) > 0 {
-			raw = append(raw, make([]byte, paddingByGap[i])...)
+	if !pl.chromeChaos {
+		for _, f := range pl.frames {
+			var err error
+			raw, err = f.Frame.Append(raw, v)
+			if err != nil {
+				return nil, err
+			}
 		}
-		var err error
-		raw, err = f.Frame.Append(raw, v)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if len(paddingByGap) > 0 {
-		raw = append(raw, make([]byte, paddingByGap[len(pl.frames)])...)
 	}
 	for _, f := range pl.streamFrames {
 		var err error
@@ -1130,41 +1110,45 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 	return raw, nil
 }
 
-func (p *packetPacker) randomChromePaddingByGap(frameCount, requestedRuns int, paddingLen protocol.ByteCount) []protocol.ByteCount {
-	runs := min(requestedRuns, frameCount+1, int(paddingLen))
-	gaps := make([]int, frameCount+1)
-	for i := range gaps {
-		gaps[i] = i
-	}
-	p.rand.Shuffle(len(gaps), func(i, j int) { gaps[i], gaps[j] = gaps[j], gaps[i] })
-	gaps = gaps[:runs]
-	slices.Sort(gaps)
+type chromeInitialPayloadItem struct {
+	frame      wire.Frame
+	paddingLen protocol.ByteCount
+}
 
-	// Quadratically separated, randomized weights deliberately avoid the
-	// near-equal runs produced by the old ceiling-division loop.
-	weights := make([]int, runs)
-	var totalWeight int
-	for i := range weights {
-		weights[i] = (i + 1) * (i + 1) * (8 + p.rand.IntN(9))
-		totalWeight += weights[i]
-	}
-	p.rand.Shuffle(len(weights), func(i, j int) { weights[i], weights[j] = weights[j], weights[i] })
-
-	paddingByGap := make([]protocol.ByteCount, frameCount+1)
-	remaining := int(paddingLen)
-	remainingWeight := totalWeight
-	for i, gap := range gaps {
-		runsAfter := runs - i - 1
-		length := remaining
-		if runsAfter > 0 {
-			length = remaining * weights[i] / remainingWeight
-			length = max(1, min(length, remaining-runsAfter))
+func (p *packetPacker) appendChromeInitialPayload(
+	raw []byte,
+	frames []ackhandler.Frame,
+	paddingLen protocol.ByteCount,
+	v protocol.Version,
+) ([]byte, error) {
+	// Chrome samples 0..remaining bytes before each non-PADDING frame, appends
+	// any tail, then shuffles the complete frame list.
+	items := make([]chromeInitialPayloadItem, 0, 2*len(frames)+1)
+	remaining := paddingLen
+	for _, frame := range frames {
+		padding := protocol.ByteCount(p.rand.Int64N(int64(remaining) + 1))
+		if padding > 0 {
+			items = append(items, chromeInitialPayloadItem{paddingLen: padding})
+			remaining -= padding
 		}
-		paddingByGap[gap] = protocol.ByteCount(length)
-		remaining -= length
-		remainingWeight -= weights[i]
+		items = append(items, chromeInitialPayloadItem{frame: frame.Frame})
 	}
-	return paddingByGap
+	if remaining > 0 {
+		items = append(items, chromeInitialPayloadItem{paddingLen: remaining})
+	}
+	p.rand.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
+	for _, item := range items {
+		if item.frame == nil {
+			raw = append(raw, make([]byte, item.paddingLen)...)
+			continue
+		}
+		var err error
+		raw, err = item.frame.Append(raw, v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
 }
 
 func (p *packetPacker) encryptPacket(raw []byte, sealer sealer, pn protocol.PacketNumber, payloadOffset, pnLen protocol.ByteCount) []byte {

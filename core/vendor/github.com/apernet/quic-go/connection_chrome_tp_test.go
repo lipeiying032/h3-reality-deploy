@@ -77,8 +77,8 @@ func TestChromeTransportParameters(t *testing.T) {
 	tp := &wire.TransportParameters{}
 	applyChromeTransportParameters(tp, protocol.Version1)
 	encoded := tp.Marshal(protocol.PerspectiveClient)
-	if len(encoded) < 82 || len(encoded) > 95 {
-		t.Errorf("transport parameters length = %d, want 82..95", len(encoded))
+	if len(encoded) < 85 || len(encoded) > 100 {
+		t.Errorf("transport parameters length = %d, want 85..100", len(encoded))
 	}
 	params := parseTransportParameters(t, encoded)
 
@@ -104,9 +104,12 @@ func TestChromeTransportParameters(t *testing.T) {
 	if _, ok := params[0xe]; ok {
 		t.Error("active_connection_id_limit (0xe) must be omitted")
 	}
-	versionInfo := params[0x11]
+	versionInfo := params[0xff73db]
 	if len(versionInfo) != 12 {
 		t.Fatalf("version_information length = %d, want 12", len(versionInfo))
+	}
+	if _, ok := params[0x11]; ok {
+		t.Error("final version_information codepoint 0x11 must be omitted")
 	}
 	if chosen := binary.BigEndian.Uint32(versionInfo[:4]); chosen != uint32(protocol.Version1) {
 		t.Errorf("chosen version = %#x, want v1", chosen)
@@ -124,8 +127,12 @@ func TestChromeTransportParameters(t *testing.T) {
 	} else {
 		t.Errorf("available versions = [%#x %#x], v1 missing", available1, available2)
 	}
-	if !bytes.Equal(params[0x3128], []byte("ORIG")) {
-		t.Errorf("google_connection_options = %q, want ORIG", params[0x3128])
+	googleVersion := params[0x4752]
+	if len(googleVersion) != 4 || binary.BigEndian.Uint32(googleVersion) != uint32(protocol.Version1) {
+		t.Errorf("google_quic_version = %x, want 00000001", googleVersion)
+	}
+	if _, ok := params[0x3128]; ok {
+		t.Error("google_connection_options 0x3128 must be omitted")
 	}
 	if tp.MaxIdleTimeout != 30*time.Second {
 		t.Errorf("MaxIdleTimeout = %s, want 30s", tp.MaxIdleTimeout)
@@ -156,8 +163,8 @@ func TestChromeTransportParametersRandomizedPerConnection(t *testing.T) {
 				if param.idLength != 8 {
 					t.Errorf("GREASE transport parameter ID uses %d-byte varint, want 8", param.idLength)
 				}
-				if len(param.value) < 2 || len(param.value) > 15 {
-					t.Errorf("GREASE transport parameter value length = %d, want 2..15", len(param.value))
+				if len(param.value) > 15 {
+					t.Errorf("GREASE transport parameter value length = %d, want 0..15", len(param.value))
 				}
 			}
 		}

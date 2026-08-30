@@ -69,12 +69,10 @@ func newChromeTestClientHello(size int) []byte {
 	return clientHello
 }
 
-func TestChromeInitialCryptoFramesRandomizeAndReassemble(t *testing.T) {
+func TestChromeInitialCryptoBaseLayoutRandomizesAndReassembles(t *testing.T) {
 	const connections = 100
-	clientHello := newChromeTestClientHello(1700)
+	clientHello := newChromeTestClientHello(1793)
 	sequences := make(map[string]struct{}, connections)
-	packetDistributions := make(map[string]struct{})
-	var totalChunks, twoPacketFlights int
 
 	for conn := range connections {
 		stream := newInitialCryptoStream(true, true)
@@ -88,59 +86,47 @@ func TestChromeInitialCryptoFramesRandomizeAndReassemble(t *testing.T) {
 		if _, err := stream.Write(clientHello[splitAt:]); err != nil {
 			t.Fatal(err)
 		}
+		stream.prepareChromeChunks(1215)
 
 		var offsets []protocol.ByteCount
-		var lengths, framesPerPacket []int
+		var lengths []int
 		reconstructed := make([]byte, len(clientHello))
 		for stream.HasData() {
-			remaining := protocol.ByteCount(1180)
-			var packetFrames int
-			for stream.HasData() {
-				frame := stream.PopCryptoFrame(remaining - 1) // reserve PING
-				if frame == nil {
-					break
-				}
-				offsets = append(offsets, frame.Offset)
-				lengths = append(lengths, len(frame.Data))
-				copy(reconstructed[frame.Offset:], frame.Data)
-				remaining -= frame.Length(protocol.Version1) + 1
-				packetFrames++
+			frame := stream.PopCryptoFrame(2000)
+			if frame == nil {
+				t.Fatal("prepared CRYPTO frame did not fit")
 			}
-			if packetFrames == 0 {
-				t.Fatal("no randomized CRYPTO frame fit in an empty Initial packet")
-			}
-			framesPerPacket = append(framesPerPacket, packetFrames)
+			offsets = append(offsets, frame.Offset)
+			lengths = append(lengths, len(frame.Data))
+			copy(reconstructed[frame.Offset:], frame.Data)
 		}
 
-		if count := len(offsets); count < chromeMinCryptoChunks || count > chromeMaxCryptoChunks {
-			t.Fatalf("CRYPTO frame count = %d, want %d..%d", count, chromeMinCryptoChunks, chromeMaxCryptoChunks)
+		if len(offsets) != 3 {
+			t.Fatalf("base CRYPTO frame count = %d, want 3", len(offsets))
+		}
+		if offsets[0] != 0 || lengths[0] < 55 || lengths[0] > 86 {
+			t.Errorf("first CRYPTO frame = offset %d length %d, want offset 0 length 55..86", offsets[0], lengths[0])
+		}
+		if offsets[1]+protocol.ByteCount(lengths[1]) != protocol.ByteCount(len(clientHello)) {
+			t.Errorf("tail CRYPTO frame ends at %d, want %d", offsets[1]+protocol.ByteCount(lengths[1]), len(clientHello))
+		}
+		if got := lengths[0] + lengths[1]; got != 894 {
+			t.Errorf("first Initial base CRYPTO data = %d, want 894", got)
+		}
+		if offsets[2] != protocol.ByteCount(lengths[0]) || offsets[2]+protocol.ByteCount(lengths[2]) != offsets[1] {
+			t.Errorf("middle CRYPTO frame offset/length = %d/%d, want [%d,%d)", offsets[2], lengths[2], lengths[0], offsets[1])
+		}
+		if lengths[2] != 899 {
+			t.Errorf("second Initial base CRYPTO data = %d, want 899", lengths[2])
 		}
 		if !bytes.Equal(reconstructed, clientHello) {
-			t.Fatal("randomized CRYPTO frames did not reconstruct the ClientHello")
+			t.Fatal("base CRYPTO frames did not reconstruct the ClientHello")
 		}
-		if len(framesPerPacket) < 2 || len(framesPerPacket) > 3 {
-			t.Fatalf("Initial packet count = %d, want 2 or 3", len(framesPerPacket))
-		}
-		if len(framesPerPacket) == 2 {
-			twoPacketFlights++
-		}
-		totalChunks += len(offsets)
 		sequences[fmt.Sprintf("%v/%v", offsets, lengths)] = struct{}{}
-		packetDistributions[fmt.Sprint(framesPerPacket)] = struct{}{}
 	}
 
-	mean := float64(totalChunks) / connections
-	if mean < 12.5 || mean > 15.5 {
-		t.Errorf("mean CRYPTO frame count = %.2f, want approximately 14", mean)
-	}
-	if len(sequences) < connections/2 {
+	if len(sequences) < 20 {
 		t.Errorf("only %d/%d randomized CRYPTO sequences were distinct", len(sequences), connections)
-	}
-	if len(packetDistributions) < 2 {
-		t.Errorf("CRYPTO packet distribution did not vary: %v", packetDistributions)
-	}
-	if twoPacketFlights < 95 {
-		t.Errorf("only %d/%d first flights used two Initial packets", twoPacketFlights, connections)
 	}
 }
 
@@ -182,7 +168,20 @@ func parseChromeTestPayload(payload []byte) (int, []int, error) {
 	return pings, paddingRuns, nil
 }
 
-func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
+func TestChromeInitialAppendsPingFrames(t *testing.T) {
+	cryptoFrame := ackhandler.Frame{Frame: &wire.CryptoFrame{Data: []byte{1}}}
+	frames := appendChromeInitialPings([]ackhandler.Frame{cryptoFrame}, 3)
+	if len(frames) != 4 || frames[0].Frame != cryptoFrame.Frame {
+		t.Fatalf("frame list = %#v, want CRYPTO followed by three PINGs", frames)
+	}
+	for i, frame := range frames[1:] {
+		if _, ok := frame.Frame.(*wire.PingFrame); !ok {
+			t.Errorf("appended frame %d = %T, want PING", i, frame.Frame)
+		}
+	}
+}
+
+func TestChromeInitialSpreadsPaddingAndShufflesFrames(t *testing.T) {
 	crypto1 := &wire.CryptoFrame{Offset: 929, Data: []byte{2, 3}}
 	crypto2 := &wire.CryptoFrame{Offset: 1534, Data: []byte{4, 5}}
 	pl := payload{
@@ -193,13 +192,14 @@ func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 			{Frame: crypto2},
 			{Frame: &wire.PingFrame{}},
 		},
-		length:             crypto1.Length(protocol.Version1) + crypto2.Length(protocol.Version1) + 3,
-		preserveFrameOrder: true,
-		paddingRuns:        5,
+		length:      crypto1.Length(protocol.Version1) + crypto2.Length(protocol.Version1) + 3,
+		chromeChaos: true,
 	}
 	packer := &packetPacker{rand: *rand.New(rand.NewPCG(1, 2))}
 	layouts := make(map[string]struct{})
-	for range 20 {
+	runCounts := make(map[int]struct{})
+	firstFrameTypes := make(map[byte]struct{})
+	for range 100 {
 		raw, err := packer.appendPacketPayload(nil, pl, 97, protocol.Version1)
 		if err != nil {
 			t.Fatal(err)
@@ -214,26 +214,92 @@ func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 		if pings != 3 {
 			t.Fatalf("PING count = %d, want 3", pings)
 		}
-		if len(runs) != 5 {
-			t.Fatalf("PADDING run count = %d, want 5", len(runs))
+		if len(runs) == 0 || len(runs) > len(pl.frames)+1 {
+			t.Fatalf("PADDING run count = %d, want 1..%d", len(runs), len(pl.frames)+1)
 		}
-		var total, minRun, maxRun int
-		minRun = runs[0]
+		var total int
 		for _, run := range runs {
 			total += run
-			minRun = min(minRun, run)
-			maxRun = max(maxRun, run)
 		}
 		if total != 97 {
 			t.Fatalf("PADDING total = %d, want 97", total)
 		}
-		if maxRun-minRun < 10 {
-			t.Errorf("PADDING lengths are too uniform: %v", runs)
-		}
 		layouts[fmt.Sprint(runs)] = struct{}{}
+		runCounts[len(runs)] = struct{}{}
+		for _, frameType := range raw {
+			if frameType != 0 {
+				firstFrameTypes[frameType] = struct{}{}
+				break
+			}
+		}
 	}
-	if len(layouts) < 10 {
-		t.Errorf("only %d/20 PADDING length layouts were distinct", len(layouts))
+	if len(layouts) < 20 || len(runCounts) < 3 {
+		t.Errorf("padding diversity = %d layouts / %d run counts", len(layouts), len(runCounts))
+	}
+	if _, ok := firstFrameTypes[byte(wire.FrameTypePing)]; !ok {
+		t.Error("PING was never shuffled to the first non-PADDING position")
+	}
+	if _, ok := firstFrameTypes[byte(wire.FrameTypeCrypto)]; !ok {
+		t.Error("CRYPTO was never shuffled to the first non-PADDING position")
+	}
+}
+
+func TestChromeInitialCryptoSplitStopsAtPaddingBudget(t *testing.T) {
+	frame := &wire.CryptoFrame{Data: make([]byte, 100)}
+	frames := []ackhandler.Frame{{Frame: frame}}
+	length := frame.Length(protocol.Version1)
+	packer := &packetPacker{rand: *rand.New(rand.NewPCG(1, 2))}
+	gotFrames, gotLength, remaining := packer.splitChromeInitialCryptoFrames(frames, length, 4, protocol.Version1)
+	if len(gotFrames) != 1 || gotLength != length || remaining != 4 {
+		t.Fatalf("4-byte budget produced %d frames, length %d, remaining %d", len(gotFrames), gotLength, remaining)
+	}
+}
+
+func TestChromeInitialChaosFitsNearFullPacket(t *testing.T) {
+	clientHello := newChromeTestClientHello(1204)
+	stream := newInitialCryptoStream(true, true)
+	if _, err := stream.Write(clientHello); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := protocol.GenerateConnectionID(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packer := newPacketPacker(
+		protocol.ConnectionID{},
+		func() protocol.ConnectionID { return dest },
+		stream,
+		newCryptoStream(),
+		&chromeTestPacketNumberManager{},
+		newRetransmissionQueue(),
+		chromeTestSealingManager{},
+		nil,
+		chromeTestAckSource{},
+		nil,
+		protocol.PerspectiveClient,
+	)
+	packet, err := packer.PackCoalescedPacket(false, 1250, monotime.Now(), protocol.Version1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet == nil {
+		t.Fatal("near-full ClientHello produced no Initial")
+	}
+	defer packet.buffer.Release()
+	if len(packet.buffer.Data) != 1250 {
+		t.Fatalf("Initial UDP payload = %d, want 1250", len(packet.buffer.Data))
+	}
+	reconstructed := make([]byte, len(clientHello))
+	for _, frame := range packet.longHdrPackets[0].frames {
+		if cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame); ok {
+			copy(reconstructed[cryptoFrame.Offset:], cryptoFrame.Data)
+		}
+	}
+	if !bytes.Equal(reconstructed, clientHello) {
+		t.Fatal("near-full ClientHello did not reassemble")
+	}
+	if stream.HasData() {
+		t.Fatal("near-full ClientHello unexpectedly required another Initial")
 	}
 }
 
@@ -259,9 +325,16 @@ func TestChromeInitialPacketNumberStartsAtOne(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	for want := protocol.PacketNumber(1); want <= 3; want++ {
-		peeked, _ := handler.PeekPacketNumber(protocol.EncryptionInitial)
+		peeked, pnLen := handler.PeekPacketNumber(protocol.EncryptionInitial)
 		if peeked != want {
 			t.Fatalf("peeked Initial packet number = %d, want %d", peeked, want)
+		}
+		wantLen := protocol.PacketNumberLen2
+		if want == 1 {
+			wantLen = protocol.PacketNumberLen1
+		}
+		if pnLen != wantLen {
+			t.Errorf("Initial packet number %d uses %d bytes, want %d", want, pnLen, wantLen)
 		}
 		if popped := handler.PopPacketNumber(protocol.EncryptionInitial); popped != want {
 			t.Fatalf("popped Initial packet number = %d, want %d", popped, want)
@@ -345,6 +418,9 @@ func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
 			if len(runs) == 0 {
 				t.Error("Initial packet contains no PADDING run")
 			}
+			if len(runs) > len(longPacket.frames)+1 {
+				t.Errorf("Initial packet PADDING runs = %d, want at most %d", len(runs), len(longPacket.frames)+1)
+			}
 			totalPings += pings
 			totalPaddingRuns += len(runs)
 			pingsPerPacket = append(pingsPerPacket, pings)
@@ -356,14 +432,13 @@ func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
 		if packets < 2 || packets > 3 {
 			t.Errorf("Initial packet count = %d, want 2 or 3", packets)
 		}
-		if cryptoFrames < chromeMinCryptoChunks || cryptoFrames > chromeMaxCryptoChunks {
-			t.Errorf("CRYPTO frame count = %d, want %d..%d", cryptoFrames, chromeMinCryptoChunks, chromeMaxCryptoChunks)
+		if cryptoFrames < 3 || cryptoFrames > 3+2*chromeMaxAddedCryptoFrames {
+			t.Errorf("CRYPTO frame count = %d, want 3..%d", cryptoFrames, 3+2*chromeMaxAddedCryptoFrames)
 		}
-		if totalPings < chromeMinInitialPings || totalPings > chromeMaxInitialPings {
-			t.Errorf("PING total = %d, want %d..%d", totalPings, chromeMinInitialPings, chromeMaxInitialPings)
-		}
-		if totalPaddingRuns < chromeMinInitialPaddingRuns || totalPaddingRuns > chromeMaxInitialPaddingRuns {
-			t.Errorf("PADDING run total = %d, want %d..%d", totalPaddingRuns, chromeMinInitialPaddingRuns, chromeMaxInitialPaddingRuns)
+		for packet, pings := range pingsPerPacket {
+			if pings < chromeMinInitialPingsPerPacket || pings > chromeMaxInitialPingsPerPacket {
+				t.Errorf("Initial packet %d PING count = %d, want %d..%d", packet, pings, chromeMinInitialPingsPerPacket, chromeMaxInitialPingsPerPacket)
+			}
 		}
 		if !bytes.Equal(reconstructed, clientHello) {
 			t.Error("packed CRYPTO frames did not reconstruct the ClientHello")
