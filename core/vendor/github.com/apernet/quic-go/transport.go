@@ -74,6 +74,9 @@ type Transport struct {
 	// Due to the increased risk of collisions, it is not recommended to use connection IDs shorter than 4 bytes.
 	// If unset, a 4 byte connection ID will be used.
 	ConnectionIDLength int
+	// UseZeroLengthConnectionIDs makes this transport generate zero-length
+	// source connection IDs. It takes precedence over ConnectionIDLength.
+	UseZeroLengthConnectionIDs bool
 
 	// Use for generating new connection IDs.
 	// This allows the application to control of the connection IDs used,
@@ -257,11 +260,18 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
 		tlsConf,
 		conf,
-		0,
+		clientInitialPacketNumber(conf),
 		false,
 		use0RTT,
 		conf.Versions[0],
 	)
+}
+
+func clientInitialPacketNumber(conf *Config) protocol.PacketNumber {
+	if conf.ChromeTransportParameters {
+		return 1
+	}
+	return 0
 }
 
 func (t *Transport) doDial(
@@ -278,7 +288,7 @@ func (t *Transport) doDial(
 	if err != nil {
 		return nil, err
 	}
-	destConnID, err := generateConnectionIDForInitial()
+	destConnID, err := generateInitialConnectionID(config)
 	if err != nil {
 		return nil, err
 	}
@@ -407,10 +417,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 			t.connIDGenerator = t.ConnectionIDGenerator
 			t.connIDLen = t.ConnectionIDGenerator.ConnectionIDLen()
 		} else {
-			connIDLen := t.ConnectionIDLength
-			if t.ConnectionIDLength == 0 && !allowZeroLengthConnIDs {
-				connIDLen = protocol.DefaultConnectionIDLength
-			}
+			connIDLen := t.configuredConnectionIDLength(allowZeroLengthConnIDs)
 			t.connIDLen = connIDLen
 			t.connIDGenerator = &protocol.DefaultConnectionIDGenerator{ConnLen: t.connIDLen}
 		}
@@ -427,6 +434,23 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 		go t.runSendQueue()
 	})
 	return t.initErr
+}
+
+func (t *Transport) configuredConnectionIDLength(allowZeroLengthConnIDs bool) int {
+	if t.UseZeroLengthConnectionIDs {
+		return 0
+	}
+	if t.ConnectionIDLength == 0 && !allowZeroLengthConnIDs {
+		return protocol.DefaultConnectionIDLength
+	}
+	return t.ConnectionIDLength
+}
+
+func generateInitialConnectionID(config *Config) (protocol.ConnectionID, error) {
+	if config.InitialDCIDLength != 0 {
+		return protocol.GenerateConnectionID(config.InitialDCIDLength)
+	}
+	return generateConnectionIDForInitial()
 }
 
 // WriteTo sends a packet on the underlying connection.

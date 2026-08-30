@@ -90,6 +90,15 @@ type TransportParameters struct {
 	MaxDatagramFrameSize protocol.ByteCount // RFC 9221
 	EnableResetStreamAt  bool               // https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
 	MinAckDelay          *time.Duration
+
+	// Additional contains client-only parameters whose values are already
+	// encoded. Unknown parameters are ignored by peers as required by QUIC.
+	Additional map[uint64][]byte
+
+	// RandomizeOrder shuffles client transport parameters once and keeps the
+	// resulting encoding stable for the lifetime of this parameter set.
+	RandomizeOrder             bool
+	randomizedClientParameters []byte
 }
 
 // Unmarshal the transport parameters
@@ -352,18 +361,17 @@ func (p *TransportParameters) readNumericTransportParameter(b []byte, paramID tr
 
 // Marshal the transport parameters
 func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
+	if pers == protocol.PerspectiveClient && p.RandomizeOrder && len(p.randomizedClientParameters) > 0 {
+		return append([]byte(nil), p.randomizedClientParameters...)
+	}
+
 	// Typical Transport Parameters consume around 110 bytes, depending on the exact values,
 	// especially the lengths of the Connection IDs.
 	// Allocate 256 bytes, so we won't have to grow the slice in any case.
 	b := make([]byte, 0, 256)
 
 	// add a greased value
-	random := make([]byte, 18)
-	rand.Read(random)
-	b = quicvarint.Append(b, 27+31*uint64(random[0]))
-	length := random[1] % 16
-	b = quicvarint.Append(b, uint64(length))
-	b = append(b, random[2:2+length]...)
+	b = appendGREASETransportParameter(b, p.RandomizeOrder && pers == protocol.PerspectiveClient)
 
 	// initial_max_stream_data_bidi_local
 	b = p.marshalVarintParam(b, initialMaxStreamDataBidiLocalParameterID, uint64(p.InitialMaxStreamDataBidiLocal))
@@ -458,6 +466,13 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 	if p.MinAckDelay != nil {
 		b = p.marshalVarintParam(b, minAckDelayParameterID, uint64(*p.MinAckDelay/time.Microsecond))
 	}
+	if pers == protocol.PerspectiveClient {
+		for id, value := range p.Additional {
+			b = quicvarint.Append(b, id)
+			b = quicvarint.Append(b, uint64(len(value)))
+			b = append(b, value...)
+		}
+	}
 
 	if pers == protocol.PerspectiveClient && len(AdditionalTransportParametersClient) > 0 {
 		for k, v := range AdditionalTransportParametersClient {
@@ -467,7 +482,70 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 		}
 	}
 
+	if pers == protocol.PerspectiveClient && p.RandomizeOrder {
+		b = shuffleTransportParameters(b)
+		p.randomizedClientParameters = append([]byte(nil), b...)
+	}
 	return b
+}
+
+func appendGREASETransportParameter(b []byte, chromeStyle bool) []byte {
+	if !chromeStyle {
+		random := make([]byte, 18)
+		rand.Read(random)
+		b = quicvarint.Append(b, 27+31*uint64(random[0]))
+		length := random[1] % 16
+		b = quicvarint.Append(b, uint64(length))
+		return append(b, random[2:2+length]...)
+	}
+
+	// Chrome uses an RFC 9000 GREASE ID encoded as an 8-byte QUIC varint.
+	// Keep the ID in [2^30, 2^62) while retaining the 27 + 31*N shape.
+	random := make([]byte, 24)
+	rand.Read(random)
+	const minMultiplier = ((uint64(1) << 30) - 27 + 30) / 31
+	const maxMultiplier = ((uint64(1) << 62) - 1 - 27) / 31
+	multiplier := minMultiplier + binary.BigEndian.Uint64(random[:8])%(maxMultiplier-minMultiplier+1)
+	b = quicvarint.Append(b, 27+31*multiplier)
+	length := 2 + random[8]%14
+	b = quicvarint.Append(b, uint64(length))
+	return append(b, random[9:9+length]...)
+}
+
+func shuffleTransportParameters(b []byte) []byte {
+	remaining := b
+	params := make([][]byte, 0, 16)
+	for len(remaining) > 0 {
+		start := remaining
+		_, n, err := quicvarint.Parse(remaining)
+		if err != nil {
+			return b
+		}
+		remaining = remaining[n:]
+		length, n, err := quicvarint.Parse(remaining)
+		if err != nil {
+			return b
+		}
+		remaining = remaining[n:]
+		if uint64(len(remaining)) < length {
+			return b
+		}
+		consumed := len(start) - len(remaining) + int(length)
+		params = append(params, start[:consumed])
+		remaining = remaining[length:]
+	}
+
+	for i := len(params) - 1; i > 0; i-- {
+		var random [8]byte
+		rand.Read(random[:])
+		j := int(binary.BigEndian.Uint64(random[:]) % uint64(i+1))
+		params[i], params[j] = params[j], params[i]
+	}
+	shuffled := make([]byte, 0, len(b))
+	for _, param := range params {
+		shuffled = append(shuffled, param...)
+	}
+	return shuffled
 }
 
 func (p *TransportParameters) marshalVarintParam(b []byte, id transportParameterID, val uint64) []byte {
