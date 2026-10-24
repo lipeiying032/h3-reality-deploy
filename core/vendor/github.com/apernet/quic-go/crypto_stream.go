@@ -18,8 +18,8 @@ import (
 const disableClientHelloScramblingEnv = "QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING"
 
 const (
-	chromeMinCryptoChunks = 9
-	chromeMaxCryptoChunks = 19
+	chromeMinAddedCryptoFrames = 2
+	chromeMaxAddedCryptoFrames = 10
 )
 
 // The baseCryptoStream is used by the cryptoStream and the initialCryptoStream.
@@ -150,7 +150,7 @@ func newInitialCryptoStream(isClient, chrome bool) *initialCryptoStream {
 
 func (s *initialCryptoStream) HasData() bool {
 	if s.chrome && !s.chromeDone {
-		return len(s.chromeChunks) > 0 && s.chromeChunkNext < len(s.chromeChunks)
+		return s.end != protocol.InvalidByteCount && (len(s.chromeChunks) == 0 || s.chromeChunkNext < len(s.chromeChunks))
 	}
 	// The ClientHello might be written in multiple parts.
 	// In order to correctly split the ClientHello, we need the entire ClientHello has been queued.
@@ -163,7 +163,7 @@ func (s *initialCryptoStream) HasData() bool {
 func (s *initialCryptoStream) Write(p []byte) (int, error) {
 	s.writeBuf = append(s.writeBuf, p...)
 	if s.chrome && !s.chromeDone {
-		if len(s.chromeChunks) > 0 || len(s.writeBuf) < 4 {
+		if s.end != protocol.InvalidByteCount || len(s.writeBuf) < 4 {
 			return len(p), nil
 		}
 		if s.writeBuf[0] != 1 {
@@ -174,7 +174,6 @@ func (s *initialCryptoStream) Write(p []byte) (int, error) {
 			return len(p), nil
 		}
 		s.end = protocol.ByteCount(clientHelloLen)
-		s.prepareChromeChunks()
 		return len(p), nil
 	}
 	if !s.scramble {
@@ -312,41 +311,45 @@ func (s *initialCryptoStream) finishChromeChunks() {
 	s.chromeDone = true
 }
 
-func (s *initialCryptoStream) prepareChromeChunks() {
-	numChunks := chromeMinCryptoChunks + s.chromeRand.IntN(chromeMaxCryptoChunks-chromeMinCryptoChunks+1)
-	// A real ClientHello is much larger than the observed chunk count. Keep the
-	// fallback well-defined for synthetic or malformed tiny handshakes as well.
-	if end := int(s.end); numChunks > end {
-		numChunks = end
+func (s *initialCryptoStream) prepareChromeChunks(bytesFree protocol.ByteCount) {
+	if len(s.chromeChunks) > 0 || s.end <= 0 {
+		return
 	}
-
-	// Allocate the contiguous ClientHello ranges using bounded random weights.
-	// Bounding the weights keeps every range small enough that the first flight
-	// normally occupies two Initial packets, without producing equal-sized cuts.
-	weights := make([]int, numChunks)
-	var totalWeight int
-	for i := range weights {
-		weights[i] = 50 + s.chromeRand.IntN(101)
-		totalWeight += weights[i]
+	// Chrome balances the ClientHello over the minimum number of Initials.
+	// The first packet reserves two worst-case CRYPTO headers, while every
+	// following packet reserves one.
+	minFrameSize := (&wire.CryptoFrame{Offset: s.end - 1, Data: s.writeBuf[:s.end]}).Length(protocol.Version1) - s.end
+	if bytesFree <= 2*minFrameSize {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
 	}
+	maxDataFirstPacket := bytesFree - 2*minFrameSize
+	if s.end <= maxDataFirstPacket {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
+	}
+	maxDataOtherPackets := bytesFree - minFrameSize
+	firstPacketOccupiedSpace := maxDataOtherPackets - maxDataFirstPacket
+	numPackets := (s.end + firstPacketOccupiedSpace + maxDataOtherPackets - 1) / maxDataOtherPackets
+	dataInOtherPackets := (s.end + firstPacketOccupiedSpace + numPackets - 1) / numPackets
+	dataInFirstPacket := dataInOtherPackets - firstPacketOccupiedSpace
 
-	remaining := int(s.end)
-	remainingWeight := totalWeight
-	start := protocol.ByteCount(0)
-	for i, weight := range weights {
-		chunksAfter := numChunks - i - 1
-		chunkLen := remaining
-		if chunksAfter > 0 {
-			chunkLen = remaining * weight / remainingWeight
-			chunkLen = max(1, min(chunkLen, remaining-chunksAfter))
-		}
-		end := start + protocol.ByteCount(chunkLen)
+	// Put the beginning and tail in the first Initial and the intervening bytes
+	// in later Initials. Chrome randomizes the first cut over [55, 86].
+	firstFrameLength := protocol.ByteCount(55 + s.chromeRand.IntN(32))
+	if dataInFirstPacket <= firstFrameLength || dataInFirstPacket >= s.end {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
+	}
+	lastFrameLength := dataInFirstPacket - firstFrameLength
+	lastFrameStart := s.end - lastFrameLength
+	s.chromeChunks = append(s.chromeChunks,
+		clientHelloCut{start: 0, end: firstFrameLength},
+		clientHelloCut{start: lastFrameStart, end: s.end},
+	)
+	for start := firstFrameLength; start < lastFrameStart; {
+		end := min(start+dataInOtherPackets, lastFrameStart)
 		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: start, end: end})
 		start = end
-		remaining -= chunkLen
-		remainingWeight -= weight
 	}
-	s.chromeRand.Shuffle(len(s.chromeChunks), func(i, j int) {
-		s.chromeChunks[i], s.chromeChunks[j] = s.chromeChunks[j], s.chromeChunks[i]
-	})
 }
