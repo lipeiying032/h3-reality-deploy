@@ -13,6 +13,7 @@ import (
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/qerr"
 	"github.com/apernet/quic-go/internal/wire"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 var errNothingToPack = errors.New("nothing to pack")
@@ -587,13 +588,7 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	} else {
 		var cryptoFrames int
 		for hasCryptoData() {
-			frameBudget := maxPacketSize
-			if shapeChromeFlight {
-				// Keep room for the PINGs added by chaos protection.
-				reserved := protocol.ByteCount(chromeMaxInitialPingsPerPacket)
-				frameBudget = max(0, frameBudget-reserved)
-			}
-			cf := popCryptoFrame(frameBudget)
+			cf := popCryptoFrame(maxPacketSize)
 			if cf == nil {
 				break
 			}
@@ -603,9 +598,11 @@ func (p *packetPacker) maybeGetCryptoPacket(
 			cryptoFrames++
 		}
 		if shapeChromeFlight && cryptoFrames > 0 {
-			pl.frames, pl.length = p.splitChromeInitialCryptoFrames(pl.frames, pl.length, v)
+			var paddingBudget protocol.ByteCount
+			pl.frames, pl.length, paddingBudget = p.splitChromeInitialCryptoFrames(pl.frames, pl.length, maxPacketSize, v)
 			hasMore := hasCryptoData()
 			pingCount := chromeMinInitialPingsPerPacket + p.rand.IntN(chromeMaxInitialPingsPerPacket-chromeMinInitialPingsPerPacket+1)
+			pingCount = min(pingCount, int(paddingBudget))
 			pl.frames = appendChromeInitialPings(pl.frames, pingCount)
 			pl.length += protocol.ByteCount(pingCount)
 			pl.chromeChaos = true
@@ -620,11 +617,16 @@ func (p *packetPacker) maybeGetCryptoPacket(
 func (p *packetPacker) splitChromeInitialCryptoFrames(
 	frames []ackhandler.Frame,
 	length protocol.ByteCount,
+	paddingBudget protocol.ByteCount,
 	v protocol.Version,
-) ([]ackhandler.Frame, protocol.ByteCount) {
+) ([]ackhandler.Frame, protocol.ByteCount, protocol.ByteCount) {
 	// Chrome independently attempts 2..10 random CRYPTO splits per Initial.
 	numFrames := chromeMinAddedCryptoFrames + p.rand.IntN(chromeMaxAddedCryptoFrames-chromeMinAddedCryptoFrames+1)
+	maxOverhead := chromeInitialMaxCryptoFrameOverhead(frames)
 	for range numFrames {
+		if paddingBudget < maxOverhead {
+			break
+		}
 		index := p.rand.IntN(len(frames))
 		frame, ok := frames[index].Frame.(*wire.CryptoFrame)
 		if !ok || len(frame.Data) <= 1 {
@@ -638,9 +640,31 @@ func (p *packetPacker) splitChromeInitialCryptoFrames(
 		}
 		frame.Data = frame.Data[:firstLength]
 		frames = append(frames, ackhandler.Frame{Frame: second, Handler: frames[index].Handler})
-		length += frame.Length(v) + second.Length(v) - oldLength
+		extraOverhead := frame.Length(v) + second.Length(v) - oldLength
+		length += extraOverhead
+		paddingBudget -= extraOverhead
 	}
-	return frames, length
+	return frames, length, paddingBudget
+}
+
+func chromeInitialMaxCryptoFrameOverhead(frames []ackhandler.Frame) protocol.ByteCount {
+	minOffset := protocol.InvalidByteCount
+	var maxOffset protocol.ByteCount
+	for _, frame := range frames {
+		cryptoFrame, ok := frame.Frame.(*wire.CryptoFrame)
+		if !ok {
+			continue
+		}
+		if minOffset == protocol.InvalidByteCount || cryptoFrame.Offset < minOffset {
+			minOffset = cryptoFrame.Offset
+		}
+		maxOffset = max(maxOffset, cryptoFrame.Offset+protocol.ByteCount(len(cryptoFrame.Data)))
+	}
+	if minOffset == protocol.InvalidByteCount {
+		return 0
+	}
+	dataLength := maxOffset - minOffset
+	return protocol.ByteCount(1 + quicvarint.Len(uint64(maxOffset)) + quicvarint.Len(uint64(dataLength)))
 }
 
 func appendChromeInitialPings(frames []ackhandler.Frame, count int) []ackhandler.Frame {
