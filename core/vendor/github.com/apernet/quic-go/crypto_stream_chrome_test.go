@@ -181,7 +181,7 @@ func TestChromeInitialAppendsPingFrames(t *testing.T) {
 	}
 }
 
-func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
+func TestChromeInitialSpreadsPaddingAndShufflesFrames(t *testing.T) {
 	crypto1 := &wire.CryptoFrame{Offset: 929, Data: []byte{2, 3}}
 	crypto2 := &wire.CryptoFrame{Offset: 1534, Data: []byte{4, 5}}
 	pl := payload{
@@ -192,13 +192,14 @@ func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 			{Frame: crypto2},
 			{Frame: &wire.PingFrame{}},
 		},
-		length:             crypto1.Length(protocol.Version1) + crypto2.Length(protocol.Version1) + 3,
-		preserveFrameOrder: true,
-		paddingRuns:        5,
+		length:      crypto1.Length(protocol.Version1) + crypto2.Length(protocol.Version1) + 3,
+		chromeChaos: true,
 	}
 	packer := &packetPacker{rand: *rand.New(rand.NewPCG(1, 2))}
 	layouts := make(map[string]struct{})
-	for range 20 {
+	runCounts := make(map[int]struct{})
+	firstFrameTypes := make(map[byte]struct{})
+	for range 100 {
 		raw, err := packer.appendPacketPayload(nil, pl, 97, protocol.Version1)
 		if err != nil {
 			t.Fatal(err)
@@ -213,26 +214,33 @@ func TestChromeInitialInterleavesPingAndPadding(t *testing.T) {
 		if pings != 3 {
 			t.Fatalf("PING count = %d, want 3", pings)
 		}
-		if len(runs) != 5 {
-			t.Fatalf("PADDING run count = %d, want 5", len(runs))
+		if len(runs) == 0 || len(runs) > len(pl.frames)+1 {
+			t.Fatalf("PADDING run count = %d, want 1..%d", len(runs), len(pl.frames)+1)
 		}
-		var total, minRun, maxRun int
-		minRun = runs[0]
+		var total int
 		for _, run := range runs {
 			total += run
-			minRun = min(minRun, run)
-			maxRun = max(maxRun, run)
 		}
 		if total != 97 {
 			t.Fatalf("PADDING total = %d, want 97", total)
 		}
-		if maxRun-minRun < 10 {
-			t.Errorf("PADDING lengths are too uniform: %v", runs)
-		}
 		layouts[fmt.Sprint(runs)] = struct{}{}
+		runCounts[len(runs)] = struct{}{}
+		for _, frameType := range raw {
+			if frameType != 0 {
+				firstFrameTypes[frameType] = struct{}{}
+				break
+			}
+		}
 	}
-	if len(layouts) < 10 {
-		t.Errorf("only %d/20 PADDING length layouts were distinct", len(layouts))
+	if len(layouts) < 20 || len(runCounts) < 3 {
+		t.Errorf("padding diversity = %d layouts / %d run counts", len(layouts), len(runCounts))
+	}
+	if _, ok := firstFrameTypes[byte(wire.FrameTypePing)]; !ok {
+		t.Error("PING was never shuffled to the first non-PADDING position")
+	}
+	if _, ok := firstFrameTypes[byte(wire.FrameTypeCrypto)]; !ok {
+		t.Error("CRYPTO was never shuffled to the first non-PADDING position")
 	}
 }
 
@@ -351,6 +359,9 @@ func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
 			if len(runs) == 0 {
 				t.Error("Initial packet contains no PADDING run")
 			}
+			if len(runs) > len(longPacket.frames)+1 {
+				t.Errorf("Initial packet PADDING runs = %d, want at most %d", len(runs), len(longPacket.frames)+1)
+			}
 			totalPings += pings
 			totalPaddingRuns += len(runs)
 			pingsPerPacket = append(pingsPerPacket, pings)
@@ -369,9 +380,6 @@ func TestChromeInitialPacketPackerSizeAndFrames(t *testing.T) {
 			if pings < chromeMinInitialPingsPerPacket || pings > chromeMaxInitialPingsPerPacket {
 				t.Errorf("Initial packet %d PING count = %d, want %d..%d", packet, pings, chromeMinInitialPingsPerPacket, chromeMaxInitialPingsPerPacket)
 			}
-		}
-		if totalPaddingRuns < chromeMinInitialPaddingRuns || totalPaddingRuns > chromeMaxInitialPaddingRuns {
-			t.Errorf("PADDING run total = %d, want %d..%d", totalPaddingRuns, chromeMinInitialPaddingRuns, chromeMaxInitialPaddingRuns)
 		}
 		if !bytes.Equal(reconstructed, clientHello) {
 			t.Error("packed CRYPTO frames did not reconstruct the ClientHello")
