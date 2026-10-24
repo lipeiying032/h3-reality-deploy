@@ -410,8 +410,8 @@ func applyChromeTransportParameters(params *wire.TransportParameters, version pr
 		versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
 	}
 	params.Additional = map[uint64][]byte{
-		0x11:   versionBytes,
-		0x3128: []byte("ORIG"),
+		0xff73db: versionBytes,
+		0x3128:   []byte("ORIG"),
 	}
 	params.RandomizeOrder = true
 }
