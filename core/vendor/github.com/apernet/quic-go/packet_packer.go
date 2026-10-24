@@ -19,10 +19,10 @@ import (
 var errNothingToPack = errors.New("nothing to pack")
 
 const (
-	chromeMinInitialPings       = 8
-	chromeMaxInitialPings       = 19
-	chromeMinInitialPaddingRuns = 5
-	chromeMaxInitialPaddingRuns = 9
+	chromeMinInitialPingsPerPacket = 2
+	chromeMaxInitialPingsPerPacket = 10
+	chromeMinInitialPaddingRuns    = 5
+	chromeMaxInitialPaddingRuns    = 9
 )
 
 type packer interface {
@@ -149,11 +149,10 @@ type packetPacker struct {
 
 	peekTimes int
 
-	chromeInitialPlanReady      bool
-	chromeInitialFlightDone     bool
-	chromeInitialPacketsPacked  int
-	chromeInitialPingsRemaining int
-	chromePaddingRunsRemaining  int
+	chromeInitialPlanReady     bool
+	chromeInitialFlightDone    bool
+	chromeInitialPacketsPacked int
+	chromePaddingRunsRemaining int
 }
 
 const DatagramFrameMaxPeekTimes = 10
@@ -553,7 +552,6 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	chromeInitial := encLevel == protocol.EncryptionInitial && p.initialStream.chrome
 	shapeChromeFlight := chromeInitial && !p.chromeInitialFlightDone && !hasRetransmission && hasCryptoData()
 	if shapeChromeFlight && !p.chromeInitialPlanReady {
-		p.chromeInitialPingsRemaining = chromeMinInitialPings + p.rand.IntN(chromeMaxInitialPings-chromeMinInitialPings+1)
 		p.chromePaddingRunsRemaining = chromeMinInitialPaddingRuns + p.rand.IntN(chromeMaxInitialPaddingRuns-chromeMinInitialPaddingRuns+1)
 		p.chromeInitialPlanReady = true
 	}
@@ -603,10 +601,9 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		for hasCryptoData() {
 			frameBudget := maxPacketSize
 			if shapeChromeFlight {
-				// Reserve the entire remaining frame plan. The unused part turns
-				// into PADDING, and keeps the randomized metadata from forcing an
-				// otherwise two-packet ClientHello into a third Initial.
-				reserved := protocol.ByteCount(p.chromeInitialPingsRemaining + p.chromePaddingRunsRemaining)
+				// Reserve this packet's maximum PING count and the remaining
+				// padding-run plan, so chaos overhead can't add an Initial.
+				reserved := protocol.ByteCount(chromeMaxInitialPingsPerPacket + p.chromePaddingRunsRemaining)
 				frameBudget = max(0, frameBudget-reserved)
 			}
 			cf := popCryptoFrame(frameBudget)
@@ -621,14 +618,14 @@ func (p *packetPacker) maybeGetCryptoPacket(
 		if shapeChromeFlight && cryptoFrames > 0 {
 			pl.frames, pl.length = p.splitChromeInitialCryptoFrames(pl.frames, pl.length, v)
 			hasMore := hasCryptoData()
-			pingCount := p.takeChromeInitialPings(hasMore)
-			pl.frames = p.interleaveChromeInitialPings(pl.frames, pingCount)
+			pingCount := chromeMinInitialPingsPerPacket + p.rand.IntN(chromeMaxInitialPingsPerPacket-chromeMinInitialPingsPerPacket+1)
+			pl.frames = appendChromeInitialPings(pl.frames, pingCount)
 			pl.length += protocol.ByteCount(pingCount)
 
 			futureCryptoFrames := len(p.initialStream.chromeChunks) - p.initialStream.chromeChunkNext
 			pl.paddingRuns = p.takeChromeInitialPaddingRuns(
 				len(pl.frames),
-				futureCryptoFrames+p.chromeInitialPingsRemaining,
+				futureCryptoFrames,
 				hasMore,
 			)
 			p.chromeInitialPacketsPacked++
@@ -666,40 +663,11 @@ func (p *packetPacker) splitChromeInitialCryptoFrames(
 	return frames, length
 }
 
-func (p *packetPacker) takeChromeInitialPings(hasMore bool) int {
-	if !hasMore {
-		count := p.chromeInitialPingsRemaining
-		p.chromeInitialPingsRemaining = 0
-		return count
-	}
-	reserve := 1
-	if p.chromeInitialPacketsPacked == 0 {
-		reserve = 2 // keep one PING for each of up to two remaining Initials
-	}
-	maxCurrent := p.chromeInitialPingsRemaining - reserve
-	if maxCurrent <= 0 {
-		return 0
-	}
-	count := 1 + p.rand.IntN(maxCurrent)
-	p.chromeInitialPingsRemaining -= count
-	return count
-}
-
-func (p *packetPacker) interleaveChromeInitialPings(frames []ackhandler.Frame, count int) []ackhandler.Frame {
-	pingsAtGap := make([]int, len(frames)+1)
+func appendChromeInitialPings(frames []ackhandler.Frame, count int) []ackhandler.Frame {
 	for range count {
-		pingsAtGap[p.rand.IntN(len(pingsAtGap))]++
+		frames = append(frames, ackhandler.Frame{Frame: &wire.PingFrame{}, Handler: emptyHandler{}})
 	}
-	interleaved := make([]ackhandler.Frame, 0, len(frames)+count)
-	for gap, pings := range pingsAtGap {
-		for range pings {
-			interleaved = append(interleaved, ackhandler.Frame{Frame: &wire.PingFrame{}, Handler: emptyHandler{}})
-		}
-		if gap < len(frames) {
-			interleaved = append(interleaved, frames[gap])
-		}
-	}
-	return interleaved
+	return frames
 }
 
 func (p *packetPacker) takeChromeInitialPaddingRuns(currentFrames, futureFrames int, hasMore bool) int {
