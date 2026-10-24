@@ -313,7 +313,7 @@ func TestSkipAckFrameRangeCount(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := skipAckFrame(test.data); got != len(test.data) {
+			if got := skipAckFrame(test.data, false); got != len(test.data) {
 				t.Fatalf("skipAckFrame() = %d, want %d", got, len(test.data))
 			}
 		})
@@ -335,10 +335,33 @@ func TestSkipAckFrameRejectsTruncation(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := skipAckFrame(test.data); got != -1 {
+			if got := skipAckFrame(test.data, false); got != -1 {
 				t.Fatalf("skipAckFrame() = %d, want -1", got)
 			}
 		})
+	}
+}
+
+func TestSkipAckFrameECNCounts(t *testing.T) {
+	ackECN := []byte{3, 0, 0, 3, 10, 11, 12}
+	if got := skipAckFrame(ackECN, true); got != len(ackECN) {
+		t.Fatalf("skipAckFrame(ACK_ECN) = %d, want %d", got, len(ackECN))
+	}
+	for length := len(ackECN) - 3; length < len(ackECN); length++ {
+		if got := skipAckFrame(ackECN[:length], true); got != -1 {
+			t.Fatalf("skipAckFrame(truncated ACK_ECN length %d) = %d, want -1", length, got)
+		}
+	}
+}
+
+func TestParseCryptoFramesAfterACKECN(t *testing.T) {
+	payload := []byte{
+		0x03, 3, 0, 0, 3, 10, 11, 12, // ACK_ECN with no additional ranges
+		0x06, 0, 3, 'a', 'b', 'c', // CRYPTO at offset 0
+	}
+	frags := parseCryptoFrames(payload)
+	if len(frags) != 1 || frags[0].off != 0 || !bytes.Equal(frags[0].data, []byte("abc")) {
+		t.Fatalf("parseCryptoFrames() = %+v, want one CRYPTO fragment", frags)
 	}
 }
 
