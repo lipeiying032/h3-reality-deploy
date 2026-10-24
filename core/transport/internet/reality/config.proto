@@ -42,6 +42,10 @@ message Config {
   // paired with a mismatched throwaway key.
   string h3_certificate_file = 33;
   string h3_key_file = 34;
+
+  // Optional target-specific HTTP/3 server Initial packet size. Zero keeps
+  // the quic-go default (1280 bytes).
+  uint32 h3_initial_packet_size = 35;
 }
 
 message LimitFallback {

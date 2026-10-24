@@ -47,4 +47,8 @@ type RealityQUICParams struct {
 	// FallbackTimeout is how long an idle precheck/relay entry is kept alive
 	// (default 120s).
 	FallbackTimeout time.Duration
+
+	// Optional target-specific HTTP/3 server Initial packet size. Zero keeps
+	// quic-go's default. The listener validates the value before narrowing it.
+	H3InitialPacketSize uint32
 }

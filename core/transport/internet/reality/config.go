@@ -65,16 +65,17 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 // X-Reality-Auth verification (server) and record construction (client).
 func (c *Config) GetRealityQUICParams() *tls.RealityQUICParams {
 	params := &tls.RealityQUICParams{
-		PrivateKey:   c.PrivateKey,
-		MinClientVer: c.MinClientVer,
-		MaxClientVer: c.MaxClientVer,
-		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
-		PublicKey:    c.PublicKey,
-		ShortId:      c.ShortId,
-		ServerName:   c.ServerName,
-		Alpn:         c.Alpn,
-		Show:         c.Show,
-		Dest:         c.Dest,
+		PrivateKey:          c.PrivateKey,
+		MinClientVer:        c.MinClientVer,
+		MaxClientVer:        c.MaxClientVer,
+		MaxTimeDiff:         time.Duration(c.MaxTimeDiff) * time.Millisecond,
+		PublicKey:           c.PublicKey,
+		ShortId:             c.ShortId,
+		ServerName:          c.ServerName,
+		Alpn:                c.Alpn,
+		Show:                c.Show,
+		Dest:                c.Dest,
+		H3InitialPacketSize: c.H3InitialPacketSize,
 	}
 	if len(c.ServerNames) > 0 {
 		params.DestServerName = c.ServerNames[0]
