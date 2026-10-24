@@ -446,13 +446,28 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, packe
 		c.relayDecision(st, packet)
 		return
 	}
-	for _, frag := range parseCryptoFrames(pkt.Payload) {
-		st.crypto.add(frag)
+	frags, err := parseCryptoFrames(pkt.Payload)
+	if err != nil {
+		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (malformed frames: ", err, ")")
+		c.relayDecision(st, packet)
+		return
 	}
-	hello := extractClientHello(st.crypto.contiguous())
+	for _, frag := range frags {
+		if err := st.crypto.add(frag); err != nil {
+			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (CRYPTO reassembly: ", err, ")")
+			c.relayDecision(st, packet)
+			return
+		}
+	}
+	hello, err := st.crypto.clientHello()
+	if err != nil {
+		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello: ", err, ")")
+		c.relayDecision(st, packet)
+		return
+	}
 	if hello == nil {
 		// ClientHello incomplete: hold the datagram and wait for more Initials.
-		if len(st.pending) >= precheckMaxPendingPkts || st.pendingBytes >= precheckMaxPendingBytes ||
+		if len(st.pending)+1 > precheckMaxPendingPkts || st.pendingBytes+len(data) > precheckMaxPendingBytes ||
 			time.Since(st.firstSeen) > c.relayTimeout() {
 			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello incomplete)")
 			c.relayDecision(st, packet)
@@ -489,6 +504,7 @@ func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, packe
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck DROP for ", addr.String(), " (no dest configured)")
 		st.pending = nil
 		st.pendingBytes = 0
+		st.crypto = cryptoReassembler{}
 		return
 	}
 	c.flushPending(st, packet, true)
@@ -507,6 +523,7 @@ func (c *realityPrecheckPacketConn) flushPending(st *precheckClientState, packet
 	}
 	st.pending = nil
 	st.pendingBytes = 0
+	st.crypto = cryptoReassembler{}
 	if toRelay {
 		c.relay.relayClientToDest(packet.addr, st.relayDest, packet.data)
 	} else {

@@ -7,6 +7,7 @@ package splithttp
 // extraction are taken, ECH detection is intentionally excluded.
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
@@ -64,6 +65,7 @@ func deriveInitialSecrets(dcid []byte) (key, iv, hp []byte) {
 }
 
 // readVarint decodes a QUIC variable-length integer (RFC 9000 Section 16).
+// The consumed byte count is zero when data is truncated.
 func readVarint(data []byte) (uint64, int) {
 	if len(data) == 0 {
 		return 0, 0
@@ -116,6 +118,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	if firstByte&0x80 == 0 {
 		return nil, fmt.Errorf("not a long header")
 	}
+	if firstByte&0x40 == 0 {
+		return nil, fmt.Errorf("QUIC fixed bit not set")
+	}
 	pktType := (firstByte >> 4) & 0x03
 	if pktType != 0 {
 		return nil, fmt.Errorf("not an Initial packet (type=%d)", pktType)
@@ -137,6 +142,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	}
 	dcidLen := int(data[offset])
 	offset++
+	if dcidLen > 20 {
+		return nil, fmt.Errorf("invalid DCID length: %d", dcidLen)
+	}
 	if offset+dcidLen > len(data) {
 		return nil, fmt.Errorf("truncated at DCID")
 	}
@@ -150,6 +158,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	}
 	scidLen := int(data[offset])
 	offset++
+	if scidLen > 20 {
+		return nil, fmt.Errorf("invalid SCID length: %d", scidLen)
+	}
 	if offset+scidLen > len(data) {
 		return nil, fmt.Errorf("truncated at SCID")
 	}
@@ -162,8 +173,11 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 		return nil, fmt.Errorf("truncated at token length")
 	}
 	tokenLen, varintBytes := readVarint(data[offset:])
+	if varintBytes == 0 {
+		return nil, fmt.Errorf("truncated at token length")
+	}
 	offset += varintBytes
-	if offset+int(tokenLen) > len(data) {
+	if tokenLen > uint64(len(data)-offset) {
 		return nil, fmt.Errorf("truncated at token")
 	}
 	offset += int(tokenLen)
@@ -172,11 +186,21 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	if offset >= len(data) {
 		return nil, fmt.Errorf("truncated at length")
 	}
-	_, varintBytes = readVarint(data[offset:])
+	packetLen, varintBytes := readVarint(data[offset:])
+	if varintBytes == 0 {
+		return nil, fmt.Errorf("truncated at length")
+	}
 	offset += varintBytes
 
 	// offset now points to start of Packet Number field
 	pnStart := offset
+	if packetLen > uint64(len(data)-pnStart) {
+		return nil, fmt.Errorf("truncated Initial packet: length=%d remaining=%d", packetLen, len(data)-pnStart)
+	}
+	if packetLen < 1+16 {
+		return nil, fmt.Errorf("Initial packet length too small: %d", packetLen)
+	}
+	packetEnd := pnStart + int(packetLen)
 
 	// Derive keys
 	key, iv, hp := deriveInitialSecrets(p.DCID)
@@ -184,7 +208,7 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	// The sample for header protection starts at the 4th byte after the start
 	// of the Packet Number field.
 	sampleOffset := pnStart + 4
-	if sampleOffset+16 > len(data) {
+	if sampleOffset+16 > packetEnd {
 		return nil, fmt.Errorf("packet too short for header protection sample")
 	}
 	sample := make([]byte, 16)
@@ -201,7 +225,7 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	pnLen := int(data[0]&0x03) + 1
 
 	// Unprotect packet number bytes
-	if pnStart+pnLen > len(data) {
+	if pnStart+pnLen > packetEnd {
 		return nil, fmt.Errorf("packet number extends beyond data")
 	}
 	for i := 0; i < pnLen; i++ {
@@ -217,13 +241,9 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 	offset = pnStart + pnLen
 
 	// Decrypt payload (offset now points past packet number)
-	if offset+16 >= len(data) {
+	if offset+16 > packetEnd {
 		return nil, fmt.Errorf("payload too short")
 	}
-
-	ciphertext := data[offset:]
-	authTag := ciphertext[len(ciphertext)-16:]
-	ciphertext = ciphertext[:len(ciphertext)-16]
 
 	// Build the header (associated data) for AEAD — everything before offset
 	headerForAEAD := data[:offset]
@@ -240,9 +260,7 @@ func parseQUICInitial(data []byte) (*initialPkt, error) {
 		nonce[i] ^= pnPadded[i]
 	}
 
-	// Combine ciphertext + auth tag for AEAD decryption
-	combined := append(ciphertext, authTag...)
-	plaintext, err := aead.Open(nil, nonce, combined, headerForAEAD)
+	plaintext, err := aead.Open(nil, nonce, data[offset:packetEnd], headerForAEAD)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
@@ -257,70 +275,10 @@ type cryptoFrag struct {
 	data []byte
 }
 
-type cryptoRange struct {
-	start int
-	end   int
-}
-
-// cryptoReassembler tracks both CRYPTO stream bytes and the ranges that have
-// actually arrived. The backing slice can contain zero-filled gaps after an
-// out-of-order fragment, so its length alone must never be used as evidence
-// that a ClientHello is complete.
-type cryptoReassembler struct {
-	data    []byte
-	covered []cryptoRange
-}
-
-func (r *cryptoReassembler) add(frag cryptoFrag) {
-	if frag.off < 0 || len(frag.data) == 0 {
-		return
-	}
-	end := frag.off + len(frag.data)
-	if end < frag.off { // integer overflow
-		return
-	}
-	if end > len(r.data) {
-		grown := make([]byte, end)
-		copy(grown, r.data)
-		r.data = grown
-	}
-	copy(r.data[frag.off:end], frag.data)
-
-	next := cryptoRange{start: frag.off, end: end}
-	merged := make([]cryptoRange, 0, len(r.covered)+1)
-	inserted := false
-	for _, current := range r.covered {
-		switch {
-		case current.end < next.start:
-			merged = append(merged, current)
-		case next.end < current.start:
-			if !inserted {
-				merged = append(merged, next)
-				inserted = true
-			}
-			merged = append(merged, current)
-		default:
-			if current.start < next.start {
-				next.start = current.start
-			}
-			if current.end > next.end {
-				next.end = current.end
-			}
-		}
-	}
-	if !inserted {
-		merged = append(merged, next)
-	}
-	r.covered = merged
-}
-
-// contiguous returns only the received prefix starting at CRYPTO offset 0.
-func (r *cryptoReassembler) contiguous() []byte {
-	if len(r.covered) == 0 || r.covered[0].start != 0 {
-		return nil
-	}
-	return r.data[:r.covered[0].end]
-}
+const (
+	precheckMaxCryptoBytes  = 128 * 1024
+	precheckMaxCryptoRanges = 256
+)
 
 // parseCryptoFrames extracts all CRYPTO frames (frame type 0x06) from a
 // decrypted QUIC payload. CRYPTO frames carry the TLS handshake stream (RFC
@@ -328,7 +286,7 @@ func (r *cryptoReassembler) contiguous() []byte {
 // arbitrarily, so each fragment is returned with its stream offset. Frame
 // types that end the scan (unknown types, padding) stop the walk; the tail of
 // an Initial payload is normally padding anyway.
-func parseCryptoFrames(payload []byte) []cryptoFrag {
+func parseCryptoFrames(payload []byte) ([]cryptoFrag, error) {
 	var frags []cryptoFrag
 	offset := 0
 
@@ -342,95 +300,180 @@ func parseCryptoFrames(payload []byte) []cryptoFrag {
 		case 0x01: // PING
 			// no payload
 		case 0x02, 0x03: // ACK
-			n := skipAckFrame(payload[offset:], frameType == 0x03)
-			if n < 0 {
-				return frags
+			n, err := skipAckFrame(payload[offset:], frameType == 0x03)
+			if err != nil {
+				return nil, err
 			}
 			offset += n
 		case 0x06: // CRYPTO
 			fragOff, n1 := readVarint(payload[offset:])
+			if n1 == 0 {
+				return nil, fmt.Errorf("truncated CRYPTO offset")
+			}
 			offset += n1
 			fragLen, n2 := readVarint(payload[offset:])
+			if n2 == 0 {
+				return nil, fmt.Errorf("truncated CRYPTO length")
+			}
 			offset += n2
-			if offset+int(fragLen) > len(payload) {
-				return frags
+			if fragOff > precheckMaxCryptoBytes || fragLen > precheckMaxCryptoBytes ||
+				fragOff+fragLen > precheckMaxCryptoBytes {
+				return nil, fmt.Errorf("CRYPTO range exceeds precheck limit: offset=%d length=%d", fragOff, fragLen)
+			}
+			if fragLen > uint64(len(payload)-offset) {
+				return nil, fmt.Errorf("truncated CRYPTO data")
 			}
 			frags = append(frags, cryptoFrag{off: int(fragOff), data: payload[offset : offset+int(fragLen)]})
 			offset += int(fragLen)
 		default:
-			return frags
+			return nil, fmt.Errorf("unsupported frame type in Initial: %#x", frameType)
 		}
 	}
-	return frags
+	return frags, nil
 }
 
 // skipAckFrame returns the number of bytes an ACK frame (frame type 0x02/0x03,
-// RFC 9000 Section 19.3) occupies, or -1 when the payload is truncated.
-func skipAckFrame(data []byte, hasECN bool) int {
+// RFC 9000 Section 19.3) occupies. frame type 0x03 appends three ECN counts.
+func skipAckFrame(data []byte, hasECN bool) (int, error) {
 	offset := 0
-	read := func() (uint64, bool) {
-		value, n := readVarint(data[offset:])
+	read := func(name string) (uint64, error) {
+		v, n := readVarint(data[offset:])
 		if n == 0 {
-			return 0, false
+			return 0, fmt.Errorf("truncated ACK %s", name)
 		}
 		offset += n
-		return value, true
+		return v, nil
 	}
 	// Largest Acknowledged (varint)
-	if _, ok := read(); !ok {
-		return -1
+	if _, err := read("largest acknowledged"); err != nil {
+		return 0, err
 	}
 	// ACK Delay (varint)
-	if _, ok := read(); !ok {
-		return -1
+	if _, err := read("delay"); err != nil {
+		return 0, err
 	}
 	// ACK Range Count (varint)
-	count, ok := read()
-	if !ok {
-		return -1
+	count, err := read("range count")
+	if err != nil {
+		return 0, err
 	}
 	// First ACK Range (varint)
-	if _, ok := read(); !ok {
-		return -1
+	if _, err := read("first range"); err != nil {
+		return 0, err
+	}
+	// Each additional range needs at least two one-byte varints. This bound
+	// prevents an attacker-controlled count from creating a long empty loop.
+	if count > uint64((len(data)-offset)/2) {
+		return 0, fmt.Errorf("ACK range count exceeds remaining payload: %d", count)
 	}
 	// Additional ACK Ranges: each has gap + ack_range
 	for i := uint64(0); i < count; i++ {
-		if _, ok := read(); !ok {
-			return -1
+		if _, err := read("gap"); err != nil {
+			return 0, err
 		}
-		if _, ok := read(); !ok {
-			return -1
+		if _, err := read("range"); err != nil {
+			return 0, err
 		}
 	}
 	if hasECN {
-		// ECT(0), ECT(1), and ECN-CE counts.
-		for i := 0; i < 3; i++ {
-			if _, ok := read(); !ok {
-				return -1
+		for _, name := range []string{"ECT(0)", "ECT(1)", "CE"} {
+			if _, err := read(name); err != nil {
+				return 0, err
 			}
 		}
 	}
-	return offset
+	return offset, nil
 }
 
-// extractClientHello returns the complete TLS ClientHello handshake message
-// (type byte + 3-byte length + body, i.e. including the 4-byte header) from
-// the reassembled CRYPTO stream, or nil when the message is not complete yet
-// or is not a ClientHello.
-func extractClientHello(cryptoData []byte) []byte {
-	// Handshake: Type(1) + Length(3)
-	if len(cryptoData) < 4 {
+type cryptoRange struct {
+	off  int
+	data []byte
+}
+
+// cryptoReassembler stores only bytes that actually arrived. Its ranges are
+// sorted, non-overlapping and non-adjacent, so a sparse tail never allocates a
+// zero-filled buffer up to its offset.
+type cryptoReassembler struct {
+	ranges      []cryptoRange
+	uniqueBytes int
+}
+
+func (r *cryptoReassembler) add(frag cryptoFrag) error {
+	if frag.off < 0 || frag.off > precheckMaxCryptoBytes || len(frag.data) > precheckMaxCryptoBytes-frag.off {
+		return fmt.Errorf("CRYPTO range exceeds precheck limit: offset=%d length=%d", frag.off, len(frag.data))
+	}
+	if len(frag.data) == 0 {
 		return nil
 	}
-	if cryptoData[0] != 0x01 { // ClientHello
-		return nil
+	start, end := frag.off, frag.off+len(frag.data)
+	first := 0
+	for first < len(r.ranges) && r.ranges[first].off+len(r.ranges[first].data) < start {
+		first++
+	}
+	last := first
+	unionStart, unionEnd := start, end
+	for last < len(r.ranges) && r.ranges[last].off <= unionEnd {
+		existing := r.ranges[last]
+		existingEnd := existing.off + len(existing.data)
+		overlapStart := max(start, existing.off)
+		overlapEnd := min(end, existingEnd)
+		if overlapStart < overlapEnd && !bytes.Equal(
+			frag.data[overlapStart-start:overlapEnd-start],
+			existing.data[overlapStart-existing.off:overlapEnd-existing.off],
+		) {
+			return fmt.Errorf("conflicting CRYPTO overlap at [%d,%d)", overlapStart, overlapEnd)
+		}
+		unionStart = min(unionStart, existing.off)
+		unionEnd = max(unionEnd, existingEnd)
+		last++
+	}
+
+	merged := cryptoRange{off: unionStart, data: make([]byte, unionEnd-unionStart)}
+	for i := first; i < last; i++ {
+		existing := r.ranges[i]
+		copy(merged.data[existing.off-unionStart:], existing.data)
+	}
+	copy(merged.data[start-unionStart:], frag.data)
+
+	r.ranges = append(r.ranges, cryptoRange{})
+	copy(r.ranges[first+1:], r.ranges[last:])
+	r.ranges[first] = merged
+	r.ranges = r.ranges[:len(r.ranges)-(last-first)]
+	if len(r.ranges) > precheckMaxCryptoRanges {
+		return fmt.Errorf("too many CRYPTO ranges: %d", len(r.ranges))
+	}
+	r.uniqueBytes = 0
+	for _, current := range r.ranges {
+		r.uniqueBytes += len(current.data)
+	}
+	if r.uniqueBytes > precheckMaxCryptoBytes {
+		return fmt.Errorf("too much CRYPTO data: %d", r.uniqueBytes)
+	}
+	return nil
+}
+
+// clientHello returns a copy of the complete TLS ClientHello when the first
+// range continuously covers it. A nil result with nil error means incomplete.
+func (r *cryptoReassembler) clientHello() ([]byte, error) {
+	if len(r.ranges) == 0 || r.ranges[0].off != 0 || len(r.ranges[0].data) < 4 {
+		return nil, nil
+	}
+	cryptoData := r.ranges[0].data
+	if cryptoData[0] != 0x01 {
+		return nil, fmt.Errorf("first TLS handshake is not ClientHello: %#x", cryptoData[0])
 	}
 	hsLen := int(cryptoData[1])<<16 | int(cryptoData[2])<<8 | int(cryptoData[3])
 	if hsLen <= 0 {
-		return nil
+		return nil, fmt.Errorf("invalid ClientHello length: %d", hsLen)
 	}
-	if 4+hsLen > len(cryptoData) {
-		return nil
+	total := 4 + hsLen
+	if total > precheckMaxCryptoBytes {
+		return nil, fmt.Errorf("ClientHello exceeds precheck limit: %d", total)
 	}
-	return cryptoData[:4+hsLen]
+	if total > len(cryptoData) {
+		return nil, nil
+	}
+	hello := make([]byte, total)
+	copy(hello, cryptoData[:total])
+	return hello, nil
 }
