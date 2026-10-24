@@ -102,8 +102,11 @@ type sentPacketHandler struct {
 	ptoCount uint32
 	ptoMode  SendMode
 	// The number of PTO probe packets that should be sent.
-	// Only applies to the application-data packet number space.
 	numProbesToSend int
+	// chromePTO enables Chromium's PTO behavior: before the first RTT sample,
+	// use 3x the initial RTT, grant one probe, and skip one packet number in
+	// the packet number space selected by the PTO.
+	chromePTO bool
 
 	// The alarm timeout
 	alarm alarmTimer
@@ -163,6 +166,12 @@ func NewSentPacketHandler(
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
 	return h
+}
+
+// EnableChromePTO enables the Chrome PTO profile. It must be called before
+// the connection run loop starts.
+func (h *sentPacketHandler) EnableChromePTO() {
+	h.chromePTO = true
 }
 
 func (h *sentPacketHandler) removeFromBytesInFlight(p *packet) {
@@ -561,7 +570,7 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 
 	pnSpace := h.getPacketNumberSpace(encLevel)
 
-	if encLevel == protocol.Encryption1RTT {
+	if encLevel == protocol.Encryption1RTT || h.chromePTO {
 		for p := range pnSpace.history.SkippedPackets() {
 			if ack.AcksPacket(p) {
 				return nil, false, &qerr.TransportError{
@@ -663,7 +672,13 @@ func (h *sentPacketHandler) getLossTimeAndSpace() (monotime.Time, protocol.Encry
 }
 
 func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration {
-	pto := h.rttStats.PTO(includeMaxAckDelay) << h.ptoCount
+	pto := h.rttStats.PTO(includeMaxAckDelay)
+	if h.chromePTO && !h.rttStats.HasMeasurement() {
+		// QUICHE uses 3 * initial_rtt before the first RTT sample. SmoothedRTT
+		// holds quic-go's restored token RTT in this state, if one was loaded.
+		pto = 3 * h.rttStats.SmoothedRTT()
+	}
+	pto <<= h.ptoCount
 	if pto > maxPTODuration || pto <= 0 {
 		return maxPTODuration
 	}
@@ -937,12 +952,18 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 	if h.bytesInFlight == 0 && !h.peerCompletedAddressValidation {
 		h.ptoCount++
 		h.numProbesToSend++
+		var encLevel protocol.EncryptionLevel
 		if h.initialPackets != nil {
 			h.ptoMode = SendPTOInitial
+			encLevel = protocol.EncryptionInitial
 		} else if h.handshakePackets != nil {
 			h.ptoMode = SendPTOHandshake
+			encLevel = protocol.EncryptionHandshake
 		} else {
 			return errors.New("sentPacketHandler BUG: PTO fired, but bytes_in_flight is 0 and Initial and Handshake already dropped")
+		}
+		if h.chromePTO {
+			h.skipPacketNumberForPTO(encLevel)
 		}
 		return nil
 	}
@@ -967,22 +988,37 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		})
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
 	}
-	h.numProbesToSend += 2
+	if h.chromePTO {
+		h.numProbesToSend++
+	} else {
+		h.numProbesToSend += 2
+	}
 	//nolint:exhaustive // We never arm a PTO timer for 0-RTT packets.
 	switch encLevel {
 	case protocol.EncryptionInitial:
+		if h.chromePTO {
+			h.skipPacketNumberForPTO(encLevel)
+		}
 		h.ptoMode = SendPTOInitial
 	case protocol.EncryptionHandshake:
+		if h.chromePTO {
+			h.skipPacketNumberForPTO(encLevel)
+		}
 		h.ptoMode = SendPTOHandshake
 	case protocol.Encryption1RTT:
-		// skip a packet number in order to elicit an immediate ACK
-		pn := h.PopPacketNumber(protocol.Encryption1RTT)
-		h.getPacketNumberSpace(protocol.Encryption1RTT).history.SkippedPacket(pn)
+		// quic-go already skips a 1-RTT packet number. Chrome does the same
+		// for every packet number space.
+		h.skipPacketNumberForPTO(encLevel)
 		h.ptoMode = SendPTOAppData
 	default:
 		return fmt.Errorf("PTO timer in unexpected encryption level: %s", encLevel)
 	}
 	return nil
+}
+
+func (h *sentPacketHandler) skipPacketNumberForPTO(encLevel protocol.EncryptionLevel) {
+	pn := h.PopPacketNumber(encLevel)
+	h.getPacketNumberSpace(encLevel).history.SkippedPacket(pn)
 }
 
 func (h *sentPacketHandler) GetLossDetectionTimeout() monotime.Time {
