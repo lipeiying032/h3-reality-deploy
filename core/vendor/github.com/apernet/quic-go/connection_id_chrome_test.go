@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"encoding/hex"
 	"testing"
 
 	"github.com/apernet/quic-go/internal/protocol"
@@ -40,6 +41,28 @@ func TestChromeInitialConnectionIDLengths(t *testing.T) {
 	}
 	if parsed.DestConnectionID.Len() != 8 {
 		t.Errorf("Initial DCID length = %d, want 8", parsed.DestConnectionID.Len())
+	}
+}
+
+func TestTargetServerConnectionIDLengthAndUniqueness(t *testing.T) {
+	transport := &Transport{ConnectionIDLength: 20}
+	length := transport.configuredConnectionIDLength(false)
+	if length != 20 {
+		t.Fatalf("configured connection ID length = %d, want 20", length)
+	}
+
+	const count = 100000
+	seen := make(map[string]struct{}, count)
+	for range count {
+		connID, err := protocol.GenerateConnectionID(length)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := hex.EncodeToString(connID.Bytes())
+		if _, exists := seen[key]; exists {
+			t.Fatalf("duplicate connection ID after %d generations: %s", len(seen)+1, key)
+		}
+		seen[key] = struct{}{}
 	}
 }
 

@@ -46,6 +46,10 @@ message Config {
   // Optional target-specific HTTP/3 server Initial packet size. Zero keeps
   // the quic-go default (1280 bytes).
   uint32 h3_initial_packet_size = 35;
+
+  // Optional target-specific HTTP/3 server connection ID length. Zero keeps
+  // the quic-go default (4 bytes).
+  uint32 h3_connection_id_length = 36;
 }
 
 message LimitFallback {

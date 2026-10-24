@@ -51,4 +51,8 @@ type RealityQUICParams struct {
 	// Optional target-specific HTTP/3 server Initial packet size. Zero keeps
 	// quic-go's default. The listener validates the value before narrowing it.
 	H3InitialPacketSize uint32
+
+	// Optional target-specific HTTP/3 server connection ID length. Zero keeps
+	// quic-go's default. The listener validates the value before narrowing it.
+	H3ConnectionIDLength uint32
 }

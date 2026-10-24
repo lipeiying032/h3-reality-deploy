@@ -57,8 +57,11 @@ type Config struct {
 	// Optional target-specific HTTP/3 server Initial packet size. Zero keeps
 	// the quic-go default (1280 bytes).
 	H3InitialPacketSize uint32 `protobuf:"varint,35,opt,name=h3_initial_packet_size,json=h3InitialPacketSize,proto3" json:"h3_initial_packet_size,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Optional target-specific HTTP/3 server connection ID length. Zero keeps
+	// the quic-go default (4 bytes).
+	H3ConnectionIdLength uint32 `protobuf:"varint,36,opt,name=h3_connection_id_length,json=h3ConnectionIdLength,proto3" json:"h3_connection_id_length,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Config) Reset() {
@@ -266,6 +269,13 @@ func (x *Config) GetH3InitialPacketSize() uint32 {
 	return 0
 }
 
+func (x *Config) GetH3ConnectionIdLength() uint32 {
+	if x != nil {
+		return x.H3ConnectionIdLength
+	}
+	return 0
+}
+
 type LimitFallback struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	AfterBytes       uint64                 `protobuf:"varint,1,opt,name=after_bytes,json=afterBytes,proto3" json:"after_bytes,omitempty"`
@@ -330,7 +340,7 @@ var File_transport_internet_reality_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_reality_config_proto_rawDesc = "" +
 	"\n" +
-	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xb1\a\n" +
+	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xe8\a\n" +
 	"\x06Config\x12\x12\n" +
 	"\x04show\x18\x01 \x01(\bR\x04show\x12\x12\n" +
 	"\x04dest\x18\x02 \x01(\tR\x04dest\x12\x12\n" +
@@ -360,7 +370,8 @@ const file_transport_internet_reality_config_proto_rawDesc = "" +
 	"\x04alpn\x18  \x03(\tR\x04alpn\x12.\n" +
 	"\x13h3_certificate_file\x18! \x01(\tR\x11h3CertificateFile\x12\x1e\n" +
 	"\vh3_key_file\x18\" \x01(\tR\th3KeyFile\x123\n" +
-	"\x16h3_initial_packet_size\x18# \x01(\rR\x13h3InitialPacketSize\"\x83\x01\n" +
+	"\x16h3_initial_packet_size\x18# \x01(\rR\x13h3InitialPacketSize\x125\n" +
+	"\x17h3_connection_id_length\x18$ \x01(\rR\x14h3ConnectionIdLength\"\x83\x01\n" +
 	"\rLimitFallback\x12\x1f\n" +
 	"\vafter_bytes\x18\x01 \x01(\x04R\n" +
 	"afterBytes\x12\"\n" +
