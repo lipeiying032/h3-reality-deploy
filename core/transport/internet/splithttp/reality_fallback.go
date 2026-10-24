@@ -10,14 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common/errors"
 )
 
 // realityFallbackClient is the reverse-proxy client used for unauthenticated
 // (active-probe) requests on the C-gamma data plane. The request is forwarded
-// verbatim to the configured REALITY dest over TCP TLS, so a prober sees the
-// real dest response: the handshake already presents the dest certificate, and
-// now the HTTP response (status/headers/body) matches the real dest too.
+// over HTTP/3 to the configured REALITY dest so the outbound protocol stack
+// matches the H3 probe. The dest response's status, headers and body are then
+// relayed back to the prober.
 //
 // The client is created once per listener and reused for every forwarded
 // request (including its pooled connections). A package-level singleton would
@@ -28,25 +30,19 @@ func newRealityFallbackClient(dest, destServerName string) *http.Client {
 	if sni == "" {
 		sni = hostOnly(dest)
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	transport := &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// TCP TLS to the dest address; the SNI presented is the dest's
-			// server name (www.apple.com) and the certificate is not verified
-			// (the proxy does not hold the dest's private key nor its root
-			// trust). ALPN is the standard h2/http1.1 set, so the forward hop
-			// negotiates whatever the dest supports.
-			return gotls.DialWithDialer(dialer, network, addr, &gotls.Config{
-				InsecureSkipVerify: true,
-				ServerName:         sni,
-				NextProtos:         []string{"h2", "http/1.1"},
-			})
+	transport := &http3.Transport{
+		TLSClientConfig: &gotls.Config{
+			// The proxy is only an HTTP reverse proxy for probe traffic. Do
+			// not fail an active probe because the dest uses a private CA;
+			// this preserves the prior fallback behavior for private dests.
+			InsecureSkipVerify: true,
+			ServerName:         sni,
 		},
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          128,
-		MaxIdleConnsPerHost:   128,
+		QUICConfig: &quic.Config{
+			HandshakeIdleTimeout: 10 * time.Second,
+			MaxIdleTimeout:       90 * time.Second,
+			KeepAlivePeriod:      30 * time.Second,
+		},
 	}
 	return &http.Client{Transport: transport}
 }
@@ -114,10 +110,9 @@ func (h *requestHandler) forwardToDest(writer http.ResponseWriter, request *http
 	defer resp.Body.Close()
 
 	for name, values := range resp.Header {
-		// Alt-Svc advertises the dest's H3 endpoint (e.g. h3=":443"); a probe
-		// connected to us over H3 would never see this H1.1-specific header on
-		// a direct dest response, so stripping it keeps the forwarded response
-		// indistinguishable from a direct one.
+		// The upstream's H3 endpoint is the endpoint this request already
+		// connected to. Re-advertising it through our fallback response is an
+		// unnecessary proxy marker, so strip it before relaying headers.
 		if isHopByHopHeader(name) || strings.EqualFold(name, "Alt-Svc") {
 			continue
 		}

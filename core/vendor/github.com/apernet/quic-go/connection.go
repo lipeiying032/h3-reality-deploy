@@ -3,7 +3,9 @@ package quic
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -379,6 +381,41 @@ var newConnection = func(
 	return &wrappedConn{Conn: s}
 }
 
+func applyChromeTransportParameters(params *wire.TransportParameters, version protocol.Version) {
+	params.InitialMaxStreamDataBidiLocal = 6 * 1024 * 1024
+	params.InitialMaxStreamDataBidiRemote = 6 * 1024 * 1024
+	params.InitialMaxStreamDataUni = 6 * 1024 * 1024
+	params.InitialMaxData = 15 * 1024 * 1024
+	params.MaxIdleTimeout = 30 * time.Second
+	params.MaxUDPPayloadSize = 1472
+	params.MaxBidiStreamNum = 100
+	params.MaxUniStreamNum = 103
+	params.MaxAckDelay = protocol.DefaultMaxAckDelay
+	params.AckDelayExponent = protocol.DefaultAckDelayExponent
+	params.ActiveConnectionIDLimit = protocol.DefaultActiveConnectionIDLimit
+	params.MaxDatagramFrameSize = 65536
+
+	versionBytes := make([]byte, 0, 12)
+	versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	var greaseVersion [4]byte
+	_, _ = cryptorand.Read(greaseVersion[:])
+	for i := range greaseVersion {
+		greaseVersion[i] = greaseVersion[i]&0xf0 | 0x0a
+	}
+	if greaseVersion[0]&0x10 == 0 {
+		versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+		versionBytes = append(versionBytes, greaseVersion[:]...)
+	} else {
+		versionBytes = append(versionBytes, greaseVersion[:]...)
+		versionBytes = binary.BigEndian.AppendUint32(versionBytes, uint32(version))
+	}
+	params.Additional = map[uint64][]byte{
+		0xff73db: versionBytes,
+		0x4752:   binary.BigEndian.AppendUint32(nil, uint32(version)),
+	}
+	params.RandomizeOrder = true
+}
+
 // declare this as a variable, such that we can it mock it in the tests
 var newClientConnection = func(
 	ctx context.Context,
@@ -486,6 +523,9 @@ var newClientConnection = func(
 	} else {
 		params.MaxDatagramFrameSize = protocol.InvalidByteCount
 	}
+	if s.config.ChromeTransportParameters {
+		applyChromeTransportParameters(params, s.version)
+	}
 	if s.qlogger != nil {
 		s.qlogTransportParameters(params, protocol.PerspectiveClient, false)
 	}
@@ -520,7 +560,7 @@ var newClientConnection = func(
 
 func (c *Conn) preSetup() {
 	c.largestRcvdAppData = protocol.InvalidPacketNumber
-	c.initialStream = newInitialCryptoStream(c.perspective == protocol.PerspectiveClient)
+	c.initialStream = newInitialCryptoStream(c.perspective == protocol.PerspectiveClient, c.config.ChromeTransportParameters)
 	c.handshakeStream = newCryptoStream()
 	c.sendQueue = newSendQueue(c.conn)
 	c.retransmissionQueue = newRetransmissionQueue()

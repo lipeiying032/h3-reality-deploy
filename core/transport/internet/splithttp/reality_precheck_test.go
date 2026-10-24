@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/net/ipv4"
 )
 
 // buildTestClientHelloBody assembles a raw TLS 1.3 ClientHello handshake
@@ -247,13 +249,351 @@ func TestParseQUICInitialRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseQUICInitial: %v", err)
 	}
-	var buf []byte
-	for _, frag := range parseCryptoFrames(parsed.Payload) {
-		buf = mergeCryptoFrag(buf, frag)
+	frags, err := parseCryptoFrames(parsed.Payload)
+	if err != nil {
+		t.Fatalf("parseCryptoFrames: %v", err)
 	}
-	ch := extractClientHello(buf)
+	var reassembler cryptoReassembler
+	for _, frag := range frags {
+		if err := reassembler.add(frag); err != nil {
+			t.Fatalf("add CRYPTO fragment: %v", err)
+		}
+	}
+	ch, err := reassembler.clientHello()
+	if err != nil {
+		t.Fatalf("clientHello: %v", err)
+	}
 	if ch == nil || string(ch) != string(hello) {
-		t.Fatalf("extractClientHello = %x, want %x", ch, hello)
+		t.Fatalf("clientHello = %x, want %x", ch, hello)
+	}
+}
+
+func TestParseQUICInitialHonorsDeclaredLength(t *testing.T) {
+	hello := []byte{0x01, 0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc}
+	pkt := append(testInitialPacket(t, hello), []byte{0xde, 0xad, 0xbe, 0xef}...)
+	if _, err := parseQUICInitial(pkt); err != nil {
+		t.Fatalf("coalesced/trailing bytes changed Initial AEAD input: %v", err)
+	}
+
+	truncated := testInitialPacket(t, hello)
+	truncated = truncated[:len(truncated)-1]
+	if _, err := parseQUICInitial(truncated); err == nil {
+		t.Fatal("truncated declared Initial length unexpectedly parsed")
+	}
+}
+
+func TestCryptoReassemblerHeadTailThenMiddle(t *testing.T) {
+	hello := make([]byte, 180)
+	hello[0] = 0x01
+	hello[1], hello[2], hello[3] = 0, 0, byte(len(hello)-4)
+	for i := 4; i < len(hello); i++ {
+		hello[i] = byte(i)
+	}
+
+	var r cryptoReassembler
+	for _, frag := range []cryptoFrag{
+		{off: 0, data: hello[:60]},
+		{off: 120, data: hello[120:]},
+	} {
+		if err := r.add(frag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := r.clientHello(); err != nil || got != nil {
+		t.Fatalf("sparse head+tail = %x, %v; want incomplete", got, err)
+	}
+	if len(r.ranges) != 2 || len(r.ranges[0].data) != 60 || len(r.ranges[1].data) != 60 {
+		t.Fatalf("ranges = %#v; sparse tail must not zero-fill the middle", r.ranges)
+	}
+	if err := r.add(cryptoFrag{off: 60, data: hello[60:120]}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.clientHello()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, hello) {
+		t.Fatalf("reassembled ClientHello differs: got %x want %x", got, hello)
+	}
+	if len(r.ranges) != 1 || r.ranges[0].off != 0 {
+		t.Fatalf("ranges were not coalesced: %#v", r.ranges)
+	}
+}
+
+func TestCryptoReassemblerOverlapAndLimits(t *testing.T) {
+	var r cryptoReassembler
+	if err := r.add(cryptoFrag{off: 10, data: []byte{1, 2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.add(cryptoFrag{off: 11, data: []byte{2, 3}}); err != nil {
+		t.Fatalf("identical overlap rejected: %v", err)
+	}
+	if err := r.add(cryptoFrag{off: 12, data: []byte{9}}); err == nil {
+		t.Fatal("conflicting overlap accepted")
+	}
+
+	var sparse cryptoReassembler
+	if err := sparse.add(cryptoFrag{off: precheckMaxCryptoBytes - 3, data: []byte{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sparse.ranges) != 1 || len(sparse.ranges[0].data) != 3 {
+		t.Fatalf("sparse range allocated unexpected data: %#v", sparse.ranges)
+	}
+	if err := sparse.add(cryptoFrag{off: precheckMaxCryptoBytes, data: []byte{1}}); err == nil {
+		t.Fatal("out-of-range CRYPTO fragment accepted")
+	}
+}
+
+func TestSkipAckFrame(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   []byte
+		hasECN bool
+		want   int
+	}{
+		{name: "no ranges", data: []byte{0, 0, 0, 0}, want: 4},
+		{name: "one extra range", data: []byte{3, 0, 1, 0, 0, 0}, want: 6},
+		{name: "ecn", data: []byte{3, 0, 0, 0, 1, 2, 3}, hasECN: true, want: 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := skipAckFrame(tc.data, tc.hasECN)
+			if err != nil || got != tc.want {
+				t.Fatalf("skipAckFrame = %d, %v; want %d", got, err, tc.want)
+			}
+		})
+	}
+	for _, data := range [][]byte{{}, {0, 0, 0}, {0, 0, 1, 0, 0}} {
+		if _, err := skipAckFrame(data, false); err == nil {
+			t.Fatalf("truncated ACK accepted: %x", data)
+		}
+	}
+	if _, err := skipAckFrame([]byte{0, 0, 63, 0}, false); err == nil {
+		t.Fatal("impossible ACK range count accepted")
+	}
+}
+
+func TestParseCryptoFramesRejectsMalformed(t *testing.T) {
+	for _, payload := range [][]byte{
+		{0x06},
+		{0x06, 0x40},
+		{0x06, 0, 5, 1},
+		{0x02, 0, 0, 0},
+		{0xff},
+	} {
+		if _, err := parseCryptoFrames(payload); err == nil {
+			t.Fatalf("malformed Initial frames accepted: %x", payload)
+		}
+	}
+}
+
+func TestCloneQueuedPacketOwnsBuffers(t *testing.T) {
+	data := []byte{1, 2, 3}
+	oob := []byte{4, 5, 6}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+	packet := cloneQueuedPacket(data, oob, 7, addr)
+
+	data[0], oob[0], addr.Port = 9, 9, 8443
+	if !bytes.Equal(packet.data, []byte{1, 2, 3}) || !bytes.Equal(packet.oob, []byte{4, 5, 6}) {
+		t.Fatalf("queued packet aliases reusable read buffers: data=%v oob=%v", packet.data, packet.oob)
+	}
+	if packet.flags != 7 || packet.addr.String() != "127.0.0.1:443" {
+		t.Fatalf("queued packet metadata changed: flags=%d addr=%v", packet.flags, packet.addr)
+	}
+}
+
+func TestFlushPendingPreservesPacketMetadata(t *testing.T) {
+	c := &realityPrecheckPacketConn{
+		queue:  make(chan queuedPacket, 2),
+		closed: make(chan struct{}),
+	}
+	first := cloneQueuedPacket([]byte("first"), []byte{1}, 2, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001})
+	second := cloneQueuedPacket([]byte("second"), []byte{3}, 4, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002})
+	state := &precheckClientState{pending: []queuedPacket{first}, pendingBytes: len(first.data)}
+	c.flushPending(state, second, false)
+
+	for i, want := range []queuedPacket{first, second} {
+		got, err := c.dequeue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.data, want.data) || !bytes.Equal(got.oob, want.oob) || got.flags != want.flags || got.addr.String() != want.addr.String() {
+			t.Fatalf("packet %d metadata changed: got %+v, want %+v", i, got, want)
+		}
+	}
+	if state.pending != nil || state.pendingBytes != 0 {
+		t.Fatalf("pending state not released: packets=%d bytes=%d", len(state.pending), state.pendingBytes)
+	}
+}
+
+func TestPrecheckReadBatchPreservesMetadata(t *testing.T) {
+	core := &realityPrecheckPacketConn{
+		queue:  make(chan queuedPacket, 2),
+		closed: make(chan struct{}),
+	}
+	wrapper := &realityPrecheckOOBPacketConn{realityPrecheckPacketConn: core}
+	wants := []queuedPacket{
+		cloneQueuedPacket([]byte("first"), []byte{1, 2}, 3, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001}),
+		cloneQueuedPacket([]byte("second"), []byte{4, 5}, 6, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002}),
+	}
+	for _, packet := range wants {
+		core.enqueue(packet)
+	}
+	messages := []ipv4.Message{
+		{Buffers: [][]byte{make([]byte, 2), make([]byte, 8)}, OOB: make([]byte, 8)},
+		{Buffers: [][]byte{make([]byte, 8)}, OOB: make([]byte, 8)},
+	}
+	n, err := wrapper.ReadBatch(messages, 0)
+	if err != nil || n != len(wants) {
+		t.Fatalf("ReadBatch() = (%d, %v), want (%d, nil)", n, err, len(wants))
+	}
+	for i, want := range wants {
+		var gotData []byte
+		for _, buffer := range messages[i].Buffers {
+			gotData = append(gotData, buffer...)
+		}
+		gotData = gotData[:messages[i].N]
+		if !bytes.Equal(gotData, want.data) || !bytes.Equal(messages[i].OOB[:messages[i].NN], want.oob) ||
+			messages[i].Flags != want.flags || messages[i].Addr.String() != want.addr.String() {
+			t.Fatalf("message %d metadata changed: %+v", i, messages[i])
+		}
+	}
+}
+
+type scriptedBatchReader struct {
+	packets []queuedPacket
+	calls   int
+}
+
+func (r *scriptedBatchReader) ReadBatch(messages []ipv4.Message, _ int) (int, error) {
+	r.calls++
+	n := len(r.packets)
+	if n > len(messages) {
+		n = len(messages)
+	}
+	for i := 0; i < n; i++ {
+		fillBatchMessage(&messages[i], r.packets[i])
+	}
+	return n, nil
+}
+
+func TestPrecheckReadsUnderlyingPacketsInBatch(t *testing.T) {
+	packets := []queuedPacket{
+		cloneQueuedPacket([]byte("first"), []byte{1}, 2, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001}),
+		cloneQueuedPacket([]byte("second"), []byte{3}, 4, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002}),
+	}
+	reader := &scriptedBatchReader{packets: packets}
+	core := &realityPrecheckPacketConn{
+		batchConn: reader,
+		queue:     make(chan queuedPacket, len(packets)),
+		closed:    make(chan struct{}),
+		states:    make(map[string]*precheckClientState),
+		perIP:     make(map[string]int),
+	}
+	for _, packet := range packets {
+		core.states[packet.addr.String()] = &precheckClientState{state: precheckAuth}
+	}
+	messages := newPrecheckReadMessages()
+	n, err := core.readBatchOnce(messages)
+	if err != nil || n != len(packets) || reader.calls != 1 {
+		t.Fatalf("readBatchOnce() = (%d, %v), calls=%d", n, err, reader.calls)
+	}
+	for i, want := range packets {
+		messages[i].Buffers[0][0] = 0
+		messages[i].OOB[0] = 0
+		got, err := core.dequeue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.data, want.data) || !bytes.Equal(got.oob, want.oob) || got.flags != want.flags || got.addr.String() != want.addr.String() {
+			t.Fatalf("packet %d changed after batch buffer reuse: got %+v, want %+v", i, got, want)
+		}
+	}
+}
+
+type packetConnOnly struct {
+	net.PacketConn
+}
+
+func precheckCore(t *testing.T, conn net.PacketConn) *realityPrecheckPacketConn {
+	t.Helper()
+	switch conn := conn.(type) {
+	case *realityPrecheckPacketConn:
+		return conn
+	case *realityPrecheckOOBPacketConn:
+		return conn.realityPrecheckPacketConn
+	default:
+		t.Fatalf("unexpected precheck conn type %T", conn)
+		return nil
+	}
+}
+
+func TestPrecheckPreservesUDPCapabilitiesConditionally(t *testing.T) {
+	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destConn.Close()
+	params := &tls.RealityQUICParams{Dest: destConn.LocalAddr().String(), FallbackTimeout: time.Second}
+
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := newRealityPrecheckPacketConn(context.Background(), serverConn, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrapped.Close()
+	oob, ok := wrapped.(oobPacketConn)
+	if !ok {
+		t.Fatalf("*net.UDPConn wrapper lost OOB capabilities: %T", wrapped)
+	}
+	if _, ok := wrapped.(batchPacketConn); !ok {
+		t.Fatalf("*net.UDPConn wrapper lost batch capability: %T", wrapped)
+	}
+	if supportsUDPBatching() {
+		if precheckCore(t, wrapped).batchConn == nil {
+			t.Fatal("concrete UDPConn did not enable kernel receive batching")
+		}
+	} else if precheckCore(t, wrapped).batchConn != nil {
+		t.Fatalf("kernel receive batching unexpectedly enabled on %s", runtime.GOOS)
+	}
+	if raw, err := oob.SyscallConn(); err != nil || raw == nil {
+		t.Fatalf("SyscallConn() = (%v, %v)", raw, err)
+	}
+	if err := oob.SetReadBuffer(256 * 1024); err != nil {
+		t.Fatalf("SetReadBuffer: %v", err)
+	}
+	if err := oob.SetWriteBuffer(256 * 1024); err != nil {
+		t.Fatalf("SetWriteBuffer: %v", err)
+	}
+	payload := []byte("forwarded through WriteMsgUDP")
+	if n, _, err := oob.WriteMsgUDP(payload, nil, destConn.LocalAddr().(*net.UDPAddr)); err != nil || n != len(payload) {
+		t.Fatalf("WriteMsgUDP() = (%d, %v), want (%d, nil)", n, err, len(payload))
+	}
+	buf := make([]byte, 64)
+	if err := destConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := destConn.ReadFromUDP(buf); err != nil || !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("forwarded WriteMsgUDP payload = %q, err=%v", buf[:n], err)
+	}
+
+	basicConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	basicWrapped, err := newRealityPrecheckPacketConn(context.Background(), &packetConnOnly{PacketConn: basicConn}, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer basicWrapped.Close()
+	if _, ok := basicWrapped.(oobPacketConn); ok {
+		t.Fatalf("generic PacketConn incorrectly advertised OOB capabilities: %T", basicWrapped)
+	}
+	if precheckCore(t, basicWrapped).batchConn != nil {
+		t.Fatal("generic PacketConn incorrectly enabled raw-socket batching")
 	}
 }
 
@@ -388,9 +728,19 @@ func TestParseQUICInitialCoalescedDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse coalesced Initial: %v", err)
 	}
-	var got []byte
-	for _, frag := range parseCryptoFrames(parsed.Payload) {
-		got = mergeCryptoFrag(got, frag)
+	frags, err := parseCryptoFrames(parsed.Payload)
+	if err != nil {
+		t.Fatalf("parse coalesced CRYPTO frames: %v", err)
+	}
+	var reassembler cryptoReassembler
+	for _, frag := range frags {
+		if err := reassembler.add(frag); err != nil {
+			t.Fatalf("add coalesced CRYPTO fragment: %v", err)
+		}
+	}
+	got, err := reassembler.clientHello()
+	if err != nil {
+		t.Fatalf("extract coalesced ClientHello: %v", err)
 	}
 	if !bytes.Equal(got, hello) {
 		t.Fatalf("coalesced ClientHello = %x, want %x", got, hello)
@@ -532,7 +882,11 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wrapped.Close()
-	w := wrapped.(*realityPrecheckPacketConn)
+	w := precheckCore(t, wrapped)
+	oobWrapped, ok := wrapped.(oobPacketConn)
+	if !ok {
+		t.Fatalf("UDP precheck wrapper has type %T, want OOB-capable wrapper", wrapped)
+	}
 
 	mkClient := func() (*net.UDPConn, net.Addr) {
 		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -620,7 +974,7 @@ func TestPrecheckPacketConnDecisions(t *testing.T) {
 	ch2 := make(chan readResult, 1)
 	go func() {
 		rbuf := make([]byte, 2048)
-		n, _, err := wrapped.ReadFrom(rbuf)
+		n, _, _, _, err := oobWrapped.ReadMsgUDP(rbuf, nil)
 		data := make([]byte, n)
 		copy(data, rbuf[:n])
 		ch2 <- readResult{n, data, err}
@@ -720,7 +1074,7 @@ func newPrecheckPolicyFixture(t *testing.T) *precheckPolicyFixture {
 	})
 	return &precheckPolicyFixture{
 		wrapped:   wrapped,
-		precheck:  wrapped.(*realityPrecheckPacketConn),
+		precheck:  precheckCore(t, wrapped),
 		server:    server,
 		dest:      dest,
 		serverPub: serverPub,
@@ -893,15 +1247,15 @@ func TestPrecheckCapacityStillDropsNonInitial(t *testing.T) {
 
 			// One obvious non-Initial and one Initial-shaped truncated packet
 			// both remain silent even though no state slot is available.
-			f.precheck.handlePacket([]byte{0x40, 1, 2, 3, 4, 5}, addr)
-			f.precheck.handlePacket([]byte{0xc0, 0, 0, 0, 1, 8, 0x11}, addr)
+			f.precheck.handlePacket(cloneQueuedPacket([]byte{0x40, 1, 2, 3, 4, 5}, nil, 0, addr))
+			f.precheck.handlePacket(cloneQueuedPacket([]byte{0xc0, 0, 0, 0, 1, 8, 0x11}, nil, 0, addr))
 			expectNoRelay(t, f.dest)
 
 			// A complete Initial whose AEAD tag is invalid still uses the
 			// capacity fallback and is relayed to dest.
 			corrupt := authenticatedPolicyInitial(t, f)
 			corrupt[len(corrupt)-1] ^= 0xff
-			f.precheck.handlePacket(corrupt, addr)
+			f.precheck.handlePacket(cloneQueuedPacket(corrupt, nil, 0, addr))
 			if got := expectRelay(t, f.dest); !bytes.Equal(got, corrupt) {
 				t.Fatalf("capacity relay mismatch: got %d bytes, want %d", len(got), len(corrupt))
 			}
@@ -944,7 +1298,7 @@ func TestPrecheckSingleDestRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wrapped.Close()
-	w := wrapped.(*realityPrecheckPacketConn)
+	w := precheckCore(t, wrapped)
 
 	mkClient := func() (*net.UDPConn, net.Addr) {
 		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

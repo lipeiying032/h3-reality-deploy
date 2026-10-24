@@ -650,7 +650,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 					Conn.Close()
 					return nil, errors.New("failed to wrap QUIC precheck").Base(err)
 				}
-				if pc, ok := Conn.(*realityPrecheckPacketConn); ok {
+				if pc, ok := Conn.(interface{ IsAuthenticated(net.Addr) bool }); ok {
 					handler.handshakeAuthed = pc.IsAuthenticated
 				}
 			}
@@ -680,6 +680,18 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
 			MaxIncomingStreams:             quicParams.MaxIncomingStreams,
 			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
+		}
+		var wireProfile h3WireProfile
+		if r := reality.ConfigFromStreamSettings(streamSettings); r != nil {
+			var profileErr error
+			wireProfile, profileErr = parseH3WireProfile(r.GetRealityQUICParams())
+			if profileErr != nil {
+				Conn.Close()
+				return nil, errors.New("invalid REALITY HTTP/3 wire profile").Base(profileErr)
+			}
+			if wireProfile.initialPacketSize != 0 {
+				quicConfig.InitialPacketSize = wireProfile.initialPacketSize
+			}
 		}
 
 		// C-gamma REALITY over QUIC: the handshake carries no REALITY payload.
@@ -713,13 +725,22 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 				applyDestCertChain(ctx, tlsConfig, r)
 			}
 		}
-		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, quicConfig)
+		quicTransport := &quic.Transport{
+			Conn:               Conn,
+			ConnectionIDLength: wireProfile.connectionIDLength,
+		}
+		quicListener, listenErr := quicTransport.ListenEarly(tlsConfig, quicConfig)
+		err = listenErr
 		if err != nil {
+			quicTransport.Close()
+			Conn.Close()
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		l.h3listener = &QListener{
-			QUICListener: l.h3listener,
+			QUICListener: quicListener,
 			quicParams:   quicParams,
+			transport:    quicTransport,
+			packetConn:   Conn,
 		}
 		errors.LogInfo(ctx, "listening QUIC for XHTTP/3 on ", address, ":", port)
 
@@ -796,7 +817,15 @@ func (ln *Listener) Addr() net.Addr {
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
 	if ln.h3server != nil {
-		return ln.h3server.Close()
+		serverErr := ln.h3server.Close()
+		var listenerErr error
+		if ln.h3listener != nil {
+			listenerErr = ln.h3listener.Close()
+		}
+		if serverErr != nil {
+			return serverErr
+		}
+		return listenerErr
 	} else if ln.listener != nil {
 		return ln.listener.Close()
 	}
@@ -860,6 +889,29 @@ func init() {
 type QListener struct {
 	http3.QUICListener
 	quicParams *internet.QuicParams
+	transport  *quic.Transport
+	packetConn net.PacketConn
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (l *QListener) Close() error {
+	l.closeOnce.Do(func() {
+		if err := l.QUICListener.Close(); err != nil {
+			l.closeErr = err
+		}
+		if l.transport != nil {
+			if err := l.transport.Close(); err != nil && l.closeErr == nil {
+				l.closeErr = err
+			}
+		}
+		if l.packetConn != nil {
+			if err := l.packetConn.Close(); err != nil && l.closeErr == nil {
+				l.closeErr = err
+			}
+		}
+	})
+	return l.closeErr
 }
 
 func (l *QListener) Accept(ctx context.Context) (*quic.Conn, error) {

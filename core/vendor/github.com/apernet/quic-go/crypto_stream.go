@@ -1,9 +1,11 @@
 package quic
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"slices"
 	"strconv"
@@ -14,6 +16,11 @@ import (
 )
 
 const disableClientHelloScramblingEnv = "QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING"
+
+const (
+	chromeMinAddedCryptoFrames = 2
+	chromeMaxAddedCryptoFrames = 10
+)
 
 // The baseCryptoStream is used by the cryptoStream and the initialCryptoStream.
 // This allows us to implement different logic for PopCryptoFrame for the two streams.
@@ -106,20 +113,33 @@ type clientHelloCut struct {
 type initialCryptoStream struct {
 	baseCryptoStream
 
-	scramble bool
-	end      protocol.ByteCount
-	cuts     [2]clientHelloCut
+	scramble        bool
+	chrome          bool
+	chromeDone      bool
+	chromeChunks    []clientHelloCut
+	chromeChunkNext int
+	chromeRand      *rand.Rand
+	end             protocol.ByteCount
+	cuts            [2]clientHelloCut
 }
 
-func newInitialCryptoStream(isClient bool) *initialCryptoStream {
+func newInitialCryptoStream(isClient, chrome bool) *initialCryptoStream {
 	var scramble bool
-	if isClient {
+	var chromeRand *rand.Rand
+	if isClient && !chrome {
 		disabled, err := strconv.ParseBool(os.Getenv(disableClientHelloScramblingEnv))
 		scramble = err != nil || !disabled
+	} else if isClient && chrome {
+		var seed [32]byte
+		_, _ = crand.Read(seed[:])
+		chromeRand = rand.New(rand.NewChaCha8(seed))
 	}
 	s := &initialCryptoStream{
 		baseCryptoStream: baseCryptoStream{queue: *newFrameSorter()},
 		scramble:         scramble,
+		chrome:           isClient && chrome,
+		chromeRand:       chromeRand,
+		end:              protocol.InvalidByteCount,
 	}
 	for i := range len(s.cuts) {
 		s.cuts[i].start = protocol.InvalidByteCount
@@ -129,6 +149,9 @@ func newInitialCryptoStream(isClient bool) *initialCryptoStream {
 }
 
 func (s *initialCryptoStream) HasData() bool {
+	if s.chrome && !s.chromeDone {
+		return s.end != protocol.InvalidByteCount && (len(s.chromeChunks) == 0 || s.chromeChunkNext < len(s.chromeChunks))
+	}
 	// The ClientHello might be written in multiple parts.
 	// In order to correctly split the ClientHello, we need the entire ClientHello has been queued.
 	if s.scramble && s.writeOffset == 0 && s.cuts[0].start == protocol.InvalidByteCount {
@@ -139,6 +162,20 @@ func (s *initialCryptoStream) HasData() bool {
 
 func (s *initialCryptoStream) Write(p []byte) (int, error) {
 	s.writeBuf = append(s.writeBuf, p...)
+	if s.chrome && !s.chromeDone {
+		if s.end != protocol.InvalidByteCount || len(s.writeBuf) < 4 {
+			return len(p), nil
+		}
+		if s.writeBuf[0] != 1 {
+			return len(p), errors.New("expected a TLS ClientHello on the Initial crypto stream")
+		}
+		clientHelloLen := 4 + (int(s.writeBuf[1]) << 16) + (int(s.writeBuf[2]) << 8) + int(s.writeBuf[3])
+		if len(s.writeBuf) < clientHelloLen {
+			return len(p), nil
+		}
+		s.end = protocol.ByteCount(clientHelloLen)
+		return len(p), nil
+	}
 	if !s.scramble {
 		return len(p), nil
 	}
@@ -180,6 +217,25 @@ func (s *initialCryptoStream) Write(p []byte) (int, error) {
 }
 
 func (s *initialCryptoStream) PopCryptoFrame(maxLen protocol.ByteCount) *wire.CryptoFrame {
+	if s.chrome && !s.chromeDone {
+		if s.chromeChunkNext >= len(s.chromeChunks) {
+			s.finishChromeChunks()
+			return s.baseCryptoStream.PopCryptoFrame(maxLen)
+		}
+		chunk := &s.chromeChunks[s.chromeChunkNext]
+		f := &wire.CryptoFrame{Offset: chunk.start, Data: s.writeBuf[chunk.start:chunk.end]}
+		// Keep Chrome's observed boundaries intact. Every configured chunk is
+		// smaller than a full Initial payload; if it doesn't fit in the current
+		// packet, let the packer start a new packet instead of splitting it.
+		if f.Length(protocol.Version1) > maxLen {
+			return nil
+		}
+		s.chromeChunkNext++
+		if s.chromeChunkNext == len(s.chromeChunks) {
+			s.finishChromeChunks()
+		}
+		return f
+	}
 	if !s.scramble {
 		return s.baseCryptoStream.PopCryptoFrame(maxLen)
 	}
@@ -246,4 +302,54 @@ func (s *initialCryptoStream) PopCryptoFrame(maxLen protocol.ByteCount) *wire.Cr
 	}
 
 	return f
+}
+
+func (s *initialCryptoStream) finishChromeChunks() {
+	s.writeBuf = s.writeBuf[s.end:]
+	s.writeOffset = s.end
+	s.end = protocol.InvalidByteCount
+	s.chromeDone = true
+}
+
+func (s *initialCryptoStream) prepareChromeChunks(bytesFree protocol.ByteCount) {
+	if len(s.chromeChunks) > 0 || s.end <= 0 {
+		return
+	}
+	// Chrome balances the ClientHello over the minimum number of Initials.
+	// The first packet reserves two worst-case CRYPTO headers, while every
+	// following packet reserves one.
+	minFrameSize := (&wire.CryptoFrame{Offset: s.end - 1, Data: s.writeBuf[:s.end]}).Length(protocol.Version1) - s.end
+	if bytesFree <= 2*minFrameSize {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
+	}
+	maxDataFirstPacket := bytesFree - 2*minFrameSize
+	if s.end <= maxDataFirstPacket {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
+	}
+	maxDataOtherPackets := bytesFree - minFrameSize
+	firstPacketOccupiedSpace := maxDataOtherPackets - maxDataFirstPacket
+	numPackets := (s.end + firstPacketOccupiedSpace + maxDataOtherPackets - 1) / maxDataOtherPackets
+	dataInOtherPackets := (s.end + firstPacketOccupiedSpace + numPackets - 1) / numPackets
+	dataInFirstPacket := dataInOtherPackets - firstPacketOccupiedSpace
+
+	// Put the beginning and tail in the first Initial and the intervening bytes
+	// in later Initials. Chrome randomizes the first cut over [55, 86].
+	firstFrameLength := protocol.ByteCount(55 + s.chromeRand.IntN(32))
+	if dataInFirstPacket <= firstFrameLength || dataInFirstPacket >= s.end {
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: 0, end: s.end})
+		return
+	}
+	lastFrameLength := dataInFirstPacket - firstFrameLength
+	lastFrameStart := s.end - lastFrameLength
+	s.chromeChunks = append(s.chromeChunks,
+		clientHelloCut{start: 0, end: firstFrameLength},
+		clientHelloCut{start: lastFrameStart, end: s.end},
+	)
+	for start := firstFrameLength; start < lastFrameStart; {
+		end := min(start+dataInOtherPackets, lastFrameStart)
+		s.chromeChunks = append(s.chromeChunks, clientHelloCut{start: start, end: end})
+		start = end
+	}
 }

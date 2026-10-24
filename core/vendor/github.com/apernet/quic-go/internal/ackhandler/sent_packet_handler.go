@@ -1002,6 +1002,9 @@ func (h *sentPacketHandler) ECNMode(isShortHeaderPacket bool) protocol.ECN {
 func (h *sentPacketHandler) PeekPacketNumber(encLevel protocol.EncryptionLevel) (protocol.PacketNumber, protocol.PacketNumberLen) {
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pn := pnSpace.pns.Peek()
+	if h.perspective == protocol.PerspectiveClient && encLevel == protocol.EncryptionInitial && pn == 1 {
+		return pn, protocol.PacketNumberLen1
+	}
 	// See section 17.1 of RFC 9000.
 	return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
 }

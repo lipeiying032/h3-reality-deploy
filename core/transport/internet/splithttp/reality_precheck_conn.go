@@ -8,19 +8,13 @@ package splithttp
 //     are buffered until the decision is made so no packet is lost.
 //   - AUTH:    verification passed — all (buffered + subsequent) packets are
 //     handed to quic-go through an internal FIFO queue.
-//   - RELAY:   verification failed or decryption failed for a complete QUIC
-//     Initial. The flow is treated as a probe and every packet is relayed
-//     verbatim to the single configured dest (classic REALITY semantics: auth
-//     failure is always forwarded to dest, never routed by SNI; serverNames
-//     only gates auth). Without a configured dest such flows are dropped. The
-//     target is fixed at the first packet's decision; the destination
-//     completes the handshake and the real site rejects a mismatched SNI by
-//     itself.
-//
-// Datagrams that cannot be a complete QUIC v1 Initial (short headers,
-// 0-RTT/Handshake/Retry, version negotiation, truncated headers and garbage)
-// are dropped while a flow is unknown or PENDING. AUTH and RELAY decisions
-// are sticky, so their subsequent datagrams are never reclassified.
+//   - RELAY:   verification failed or the flow is not parseable QUIC — the
+//     flow is treated as a probe and every packet is relayed verbatim to the
+//     single configured dest (classic REALITY semantics: auth failure is
+//     always forwarded to dest, never routed by SNI; serverNames only gates
+//     auth). Without a configured dest such flows are dropped. The target is
+//     fixed at the first packet's decision; the destination completes the
+//     handshake and the real site rejects a mismatched SNI by itself.
 //
 // The wrapper runs its own read loop on the underlying conn; quic-go's
 // ReadFrom is served from the AUTH queue so it is never blocked by precheck
@@ -30,12 +24,15 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -55,6 +52,10 @@ const (
 	// precheckDropLogInterval bounds diagnostic output from high-rate junk
 	// traffic. Drop notices are debug-level and shared across all clients.
 	precheckDropLogInterval = 5 * time.Second
+	// precheckReadBatchSize matches quic-go's Linux / FreeBSD receive batch.
+	precheckReadBatchSize  = 8
+	precheckReadBufferSize = 65536
+	precheckOOBBufferSize  = 128
 )
 
 type precheckState int
@@ -78,14 +79,39 @@ type precheckClientState struct {
 	// touched by the read loop, alongside state. nil means the flow is
 	// dropped (no dest configured).
 	relayDest    []*net.UDPAddr
-	cryptoBuf    []byte
-	pending      [][]byte // raw datagrams held until the decision is made
+	crypto       cryptoReassembler
+	pending      []queuedPacket // raw datagrams held until the decision is made
 	pendingBytes int
 }
 
 type queuedPacket struct {
-	data []byte
-	addr net.Addr
+	data  []byte
+	oob   []byte
+	flags int
+	addr  net.Addr
+}
+
+// oobPacketConn is the complete UDP surface quic-go needs for DF, ECN, GSO,
+// socket-buffer tuning, and batched reads. Only wrappers whose underlying
+// PacketConn satisfies this interface expose those capabilities.
+type oobPacketConn interface {
+	net.PacketConn
+	SyscallConn() (syscall.RawConn, error)
+	SetReadBuffer(int) error
+	SetWriteBuffer(int) error
+	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+}
+
+var _ oobPacketConn = (*net.UDPConn)(nil)
+
+func cloneQueuedPacket(data, oob []byte, flags int, addr net.Addr) queuedPacket {
+	return queuedPacket{
+		data:  append([]byte(nil), data...),
+		oob:   append([]byte(nil), oob...),
+		flags: flags,
+		addr:  cloneAddr(addr),
+	}
 }
 
 type realityPrecheckPacketConn struct {
@@ -106,6 +132,36 @@ type realityPrecheckPacketConn struct {
 	dropLogMu         sync.Mutex
 	dropLogNext       time.Time
 	dropLogSuppressed uint64
+
+	oobConn   oobPacketConn
+	batchConn batchPacketConn
+}
+
+// realityPrecheckOOBPacketConn conditionally restores the optimized UDP
+// method set without making generic PacketConn wrappers claim capabilities
+// they don't have. Its reads are still served exclusively from the AUTH
+// queue, so quic-go can never bypass the REALITY classifier.
+type realityPrecheckOOBPacketConn struct {
+	*realityPrecheckPacketConn
+}
+
+var _ oobPacketConn = (*realityPrecheckOOBPacketConn)(nil)
+
+type batchPacketConn interface {
+	ReadBatch([]ipv4.Message, int) (int, error)
+}
+
+var _ batchPacketConn = (*realityPrecheckOOBPacketConn)(nil)
+
+// supportsUDPBatching limits the raw-socket fast path to kernels whose
+// recvmmsg semantics are exercised by quic-go's receive loop.
+func supportsUDPBatching() bool {
+	switch runtime.GOOS {
+	case "linux", "freebsd":
+		return true
+	default:
+		return false
+	}
 }
 
 // newRealityPrecheckPacketConn wraps conn with the QUIC precheck + UDP relay.
@@ -141,20 +197,123 @@ func newRealityPrecheckPacketConn(ctx context.Context, conn net.PacketConn, para
 		queue:      make(chan queuedPacket, precheckQueueSize),
 		closed:     make(chan struct{}),
 	}
+	var wrapped net.PacketConn = c
+	if oobConn, ok := conn.(oobPacketConn); ok {
+		c.oobConn = oobConn
+		// Only unwrap a concrete UDPConn for kernel batching. A custom OOB
+		// wrapper may transform datagrams, in which case unwrapping its fd would
+		// bypass that transformation just like it would bypass this precheck.
+		if supportsUDPBatching() {
+			if udpConn, ok := conn.(*net.UDPConn); ok {
+				c.batchConn = ipv4.NewPacketConn(udpConn)
+			}
+		}
+		wrapped = &realityPrecheckOOBPacketConn{realityPrecheckPacketConn: c}
+	}
 	go c.readLoop()
 	go c.reapLoop()
-	return c, nil
+	return wrapped, nil
 }
 
 // ReadFrom serves quic-go from the AUTH packet queue.
 func (c *realityPrecheckPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	qp, err := c.dequeue()
+	if err != nil {
+		return 0, nil, err
+	}
+	n := copy(p, qp.data)
+	return n, qp.addr, nil
+}
+
+func (c *realityPrecheckPacketConn) dequeue() (queuedPacket, error) {
 	select {
 	case qp := <-c.queue:
-		n := copy(p, qp.data)
-		return n, qp.addr, nil
+		return qp, nil
 	case <-c.closed:
-		return 0, nil, net.ErrClosed
+		return queuedPacket{}, net.ErrClosed
 	}
+}
+
+func (c *realityPrecheckOOBPacketConn) SyscallConn() (syscall.RawConn, error) {
+	return c.oobConn.SyscallConn()
+}
+
+func (c *realityPrecheckOOBPacketConn) SetReadBuffer(bytes int) error {
+	return c.oobConn.SetReadBuffer(bytes)
+}
+
+func (c *realityPrecheckOOBPacketConn) SetWriteBuffer(bytes int) error {
+	return c.oobConn.SetWriteBuffer(bytes)
+}
+
+// WriteMsgUDP forwards QUIC payload and ancillary data unchanged. In
+// particular, the UDP_SEGMENT control message is what enables Linux GSO.
+func (c *realityPrecheckOOBPacketConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
+	if len(oob) == 0 {
+		n, err := c.oobConn.WriteTo(b, addr)
+		if err != nil {
+			return 0, 0, err
+		}
+		return n, 0, nil
+	}
+	return c.oobConn.WriteMsgUDP(b, oob, addr)
+}
+
+// ReadMsgUDP serves only packets admitted by the REALITY precheck while
+// preserving ECN and packet-info ancillary data captured by the read loop.
+func (c *realityPrecheckOOBPacketConn) ReadMsgUDP(b, oob []byte) (int, int, int, *net.UDPAddr, error) {
+	packet, err := c.dequeue()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	addr, ok := packet.addr.(*net.UDPAddr)
+	if !ok {
+		return 0, 0, 0, nil, errors.New("REALITY precheck queued a non-UDP address")
+	}
+	return copy(b, packet.data), copy(oob, packet.oob), packet.flags, addr, nil
+}
+
+// ReadBatch blocks for one admitted packet, then drains the AUTH queue without
+// waiting. Implementing this method is essential: otherwise quic-go's
+// ipv4.PacketConn fallback unwraps SyscallConn and reads the raw socket,
+// bypassing the precheck entirely.
+func (c *realityPrecheckOOBPacketConn) ReadBatch(messages []ipv4.Message, _ int) (int, error) {
+	if len(messages) == 0 {
+		return 0, nil
+	}
+	first, err := c.dequeue()
+	if err != nil {
+		return 0, err
+	}
+	fillBatchMessage(&messages[0], first)
+	n := 1
+	for n < len(messages) {
+		select {
+		case packet := <-c.queue:
+			fillBatchMessage(&messages[n], packet)
+			n++
+		default:
+			return n, nil
+		}
+	}
+	return n, nil
+}
+
+func fillBatchMessage(message *ipv4.Message, packet queuedPacket) {
+	remaining := packet.data
+	written := 0
+	for _, buffer := range message.Buffers {
+		n := copy(buffer, remaining)
+		written += n
+		remaining = remaining[n:]
+		if len(remaining) == 0 {
+			break
+		}
+	}
+	message.N = written
+	message.NN = copy(message.OOB, packet.oob)
+	message.Flags = packet.flags
+	message.Addr = packet.addr
 }
 
 // WriteTo passes writes (quic-go replies to AUTH clients) straight through to
@@ -208,18 +367,68 @@ func (c *realityPrecheckPacketConn) relayTimeout() time.Duration {
 	return c.params.FallbackTimeout
 }
 
-// readLoop owns the underlying conn's read side. handlePacket classifies
-// obvious non-Initial traffic before copying the reusable read buffer.
+// readLoop owns the underlying conn's read side. Every datagram is copied
+// out before the buffer is reused.
 func (c *realityPrecheckPacketConn) readLoop() {
-	buf := make([]byte, 65536)
+	if c.batchConn != nil {
+		c.readLoopBatch()
+		return
+	}
+	if c.oobConn != nil {
+		c.readLoopOOB()
+		return
+	}
+	buf := make([]byte, precheckReadBufferSize)
 	for {
 		n, addr, err := c.PacketConn.ReadFrom(buf)
 		if err != nil {
 			c.Close()
 			return
 		}
-		c.handlePacket(buf[:n], addr)
+		c.handlePacket(cloneQueuedPacket(buf[:n], nil, 0, addr))
 	}
+}
+
+func (c *realityPrecheckPacketConn) readLoopOOB() {
+	buf := make([]byte, precheckReadBufferSize)
+	oob := make([]byte, precheckOOBBufferSize)
+	for {
+		n, oobn, flags, addr, err := c.oobConn.ReadMsgUDP(buf, oob)
+		if err != nil {
+			c.Close()
+			return
+		}
+		c.handlePacket(cloneQueuedPacket(buf[:n], oob[:oobn], flags, addr))
+	}
+}
+
+func newPrecheckReadMessages() []ipv4.Message {
+	messages := make([]ipv4.Message, precheckReadBatchSize)
+	for i := range messages {
+		messages[i].Buffers = [][]byte{make([]byte, precheckReadBufferSize)}
+		messages[i].OOB = make([]byte, precheckOOBBufferSize)
+	}
+	return messages
+}
+
+func (c *realityPrecheckPacketConn) readLoopBatch() {
+	messages := newPrecheckReadMessages()
+	for {
+		_, err := c.readBatchOnce(messages)
+		if err != nil {
+			c.Close()
+			return
+		}
+	}
+}
+
+func (c *realityPrecheckPacketConn) readBatchOnce(messages []ipv4.Message) (int, error) {
+	n, err := c.batchConn.ReadBatch(messages, 0)
+	for i := 0; i < n; i++ {
+		message := &messages[i]
+		c.handlePacket(cloneQueuedPacket(message.Buffers[0][:message.N], message.OOB[:message.NN], message.Flags, message.Addr))
+	}
+	return n, err
 }
 
 // obviousNonInitialV1 performs the allocation-free checks that are safe
@@ -242,7 +451,7 @@ func obviousNonInitialV1(data []byte) bool {
 func (c *realityPrecheckPacketConn) forgetEmptyPending(addr net.Addr, st *precheckClientState) {
 	key := addr.String()
 	c.mu.Lock()
-	if c.states[key] == st && st.state == precheckPending && len(st.pending) == 0 && len(st.cryptoBuf) == 0 {
+	if c.states[key] == st && st.state == precheckPending && len(st.pending) == 0 && len(st.crypto.ranges) == 0 {
 		delete(c.states, key)
 		if c.perIP[st.ip] <= 1 {
 			delete(c.perIP, st.ip)
@@ -253,16 +462,10 @@ func (c *realityPrecheckPacketConn) forgetEmptyPending(addr net.Addr, st *preche
 	c.mu.Unlock()
 }
 
-func cloneDatagram(data []byte) []byte {
-	cloned := make([]byte, len(data))
-	copy(cloned, data)
-	return cloned
-}
-
 // confirmedNonInitial applies the complete parser to Initial-shaped traffic.
 // The parser mutates its input, so this slow path uses a disposable copy.
 func confirmedNonInitial(data []byte) (bool, error) {
-	_, err := parseQUICInitial(cloneDatagram(data))
+	_, err := parseQUICInitial(cloneQueuedPacket(data, nil, 0, nil).data)
 	return isNotQUICInitial(err), err
 }
 
@@ -286,7 +489,8 @@ func (c *realityPrecheckPacketConn) logNonInitialDrop(addr net.Addr, reason erro
 	errors.LogDebug(c.ctx, "REALITY: QUIC precheck dropped non-Initial packet from ", addr.String(), ": ", reason, " (suppressed since last log: ", suppressed, ")")
 }
 
-func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) handlePacket(packet queuedPacket) {
+	data, addr := packet.data, packet.addr
 	key := addr.String()
 	c.mu.Lock()
 	st := c.states[key]
@@ -317,16 +521,13 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 	state := st.state
 	c.mu.Unlock()
 
-	// The read buffer is reused after handlePacket returns. Obvious drops have
-	// already returned, so retain one owned copy for queues and pending state.
-	data = cloneDatagram(data)
 	switch state {
 	case precheckAuth:
-		c.enqueue(data, addr)
+		c.enqueue(packet)
 	case precheckRelay:
 		c.relay.relayClientToDest(addr, st.relayDest, data)
 	default:
-		c.decidePending(st, data, addr)
+		c.decidePending(st, packet)
 	}
 }
 
@@ -334,7 +535,8 @@ func (c *realityPrecheckPacketConn) handlePacket(data []byte, addr net.Addr) {
 // reassembled, then either keeps waiting (buffering the datagram), marks the
 // client AUTH (flushing everything to the quic-go queue) or marks it RELAY
 // (flushing everything to the dest).
-func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, packet queuedPacket) {
+	data, addr := packet.data, packet.addr
 	work := make([]byte, len(data))
 	copy(work, data)
 	pkt, err := parseQUICInitial(work)
@@ -347,42 +549,58 @@ func (c *realityPrecheckPacketConn) decidePending(st *precheckClientState, data 
 			return
 		}
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (unparseable: ", err, ")")
-		c.relayDecision(st, data, addr)
+		c.relayDecision(st, packet)
 		return
 	}
-	for _, frag := range parseCryptoFrames(pkt.Payload) {
-		st.cryptoBuf = mergeCryptoFrag(st.cryptoBuf, frag)
+	frags, err := parseCryptoFrames(pkt.Payload)
+	if err != nil {
+		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (malformed frames: ", err, ")")
+		c.relayDecision(st, packet)
+		return
 	}
-	hello := extractClientHello(st.cryptoBuf)
-	if hello == nil {
-		// ClientHello incomplete: hold the datagram and wait for more Initials.
-		if len(st.pending) >= precheckMaxPendingPkts || st.pendingBytes >= precheckMaxPendingBytes ||
-			time.Since(st.firstSeen) > c.relayTimeout() {
-			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello incomplete)")
-			c.relayDecision(st, data, addr)
+	for _, frag := range frags {
+		if err := st.crypto.add(frag); err != nil {
+			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (CRYPTO reassembly: ", err, ")")
+			c.relayDecision(st, packet)
 			return
 		}
-		st.pending = append(st.pending, data)
+	}
+	hello, err := st.crypto.clientHello()
+	if err != nil {
+		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello: ", err, ")")
+		c.relayDecision(st, packet)
+		return
+	}
+	if hello == nil {
+		// ClientHello incomplete: hold the datagram and wait for more Initials.
+		if len(st.pending)+1 > precheckMaxPendingPkts || st.pendingBytes+len(data) > precheckMaxPendingBytes ||
+			time.Since(st.firstSeen) > c.relayTimeout() {
+			errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String(), " (ClientHello incomplete)")
+			c.relayDecision(st, packet)
+			return
+		}
+		st.pending = append(st.pending, packet)
 		st.pendingBytes += len(data)
 		return
 	}
 	if c.verifier == nil || c.verifier.Verify(hello) != nil {
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck RELAY for ", addr.String())
-		c.relayDecision(st, data, addr)
+		c.relayDecision(st, packet)
 		return
 	}
 	errors.LogInfo(c.ctx, "REALITY: QUIC precheck AUTH for ", addr.String())
 	c.mu.Lock()
 	st.state = precheckAuth
 	c.mu.Unlock()
-	c.flushPending(st, data, addr, false)
+	c.flushPending(st, packet, false)
 }
 
 // relayDecision marks the client RELAY, pins the flow's destination (the
 // single configured dest, nil = drop) and forwards all buffered datagrams
 // plus the current one to that destination (no packet is dropped for a
 // configured destination).
-func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, data []byte, addr net.Addr) {
+func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, packet queuedPacket) {
+	addr := packet.addr
 	target := c.relay.dest
 	c.mu.Lock()
 	st.state = precheckRelay
@@ -392,37 +610,38 @@ func (c *realityPrecheckPacketConn) relayDecision(st *precheckClientState, data 
 		errors.LogInfo(c.ctx, "REALITY: QUIC precheck DROP for ", addr.String(), " (no dest configured)")
 		st.pending = nil
 		st.pendingBytes = 0
+		st.crypto = cryptoReassembler{}
 		return
 	}
-	c.flushPending(st, data, addr, true)
+	c.flushPending(st, packet, true)
 }
 
 // flushPending delivers the buffered datagrams (in arrival order) plus the
 // current one either to the quic-go queue (toRelay=false) or to the relay
 // (toRelay=true).
-func (c *realityPrecheckPacketConn) flushPending(st *precheckClientState, data []byte, addr net.Addr, toRelay bool) {
+func (c *realityPrecheckPacketConn) flushPending(st *precheckClientState, packet queuedPacket, toRelay bool) {
 	for _, p := range st.pending {
 		if toRelay {
-			c.relay.relayClientToDest(addr, st.relayDest, p)
+			c.relay.relayClientToDest(p.addr, st.relayDest, p.data)
 		} else {
-			c.enqueue(p, addr)
+			c.enqueue(p)
 		}
 	}
 	st.pending = nil
 	st.pendingBytes = 0
+	st.crypto = cryptoReassembler{}
 	if toRelay {
-		c.relay.relayClientToDest(addr, st.relayDest, data)
+		c.relay.relayClientToDest(packet.addr, st.relayDest, packet.data)
 	} else {
-		c.enqueue(data, addr)
+		c.enqueue(packet)
 	}
 }
 
 // enqueue hands one AUTH datagram to quic-go. When the queue is full the
 // datagram is dropped rather than blocking the read loop.
-func (c *realityPrecheckPacketConn) enqueue(data []byte, addr net.Addr) {
-	qp := queuedPacket{data: data, addr: cloneAddr(addr)}
+func (c *realityPrecheckPacketConn) enqueue(packet queuedPacket) {
 	select {
-	case c.queue <- qp:
+	case c.queue <- packet:
 	case <-c.closed:
 	default:
 	}
