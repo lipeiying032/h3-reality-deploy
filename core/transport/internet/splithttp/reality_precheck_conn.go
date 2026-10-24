@@ -47,6 +47,10 @@ const (
 	precheckMaxPendingBytes = 128 * 1024
 	// precheckScanPeriod is how often stale states are reaped.
 	precheckScanPeriod = 30 * time.Second
+	// precheckReadBatchSize matches quic-go's Linux / FreeBSD receive batch.
+	precheckReadBatchSize  = 8
+	precheckReadBufferSize = 65536
+	precheckOOBBufferSize  = 128
 )
 
 type precheckState int
@@ -120,6 +124,7 @@ type realityPrecheckPacketConn struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	oobConn   oobPacketConn
+	batchConn batchPacketConn
 }
 
 // realityPrecheckOOBPacketConn conditionally restores the optimized UDP
@@ -174,6 +179,12 @@ func newRealityPrecheckPacketConn(ctx context.Context, conn net.PacketConn, para
 	var wrapped net.PacketConn = c
 	if oobConn, ok := conn.(oobPacketConn); ok {
 		c.oobConn = oobConn
+		// Only unwrap a concrete UDPConn for kernel batching. A custom OOB
+		// wrapper may transform datagrams, in which case unwrapping its fd would
+		// bypass that transformation just like it would bypass this precheck.
+		if udpConn, ok := conn.(*net.UDPConn); ok {
+			c.batchConn = ipv4.NewPacketConn(udpConn)
+		}
 		wrapped = &realityPrecheckOOBPacketConn{realityPrecheckPacketConn: c}
 	}
 	go c.readLoop()
@@ -329,11 +340,15 @@ func (c *realityPrecheckPacketConn) relayTimeout() time.Duration {
 // readLoop owns the underlying conn's read side. Every datagram is copied
 // out before the buffer is reused.
 func (c *realityPrecheckPacketConn) readLoop() {
+	if c.batchConn != nil {
+		c.readLoopBatch()
+		return
+	}
 	if c.oobConn != nil {
 		c.readLoopOOB()
 		return
 	}
-	buf := make([]byte, 65536)
+	buf := make([]byte, precheckReadBufferSize)
 	for {
 		n, addr, err := c.PacketConn.ReadFrom(buf)
 		if err != nil {
@@ -345,8 +360,8 @@ func (c *realityPrecheckPacketConn) readLoop() {
 }
 
 func (c *realityPrecheckPacketConn) readLoopOOB() {
-	buf := make([]byte, 65536)
-	oob := make([]byte, 128)
+	buf := make([]byte, precheckReadBufferSize)
+	oob := make([]byte, precheckOOBBufferSize)
 	for {
 		n, oobn, flags, addr, err := c.oobConn.ReadMsgUDP(buf, oob)
 		if err != nil {
@@ -355,6 +370,35 @@ func (c *realityPrecheckPacketConn) readLoopOOB() {
 		}
 		c.handlePacket(cloneQueuedPacket(buf[:n], oob[:oobn], flags, addr))
 	}
+}
+
+func newPrecheckReadMessages() []ipv4.Message {
+	messages := make([]ipv4.Message, precheckReadBatchSize)
+	for i := range messages {
+		messages[i].Buffers = [][]byte{make([]byte, precheckReadBufferSize)}
+		messages[i].OOB = make([]byte, precheckOOBBufferSize)
+	}
+	return messages
+}
+
+func (c *realityPrecheckPacketConn) readLoopBatch() {
+	messages := newPrecheckReadMessages()
+	for {
+		_, err := c.readBatchOnce(messages)
+		if err != nil {
+			c.Close()
+			return
+		}
+	}
+}
+
+func (c *realityPrecheckPacketConn) readBatchOnce(messages []ipv4.Message) (int, error) {
+	n, err := c.batchConn.ReadBatch(messages, 0)
+	for i := 0; i < n; i++ {
+		message := &messages[i]
+		c.handlePacket(cloneQueuedPacket(message.Buffers[0][:message.N], message.OOB[:message.NN], message.Flags, message.Addr))
+	}
+	return n, err
 }
 
 func (c *realityPrecheckPacketConn) handlePacket(packet queuedPacket) {
